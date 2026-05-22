@@ -4,3 +4,13 @@ generating r=20 sphere mesh, ~1M triangles via manifold3d refine ...
   mesh: 991232 triangles, 495618 verts  (gen 0.2s)  manifold vol=32761.761
 
 reconstructing (direct, no ShapeFix) ...
+  reconstruction : 136.31 s  -> 7272 tri/s
+  result kind    : Solid  unique edges built: 1486848  face_fail=0 edge_fail=0
+  volume         : 32761.761  err=0.0000%  (9.16 s)
+  face count     : 991232  (0.35 s, explorer walk)
+
+  running BRepCheck_Analyzer (memory-heavy at 1M faces) ...
+  BRepCheck valid: True  (75.5 s)
+
+  STEP export of the 1M-face solid ...
+  STEP export    : ok=True  2501.3 MB  (146.7 s)

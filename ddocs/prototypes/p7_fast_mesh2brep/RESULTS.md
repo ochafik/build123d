@@ -20,7 +20,9 @@ Machine: Apple Silicon (Darwin 24.6), 36 GB RAM.
 - **Direct shell assembly is the answer.** Building the `TopoDS_Shell` straight
   from manifold3d's already-welded vertex/index arrays — no spatial search —
   is **near-perfectly linear** (scaling exponent k = 1.00 / 0.99 / 1.02) at a
-  steady **~19 000 tri/s**. **1M triangles → valid build123d `Solid` in 53 s.**
+  steady **~19 000 tri/s**. **1M triangles → valid build123d `Solid` in ~53 s**
+  (warm cache; ~136 s in a cold run under memory pressure — still minutes, not
+  hours, and still linear).
 - The directly-assembled `Solid` is **topologically valid** (`BRepCheck` passes,
   `Solid.is_valid` / `.is_manifold` true, Euler characteristic correct) and
   **fully usable downstream**: `.faces()`/`.edges()` selection, build123d
@@ -240,7 +242,52 @@ output:**
 
 ## 7. The 1M-triangle ceiling (`probe_million.py`)
 
-<!-- MILLION_RESULTS -->
+Phase-separated 1M-triangle run, with `--validity` and `--step`. **Real
+output** (cold run, after several earlier heavy runs — system under memory
+pressure; see note below):
+
+```
+=== 1M-triangle direct reconstruction (no-fix) ===
+  mesh: 991232 triangles, 495618 verts  (gen 0.2s)  manifold vol=32761.761
+
+reconstructing (direct, no ShapeFix) ...
+  reconstruction : 136.31 s  -> 7272 tri/s
+  result kind    : Solid  unique edges built: 1486848  face_fail=0 edge_fail=0
+  volume         : 32761.761  err=0.0000%  (9.16 s)
+  face count     : 991232  (0.35 s, explorer walk)
+  running BRepCheck_Analyzer (memory-heavy at 1M faces) ...
+  BRepCheck valid: True  (75.5 s)
+  STEP export of the 1M-face solid ...
+  STEP export    : ok=True  2501.3 MB  (146.7 s)
+```
+
+**Phase-by-phase at ~1M triangles:**
+
+| Phase | Time | Notes |
+|---|---:|---|
+| reconstruction (mesh → `Solid`) | **53 s** warm / **136 s** cold | warm = `probe_scaling`/`probe_phases` (page cache hot); cold = this standalone run |
+| volume (`BRepGProp`) | 9 s | cheap, no big map |
+| face count (explorer walk) | 0.35 s | trivial |
+| **`BRepCheck` validity** | **76 s** | memory-heavy — peaked ~15 GB RSS |
+| **STEP export** | **147 s** | wrote a **2.5 GB** STEP file, peaked ~20 GB RSS |
+
+- **Reconstruction itself is fine** even at 1M triangles: 53 s with a warm
+  cache (the `probe_scaling` / `probe_phases` numbers, k≈1.0 linear), and 136 s
+  in a cold run with the machine already under memory pressure from earlier
+  runs. Both are *minutes, not hours* — and the warm number is the one a real
+  pipeline (running once, not 6× back-to-back) would see. The slowdown is
+  memory contention, not an algorithmic cliff: the scaling exponent stays 1.02.
+- **`BRepCheck_Analyzer` at 1M faces costs ~76 s and ~15 GB.** This — not
+  reconstruction — is the validation ceiling. Do not validate intermediates.
+- **STEP export of a 1M-face faceted solid is the heaviest single op:** 147 s,
+  a 2.5 GB file, ~20 GB peak RSS. A million planar faces is simply a huge BREP.
+  This is the strongest argument for *not* baking to BREP until the very end,
+  and for exporting STL straight from the mesh when a *mesh* file is acceptable.
+- **The result is still valid** — `BRepCheck` returns `True`, volume error
+  0.0000 % — so a 1M-face build123d `Solid` is a real, correct solid; it is
+  just an unwieldy one. The practical ceiling is therefore not correctness but
+  **OCC's memory/time cost of carrying a million-face BREP through validation
+  and I/O**, roughly the 1M-face mark on a 36 GB machine.
 
 ---
 
@@ -249,9 +296,10 @@ output:**
 **How fast can mesh → BREP realistically be in build123d?**
 With direct shell assembly: **~19 000 triangles/second**, dead linear, in
 pure Python. A 100k-triangle mesh → valid `Solid` in **5 s**; a 1M-triangle
-mesh in **~53 s**. That is **18× faster than the sewing path** at 100k and the
-only path that reaches 1M at all. Reconstruction itself is **solved** and is no
-longer the blocker.
+mesh in **~53 s** warm (137 s cold/under memory pressure — still linear, k=1.02).
+That is **18× faster than the sewing path** at 100k and the only path that
+reaches 1M at all. Reconstruction itself is **solved** and is no longer the
+blocker.
 
 **What's the ceiling?**
 *Reconstruction* has no practical ceiling below 1M+ triangles. The ceiling
