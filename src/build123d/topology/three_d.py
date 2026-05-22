@@ -54,13 +54,22 @@ license:
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from math import cos, radians, tan
 from typing import TYPE_CHECKING, Literal, cast
 
+import numpy as np
+
 import OCP.TopAbs as ta
+from OCP.BRep import BRep_Builder
 from OCP.BRepAlgoAPI import BRepAlgoAPI_Common, BRepAlgoAPI_Cut
-from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeSolid
+from OCP.BRepBuilderAPI import (
+    BRepBuilderAPI_MakeEdge,
+    BRepBuilderAPI_MakeFace,
+    BRepBuilderAPI_MakeSolid,
+    BRepBuilderAPI_MakeVertex,
+    BRepBuilderAPI_MakeWire,
+)
 from OCP.BRepClass3d import BRepClass3d_SolidClassifier
 from OCP.BRepExtrema import BRepExtrema_DistShapeShape
 from OCP.BRepFeat import BRepFeat_MakeDPrism
@@ -85,17 +94,19 @@ from OCP.GeomAbs import GeomAbs_Intersection, GeomAbs_JoinType
 from OCP.gp import gp_Ax2, gp_Pnt, gp_Vec
 from OCP.GProp import GProp_GProps
 from OCP.LocOpe import LocOpe_DPrism
-from OCP.ShapeFix import ShapeFix_Solid
+from OCP.ShapeFix import ShapeFix_Shell, ShapeFix_Solid
 from OCP.Standard import Standard_Failure, Standard_TypeMismatch
 from OCP.StdFail import StdFail_NotDone
 from OCP.TopExp import TopExp, TopExp_Explorer
 from OCP.TopoDS import (
     TopoDS,
     TopoDS_Compound,
+    TopoDS_Edge,
     TopoDS_Face,
     TopoDS_Shape,
     TopoDS_Shell,
     TopoDS_Solid,
+    TopoDS_Vertex,
     TopoDS_Wire,
 )
 from OCP.TopTools import TopTools_IndexedDataMapOfShapeListOfShape, TopTools_ListOfShape
@@ -1312,6 +1323,185 @@ class Solid(Mixin3D[TopoDS_Solid]):
         return Solid.make_box(bbox.size.X, bbox.size.Y, bbox.size.Z, plane=moved_plane)
 
     @classmethod
+    def from_mesh(
+        cls,
+        vertices: Sequence[VectorLike] | np.ndarray,
+        triangles: Sequence[Sequence[int]] | np.ndarray,
+        *,
+        fix: bool = False,
+    ) -> Solid | Compound:
+        """from_mesh
+
+        Build a :class:`Solid` from a triangle mesh by direct ``TopoDS_Shell``
+        assembly.
+
+        Unlike per-triangle sewing (which spatially matches vertices across every
+        face and is super-linear in triangle count), this exploits the fact that
+        an indexed mesh *already encodes connectivity*: each ``TopoDS_Vertex`` is
+        built once, each ``TopoDS_Edge`` once (keyed by its sorted vertex-index
+        pair and shared, reversed, between its two triangles), and one
+        ``TopoDS_Face`` per triangle is added straight into a single
+        ``TopoDS_Shell``. No spatial search is performed, so reconstruction is
+        linear in triangle count.
+
+        The input must be a closed, oriented, indexed mesh — i.e. triangle
+        vertices reference shared indices and each interior edge is used by
+        exactly two triangles. Meshes produced by ``manifold3d`` satisfy this by
+        construction. A raw, un-welded triangle soup will *not* reconstruct
+        correctly; weld coincident vertices first (see
+        :meth:`Shape.tessellate` with ``weld=True``).
+
+        The result is faceted: one planar face per input triangle. Curved
+        geometry — if the mesh approximates any — is lost. When the mesh contains
+        several disjoint bodies (e.g. from a multi-body :class:`Compound`),
+        bounding-box nesting is used to classify shells: a shell strictly nested
+        inside another becomes that body's internal void; separate bodies are
+        returned as a :class:`Compound`.
+
+        Args:
+            vertices: ``(N, 3)`` array (or sequence of :class:`Vector`-like) of
+                unique vertex coordinates.
+            triangles: ``(M, 3)`` array of triangle vertex indices, wound
+                counter-clockwise for outward normals.
+            fix (bool, optional): when ``True`` run ``ShapeFix_Shell`` to repair
+                face orientation for untrusted (non-manifold-guaranteed) input.
+                ``ShapeFix_Shell`` is itself super-linear; leave ``False`` (the
+                default) for trusted, consistently-wound meshes such as
+                ``manifold3d`` output. Defaults to False.
+
+        Returns:
+            Solid | Compound: a :class:`Solid` for a single-body mesh, or a
+            :class:`Compound` of :class:`Solid` when the mesh has several
+            disjoint bodies.
+
+        Raises:
+            ValueError: if the mesh is empty or no valid face could be built.
+        """
+        # pylint: disable=import-outside-toplevel
+        from .composite import Compound
+
+        if not isinstance(vertices, np.ndarray) and any(
+            isinstance(v, Vector) for v in vertices
+        ):
+            vertices = [tuple(Vector(v)) for v in vertices]
+        vertex_array = np.asarray(vertices, dtype=np.float64)
+        triangle_array = np.asarray(triangles, dtype=np.int64)
+        if vertex_array.ndim != 2 or vertex_array.shape[1] != 3:
+            raise ValueError("vertices must be an (N, 3) array")
+        if triangle_array.ndim != 2 or triangle_array.shape[1] != 3:
+            raise ValueError("triangles must be an (M, 3) array")
+        if len(triangle_array) == 0:
+            raise ValueError("Cannot build a Solid from an empty mesh")
+
+        # Drop degenerate triangles (repeated vertex index): OCCT's mesher emits
+        # a few near sphere poles, and they break edge/wire construction.
+        non_degenerate = (
+            (triangle_array[:, 0] != triangle_array[:, 1])
+            & (triangle_array[:, 1] != triangle_array[:, 2])
+            & (triangle_array[:, 0] != triangle_array[:, 2])
+        )
+        triangle_array = triangle_array[non_degenerate]
+        if len(triangle_array) == 0:
+            raise ValueError("Mesh contains no non-degenerate triangles")
+
+        builder = BRep_Builder()
+
+        # One TopoDS_Vertex per unique mesh vertex, built lazily on first use.
+        occ_vertices: list[TopoDS_Vertex | None] = [None] * len(vertex_array)
+
+        def get_vertex(index: int) -> TopoDS_Vertex:
+            vertex = occ_vertices[index]
+            if vertex is None:
+                x, y, z = vertex_array[index]
+                vertex = BRepBuilderAPI_MakeVertex(
+                    gp_Pnt(float(x), float(y), float(z))
+                ).Vertex()
+                occ_vertices[index] = vertex
+            return vertex
+
+        # One TopoDS_Edge per unique vertex-index pair, stored built forward
+        # (a < b); the second triangle that uses it reuses the SAME edge
+        # reversed, so the two triangles share topology.
+        edges: dict[tuple[int, int], TopoDS_Edge] = {}
+
+        def get_edge(start: int, end: int) -> TopoDS_Edge | None:
+            key = (start, end) if start < end else (end, start)
+            edge = edges.get(key)
+            if edge is None:
+                edge_builder = BRepBuilderAPI_MakeEdge(
+                    get_vertex(key[0]), get_vertex(key[1])
+                )
+                if not edge_builder.IsDone():
+                    return None
+                edge = edge_builder.Edge()
+                edges[key] = edge
+            return edge if start == key[0] else TopoDS.Edge_s(edge.Reversed())
+
+        # Partition the triangles into connected components (disjoint bodies):
+        # triangles sharing a vertex index belong to the same body. Each
+        # component becomes its own TopoDS_Shell so a multi-body mesh yields
+        # several shells rather than one container of unrelated faces.
+        component_of_triangle = _connected_components(triangle_array, len(vertex_array))
+
+        component_shells: list[Shell] = []
+        for component in np.unique(component_of_triangle):
+            shell = TopoDS_Shell()
+            builder.MakeShell(shell)
+            faces_added = 0
+            for triangle in triangle_array[component_of_triangle == component]:
+                corner_a, corner_b, corner_c = (
+                    int(triangle[0]),
+                    int(triangle[1]),
+                    int(triangle[2]),
+                )
+                edge_ab = get_edge(corner_a, corner_b)
+                edge_bc = get_edge(corner_b, corner_c)
+                edge_ca = get_edge(corner_c, corner_a)
+                if edge_ab is None or edge_bc is None or edge_ca is None:
+                    continue
+                wire_builder = BRepBuilderAPI_MakeWire(edge_ab, edge_bc, edge_ca)
+                if not wire_builder.IsDone():
+                    continue
+                face_builder = BRepBuilderAPI_MakeFace(wire_builder.Wire(), True)
+                if not face_builder.IsDone():
+                    continue
+                builder.Add(shell, face_builder.Face())
+                faces_added += 1
+            if faces_added == 0:
+                continue
+            shell.Closed(True)
+            if fix:
+                shell_fixer = ShapeFix_Shell()
+                shell_fixer.Init(shell)
+                shell_fixer.Perform()
+                shell = shell_fixer.Shell()
+            component_shells.append(Shell(shell))
+
+        if not component_shells:
+            raise ValueError("No valid face could be built from the mesh")
+
+        # Classify the disjoint shells by bounding-box nesting (see
+        # _group_shells_into_solids): a shell nested inside another is that
+        # body's internal void; separate bodies are separate Solids. This
+        # deliberately avoids the "largest = outer, rest = voids" heuristic,
+        # which mis-builds a multi-body mesh as one Solid-with-voids.
+        solids: list[Solid] = []
+        for outer_shell, void_shells in _group_shells_into_solids(component_shells):
+            solid_builder = BRepBuilderAPI_MakeSolid(outer_shell.wrapped)
+            for void_shell in void_shells:
+                solid_builder.Add(void_shell.wrapped)
+            solid = Solid(TopoDS.Solid_s(solid_builder.Solid()))
+            if fix:
+                solid_fixer = ShapeFix_Solid(solid.wrapped)
+                solid_fixer.Perform()
+                solid = Solid(TopoDS.Solid_s(solid_fixer.Solid()))
+            solids.append(solid)
+
+        if len(solids) == 1:
+            return solids[0]
+        return Compound(children=solids)
+
+    @classmethod
     def make_box(
         cls, length: float, width: float, height: float, plane: Plane = Plane.XY
     ) -> Solid:
@@ -1843,3 +2033,91 @@ class DraftAngleError(RuntimeError):
         super().__init__(message)
         self.face = face
         self.problematic_shape = problematic_shape
+
+
+def _connected_components(triangles: np.ndarray, vertex_count: int) -> np.ndarray:
+    """Label each triangle with the index of its connected component.
+
+    Two triangles belong to the same component (disjoint mesh body) when they
+    share a vertex index. Implemented with a weighted union-find over the
+    vertex set; used by :meth:`Solid.from_mesh` to split a multi-body mesh.
+
+    Args:
+        triangles: ``(M, 3)`` array of triangle vertex indices.
+        vertex_count: number of unique vertices in the mesh.
+
+    Returns:
+        An ``(M,)`` array of component labels (0-based, contiguous).
+    """
+    parent = np.arange(vertex_count, dtype=np.int64)
+
+    def find(node: int) -> int:
+        root = node
+        while parent[root] != root:
+            root = parent[root]
+        while parent[node] != root:  # path compression
+            parent[node], node = root, parent[node]
+        return root
+
+    for triangle in triangles:
+        first = find(int(triangle[0]))
+        for other in (int(triangle[1]), int(triangle[2])):
+            parent[find(other)] = first
+
+    roots = np.array([find(int(triangle[0])) for triangle in triangles], dtype=np.int64)
+    _, labels = np.unique(roots, return_inverse=True)
+    return labels.reshape(-1)
+
+
+def _group_shells_into_solids(
+    shells: Sequence[Shell],
+) -> list[tuple[Shell, list[Shell]]]:
+    """Group reconstructed shells into ``(outer, [voids])`` tuples.
+
+    Used by :meth:`Solid.from_mesh`. A shell whose bounding box is strictly
+    contained in another shell's bounding box is classified as an internal void
+    of the *smallest* such enclosing shell; every non-nested shell is a
+    top-level body. This bounding-box-nesting rule replaces the incorrect
+    "largest shell is outer, all others are voids" heuristic, which mis-builds a
+    mesh of several disjoint bodies as a single invalid solid-with-voids.
+
+    Args:
+        shells: the connected shells obtained from a reconstructed mesh.
+
+    Returns:
+        One ``(outer_shell, void_shells)`` tuple per top-level body.
+    """
+    boxes = [shell.bounding_box() for shell in shells]
+
+    def is_inside(inner: BoundBox, outer: BoundBox) -> bool:
+        eps = 1e-7
+        return (
+            outer.min.X - eps <= inner.min.X
+            and outer.min.Y - eps <= inner.min.Y
+            and outer.min.Z - eps <= inner.min.Z
+            and inner.max.X <= outer.max.X + eps
+            and inner.max.Y <= outer.max.Y + eps
+            and inner.max.Z <= outer.max.Z + eps
+        )
+
+    def box_volume(box: BoundBox) -> float:
+        size = box.size
+        return size.X * size.Y * size.Z
+
+    parent: list[int | None] = [None] * len(shells)
+    for i in range(len(shells)):
+        for j in range(len(shells)):
+            if i == j:
+                continue
+            if is_inside(boxes[i], boxes[j]):
+                # j encloses i; keep the smallest such enclosing shell.
+                current = parent[i]
+                if current is None or box_volume(boxes[j]) < box_volume(boxes[current]):
+                    parent[i] = j
+
+    groups: list[tuple[Shell, list[Shell]]] = []
+    for i, shell in enumerate(shells):
+        if parent[i] is None:  # a top-level (outer) shell
+            voids = [shells[k] for k in range(len(shells)) if parent[k] == i]
+            groups.append((shell, voids))
+    return groups

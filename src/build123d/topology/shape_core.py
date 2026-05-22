@@ -69,6 +69,8 @@ from typing import (
 from typing import cast as tcast
 from typing import overload
 
+import numpy as np
+
 import OCP.GeomAbs as ga
 import OCP.TopAbs as ta
 from anytree import NodeMixin, RenderTree
@@ -1601,12 +1603,22 @@ class Shape(NodeMixin, Generic[TOPODS]):
         shape_copy.wrapped.Location(loc.wrapped)
         return shape_copy
 
-    def mesh(self, tolerance: float, angular_tolerance: float = 0.1):
+    def mesh(
+        self,
+        tolerance: float,
+        angular_tolerance: float = 0.1,
+        *,
+        relative: bool = True,
+    ):
         """Generate triangulation if none exists.
 
         Args:
           tolerance: float:
           angular_tolerance: float:  (Default value = 0.1)
+          relative: bool: when True (the default) ``tolerance`` is a relative
+            linear deflection that scales per edge; when False it is an absolute
+            deflection in model units, which keeps parts of different sizes on a
+            common grid (useful for mesh CSG). Defaults to True.
 
         Returns:
 
@@ -1616,7 +1628,7 @@ class Shape(NodeMixin, Generic[TOPODS]):
 
         if not BRepTools.Triangulation_s(self.wrapped, tolerance):
             BRepMesh_IncrementalMesh(
-                self.wrapped, tolerance, True, angular_tolerance, True
+                self.wrapped, tolerance, relative, angular_tolerance, True
             )
 
     def mirror(self, mirror_plane: Plane | None = None) -> Self:
@@ -2239,13 +2251,39 @@ class Shape(NodeMixin, Generic[TOPODS]):
         return right if left_inside else left
 
     def tessellate(
-        self, tolerance: float, angular_tolerance: float = 0.1
+        self,
+        tolerance: float,
+        angular_tolerance: float = 0.1,
+        *,
+        weld: bool = False,
+        relative: bool = True,
     ) -> tuple[list[Vector], list[tuple[int, int, int]]]:
-        """General triangulated approximation"""
+        """General triangulated approximation
+
+        Args:
+            tolerance (float): linear deflection of the triangulation.
+            angular_tolerance (float, optional): angular deflection in radians.
+                Defaults to 0.1.
+            weld (bool, optional): when True, merge coincident vertices across
+                face seams so the returned mesh is a single indexed,
+                cross-face-deduplicated triangle mesh (a box yields 8 vertices,
+                not 24). OCCT triangulates each face independently, so the
+                default un-welded result duplicates every seam vertex; a welded
+                mesh is required for watertight downstream consumers such as
+                ``manifold3d``. Defaults to False (backward-compatible: the
+                un-welded per-face soup, unchanged).
+            relative (bool, optional): when True ``tolerance`` is a relative
+                linear deflection; when False it is absolute (see :meth:`mesh`).
+                Defaults to True.
+
+        Returns:
+            tuple[list[Vector], list[tuple[int, int, int]]]: vertices and the
+            triangle vertex-index triples.
+        """
         if self._wrapped is None:
             raise ValueError("Cannot tessellate an empty shape")
 
-        self.mesh(tolerance, angular_tolerance)
+        self.mesh(tolerance, angular_tolerance, relative=relative)
 
         vertices: list[Vector] = []
         triangles: list[tuple[int, int, int]] = []
@@ -2284,6 +2322,9 @@ class Shape(NodeMixin, Generic[TOPODS]):
             ]
 
             offset += poly.NbNodes()
+
+        if weld:
+            vertices, triangles = _weld_mesh(vertices, triangles)
 
         return vertices, triangles
 
@@ -3602,6 +3643,59 @@ class SkipClean:
 
     def __exit__(self, exception_type, exception_value, traceback):
         SkipClean.clean = True
+
+
+def _weld_mesh(
+    vertices: list[Vector],
+    triangles: list[tuple[int, int, int]],
+    decimals: int = 6,
+) -> tuple[list[Vector], list[tuple[int, int, int]]]:
+    """Merge coincident vertices of a triangle mesh and re-index its triangles.
+
+    OCCT triangulates each face independently, so :meth:`Shape.tessellate`
+    returns a per-face vertex soup — seam vertices are duplicated and the mesh
+    is topologically open everywhere. This welds it back into a single indexed
+    mesh by grid-snapping each vertex to ``decimals`` decimal places (matching
+    build123d's ``TOLERANCE`` of ``1e-6`` and ``Mesher``'s 3MF dedup scheme),
+    grouping equal snapped coordinates, and averaging the original (un-snapped)
+    coordinates within each group so no grid bias is introduced. Triangles that
+    become degenerate after welding (two indices coincide) are dropped.
+
+    Args:
+        vertices: the per-face vertex soup from :meth:`Shape.tessellate`.
+        triangles: the triangle vertex-index triples.
+        decimals: number of decimal places to snap to. Defaults to 6.
+
+    Returns:
+        The welded vertices and re-indexed triangles.
+    """
+    if not vertices or not triangles:
+        return vertices, triangles
+
+    vertex_array = np.array([(v.X, v.Y, v.Z) for v in vertices], dtype=np.float64)
+    triangle_array = np.array(triangles, dtype=np.int64)
+
+    # Snap to a grid, then take the unique rows; `inverse` maps each old vertex
+    # index to its welded index — exactly the re-indexing the triangles need.
+    snapped = np.round(vertex_array, decimals)
+    unique_snapped, inverse = np.unique(snapped, axis=0, return_inverse=True)
+    inverse = inverse.reshape(-1)  # numpy>=2 can return shape (N, 1)
+
+    # Average the original coordinates per cluster to keep full precision.
+    welded = np.zeros((len(unique_snapped), 3), dtype=np.float64)
+    counts = np.zeros(len(unique_snapped), dtype=np.int64)
+    np.add.at(welded, inverse, vertex_array)
+    np.add.at(counts, inverse, 1)
+    welded /= counts[:, None]
+
+    remapped = inverse[triangle_array]
+    corner_a, corner_b, corner_c = remapped[:, 0], remapped[:, 1], remapped[:, 2]
+    keep = (corner_a != corner_b) & (corner_b != corner_c) & (corner_a != corner_c)
+    remapped = remapped[keep]
+
+    welded_vertices = [Vector(float(x), float(y), float(z)) for x, y, z in welded]
+    welded_triangles = [(int(a), int(b), int(c)) for a, b, c in remapped]  # noqa: E741
+    return welded_vertices, welded_triangles
 
 
 def _sew_topods_faces(faces: Iterable[TopoDS_Face]) -> TopoDS_Shape:

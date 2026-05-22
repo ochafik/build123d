@@ -67,6 +67,11 @@ ocp_vscode = [
     "ocp_vscode",
 ]
 
+# enable the optional manifold3d fast mesh-CSG backend (build123d.mesh)
+manifold = [
+    "manifold3d >= 3.4, < 4",
+]
+
 # development dependencies
 development = [
     "black",
