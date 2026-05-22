@@ -164,27 +164,36 @@ build123d has **no kernel abstraction layer** — OCP is assumed in every module
 produce correctly-typed `Part`/`Solid` results without import cycles. Reuse it;
 touch nothing else in core that an opt-in extra shouldn't.
 
-### P7 — Fillet/chamfer before meshing; operation ordering is one-way
+### P7 — Operation ordering: where fillet/chamfer sit relative to the mesh stage
 
-The mesh backend replaces *booleans* (and adds hull / Minkowski / SDF). It never
-replaces *finishing* operations: `fillet`, `chamfer`, `loft`, `sweep`, exact
-`shell`/`offset`, draft, and STEP-fidelity export are BREP-only — they need the
-analytic edges and surfaces a triangle mesh does not have (`p8` VERDICT; §6.5).
-And because BREP→mesh→BREP returns a *faceted* `Solid` with no analytic edges, a
-`fillet()` *after* a mesh stage has nothing to grab. The modelling pipeline is
-therefore one-way:
+The mesh backend replaces *booleans* (and adds hull / Minkowski / SDF); it does
+not itself perform *finishing* operations — `fillet`, `chamfer`, `loft`,
+`sweep`, exact `shell`/`offset`, draft — which are BREP-only. What matters is
+what survives a trip *through* the mesh stage, and `p9` proved the answer splits
+cleanly on planar vs curved:
+
+- **All-planar CSG → fillet/chamfer *after* the mesh stage is a supported
+  path.** With systematic faceID seeding (§3.4), an all-planar manifold result
+  reconstructs to an *exact, analytic* B-rep — planar faces on the known
+  `Geom_Plane`, exact straight edges, bit-exact volume. Real `BRepFilletAPI`
+  fillet/chamfer run on it and yield genuine analytic blend faces (`p9` payoff:
+  same face/edge count as the native boolean, 17/17 tests, STEP-valid). For
+  flat-faced parts the mesh path is *not* "faceted only."
+- **Curved geometry → fillet/chamfer must happen *before* the mesh stage.** A
+  curved face that is tessellated and meshed returns faceted; faceID still
+  identifies "this region lies on `Geom_Cylinder r=R`" but exact re-trim is
+  unsolved (Tier C). A `fillet` on a curved mesh-origin region has no analytic
+  surface to blend — it must raise (P3), never mis-answer.
+
+So the rule is not a blanket "fillet before meshing"; it is: **curved finishing
+before the mesh stage; planar finishing may come after.**
 
 ```
-BREP feature modelling → fillet / chamfer → mesh backend (bulk CSG, hull,
-   Minkowski) → bake once → faceted Solid → export
+exact BREP modelling ─► curved fillet/chamfer ─► mesh backend (bulk CSG,
+   hull, Minkowski) ─► faceID-seeded bake ─► planar fillet/chamfer ─► export
+                                                │  planar → exact analytic B-rep
+                                                │  curved → faceted (id kept)
 ```
-
-Fillets and chamfers belong on BREP, *before* geometry enters the mesh backend —
-never after. The API enforces this structurally: `MeshPart` exposes no
-`fillet`/`chamfer`, and a curved-analytic selector on a meshed result raises
-(P3, §6.5). The one partial exception — a planar–planar edge can sometimes be
-re-fitted and filleted after `ReFacer` reconstruction — is fragile and not a
-supported path.
 
 ---
 
