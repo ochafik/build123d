@@ -1,0 +1,47 @@
+=== mesh -> build123d Solid scaling benchmark ===
+(r=20 sphere, triangle count via manifold3d refine())
+
+--- target 1000: 512 triangles, 258 verts, manifold vol=32761.761 ---
+  A sewing       :      0.11 s        4827 tri/s  valid=True   faces=512  vol_err=0.0000%
+  B direct+fix   :      0.12 s        4252 tri/s  valid=True   faces=512  vol_err=0.0000%
+  B direct nofix :      0.03 s       18964 tri/s  valid=True   faces=512  vol_err=0.0000%
+
+--- target 10000: 8192 triangles, 4098 verts, manifold vol=32761.761 ---
+  A sewing       :      2.92 s        2804 tri/s  valid=True   faces=8192  vol_err=0.0000%
+  B direct+fix   :      2.51 s        3258 tri/s  valid=True   faces=8192  vol_err=0.0000%
+  B direct nofix :      0.43 s       18886 tri/s  valid=True   faces=8192  vol_err=0.0000%
+
+--- target 100000: 100352 triangles, 50178 verts, manifold vol=32761.761 ---
+  A sewing       :     94.72 s        1059 tri/s  valid=True   faces=100352  vol_err=0.0000%
+  B direct+fix   :     41.63 s        2410 tri/s  valid=True   faces=100352  vol_err=0.0000%
+  B direct nofix :      5.16 s       19463 tri/s  valid=True   faces=100352  vol_err=0.0000%
+
+--- target 1000000: 991232 triangles, 495618 verts, manifold vol=32761.761 ---
+  A sewing       : SKIPPED (>150000 tris -- minutes)
+  B direct+fix   : SKIPPED (ShapeFix_Shell super-linear)
+  B direct nofix :     52.79 s       18778 tri/s  valid=True   faces=-1  vol_err=0.0000%
+
+
+=== TIME TABLE (seconds, lower is better) ===
+
+   target      tris |         A sewing |     B direct+fix |   B direct nofix
+----------------------------------------------------------------------------
+     1000       512 |            0.106 |            0.120 |            0.027
+    10000      8192 |            2.922 |            2.515 |            0.434
+   100000    100352 |           94.724 |           41.633 |            5.156
+  1000000    991232 |          skipped |          skipped |           52.786
+
+=== THROUGHPUT TABLE (tri/s, higher is better) ===
+
+   target      tris |         A sewing |     B direct+fix |   B direct nofix
+----------------------------------------------------------------------------
+     1000       512 |             4827 |             4252 |            18964
+    10000      8192 |             2804 |             3258 |            18886
+   100000    100352 |             1059 |             2410 |            19463
+  1000000    991232 |          skipped |          skipped |            18778
+
+=== direct-nofix scaling exponent (time ~ tris^k; k~1 => linear) ===
+
+       512 ->     8192 tris : k = 1.00
+      8192 ->   100352 tris : k = 0.99
+    100352 ->   991232 tris : k = 1.02

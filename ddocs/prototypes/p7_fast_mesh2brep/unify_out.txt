@@ -1,0 +1,27 @@
+=== Coplanar-merge post-pass (ShapeUpgrade_UnifySameDomain) ===
+
+[cube (flat)]  (12 tris)
+  before unify : faces=    12 edges=    18
+  after  unify : faces=     6 edges=    12  (0.5 ms)  -> 50.0% fewer faces
+  valid=True  vol 1000.0000 -> 1000.0000  (err 0.0000%)
+
+[cylinder (2 flat caps + faceted wall)]  (188 tris)
+  before unify : faces=   188 edges=   282
+  after  unify : faces=    50 edges=   144  (3.9 ms)  -> 73.4% fewer faces
+  valid=True  vol 4009.7645 -> 4009.7645  (err 0.0000%)
+
+[cube with through-hole]  (208 tris)
+  before unify : faces=   208 edges=   312
+  after  unify : faces=    54 edges=   156  (4.2 ms)  -> 74.0% fewer faces
+  valid=True  vol 3498.7794 -> 3498.7794  (err 0.0000%)
+
+[sphere (fully curved -- expect ~no merge)]  (2048 tris)
+  before unify : faces=  2048 edges=  3072
+  after  unify : faces=  2048 edges=  3072  (33.2 ms)  -> 0.0% fewer faces
+  valid=True  vol 4165.1364 -> 4165.1364  (err 0.0000%)
+
+[sphere minus box (CSG, large flat cuts)]  (2032 tris)
+  before unify : faces=  2032 edges=  3048
+  after  unify : faces=  1908 edges=  2924  (34.3 ms)  -> 6.1% fewer faces
+  valid=True  vol 4946.9484 -> 4946.9484  (err 0.0000%)
+

@@ -1,0 +1,6 @@
+=== 1M-triangle direct reconstruction (no-fix) ===
+
+generating r=20 sphere mesh, ~1M triangles via manifold3d refine ...
+  mesh: 991232 triangles, 495618 verts  (gen 0.2s)  manifold vol=32761.761
+
+reconstructing (direct, no ShapeFix) ...

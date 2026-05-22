@@ -1,0 +1,63 @@
+=== Validity & downstream-usability of direct-assembled Solids ===
+
+==============================================================================
+1. build123d Shape API on the reconstructed Solid
+==============================================================================
+
+[cube]  12 tris -> Solid (kind=Solid)
+  Solid.is_valid     : True
+  Solid.is_manifold  : True
+  .faces()/.edges()/.vertices(): 12 / 18 / 8
+  .bounding_box()    : (-5.00,-5.00,-5.00) .. (5.00,5.00,5.00)
+  .volume            : 1000.0000 (manifold ref 1000.0000)
+
+[sphere]  1152 tris -> Solid (kind=Solid)
+  Solid.is_valid     : True
+  Solid.is_manifold  : True
+  .faces()/.edges()/.vertices(): 1152 / 1728 / 578
+  .bounding_box()    : (-10.00,-10.00,-10.00) .. (10.00,10.00,10.00)
+  .volume            : 4146.8607 (manifold ref 4146.8607)
+
+[cube w/ hole]  144 tris -> Solid (kind=Solid)
+  Solid.is_valid     : True
+  Solid.is_manifold  : True
+  .faces()/.edges()/.vertices(): 144 / 216 / 72
+  .bounding_box()    : (-10.00,-10.00,-5.00) .. (10.00,10.00,5.00)
+  .volume            : 3500.5688 (manifold ref 3500.5688)
+
+==============================================================================
+2. build123d boolean on a reconstructed Solid
+==============================================================================
+
+[sphere]  reconstructed solid - native Box(8,8,40):
+  build123d boolean  : 91.8 ms  valid=True  vol=5693.0318  manifold ref=5693.0319  err=0.0000%
+  result faces       : 1092
+
+[cylinder]  reconstructed solid - native Box(8,8,40):
+  build123d boolean  : 20.7 ms  valid=True  vol=8117.8858  manifold ref=8117.8858  err=0.0000%
+  result faces       : 55
+
+==============================================================================
+3. STEP export round-trip
+==============================================================================
+
+[cube]  STEP round-trip:
+  export   : 4.5 ms  23.9 KB
+  re-import: 3.6 ms  valid=True  faces=12  vol=1000.0000  err=0.0000%
+
+[sphere]  STEP round-trip:
+  export   : 108.9 ms  2638.2 KB
+  re-import: 226.3 ms  valid=True  faces=1152  vol=4146.8607  err=0.0000%
+
+==============================================================================
+4. winding robustness of the no-fix shortcut
+==============================================================================
+(manifold3d guarantees consistent winding; what if it is broken?)
+
+[cube]  winding robustness (12 tris, 3 flipped):
+  no-fix : valid=False  vol=500.0000  err=50.0000%
+  +fix   : valid=True   vol=1000.0000  err=0.0000%
+
+[sphere]  winding robustness (512 tris, 103 flipped):
+  no-fix : valid=False  vol=2440.7575  err=40.3998%
+  +fix   : valid=True   vol=4095.2200  err=0.0000%

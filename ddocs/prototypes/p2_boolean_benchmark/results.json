@@ -1,0 +1,820 @@
+{
+  "meta": {
+    "quick": false,
+    "timeout_s": 120.0,
+    "tess_tol": 0.05
+  },
+  "workloads": {
+    "union_grid": [
+      {
+        "label": "occ_union_grid",
+        "arg": 10,
+        "status": "ok",
+        "outer_wall": 4.230478292010957,
+        "data": {
+          "n": 10,
+          "t_build": 0.003183666995028034,
+          "t_bool": 0.06750225000723731,
+          "wall": 0.07068591700226534,
+          "volume": 59.456,
+          "valid": true,
+          "faces": 9
+        }
+      },
+      {
+        "label": "manifold_union_grid",
+        "arg": 10,
+        "status": "ok",
+        "outer_wall": 3.115380290997564,
+        "data": {
+          "n": 10,
+          "t_build": 6.791600026190281e-05,
+          "t_bool": 0.0025114169984590262,
+          "t_bake": 0.01835137499438133,
+          "wall": 0.002579332998720929,
+          "wall_with_bake": 0.02093070799310226,
+          "volume": 59.456,
+          "tris": 142,
+          "bake": {
+            "verts": 73,
+            "tris": 142,
+            "n_shells": 1,
+            "result": "solid"
+          }
+        }
+      },
+      {
+        "label": "occ_union_grid",
+        "arg": 50,
+        "status": "ok",
+        "outer_wall": 3.5509667090082075,
+        "data": {
+          "n": 50,
+          "t_build": 0.015704082994489,
+          "t_bool": 0.6474420000013197,
+          "wall": 0.6631460829958087,
+          "volume": 251.96800000000007,
+          "valid": true,
+          "faces": 9
+        }
+      },
+      {
+        "label": "manifold_union_grid",
+        "arg": 50,
+        "status": "ok",
+        "outer_wall": 2.6263375409907894,
+        "data": {
+          "n": 50,
+          "t_build": 0.0002763340016826987,
+          "t_bool": 0.006183583012898453,
+          "t_bake": 0.051401415999862365,
+          "wall": 0.006459917014581151,
+          "wall_with_bake": 0.05786133301444352,
+          "volume": 251.96800000000007,
+          "tris": 396,
+          "bake": {
+            "verts": 200,
+            "tris": 396,
+            "n_shells": 1,
+            "result": "solid"
+          }
+        }
+      },
+      {
+        "label": "occ_union_grid",
+        "arg": 200,
+        "status": "ok",
+        "outer_wall": 4.610934666998219,
+        "data": {
+          "n": 200,
+          "t_build": 0.06702958401001524,
+          "t_bool": 1.8828495000052499,
+          "wall": 1.949879084015265,
+          "volume": 932.416,
+          "valid": true,
+          "faces": 10
+        }
+      },
+      {
+        "label": "manifold_union_grid",
+        "arg": 200,
+        "status": "ok",
+        "outer_wall": 3.302163999993354,
+        "data": {
+          "n": 200,
+          "t_build": 0.0008226659992942587,
+          "t_bool": 0.01870841700292658,
+          "t_bake": 0.1572041250037728,
+          "wall": 0.01953108300222084,
+          "wall_with_bake": 0.17673520800599363,
+          "volume": 932.416,
+          "tris": 1020,
+          "bake": {
+            "verts": 512,
+            "tris": 1020,
+            "n_shells": 1,
+            "result": "solid"
+          }
+        }
+      },
+      {
+        "label": "occ_union_grid",
+        "arg": 1000,
+        "status": "ok",
+        "outer_wall": 27.7608382920007,
+        "data": {
+          "n": 1000,
+          "t_build": 0.4449772079969989,
+          "t_bool": 20.874898416004726,
+          "wall": 21.319875624001725,
+          "volume": 4410.944,
+          "valid": true,
+          "faces": 6
+        }
+      },
+      {
+        "label": "manifold_union_grid",
+        "arg": 1000,
+        "status": "ok",
+        "outer_wall": 3.4801962500059744,
+        "data": {
+          "n": 1000,
+          "t_build": 0.023158666997915134,
+          "t_bool": 0.1380067499994766,
+          "t_bake": 0.5319723340071505,
+          "wall": 0.16116541699739173,
+          "wall_with_bake": 0.6931377510045422,
+          "volume": 4410.944,
+          "tris": 2636,
+          "bake": {
+            "verts": 1320,
+            "tris": 2636,
+            "n_shells": 1,
+            "result": "solid"
+          }
+        }
+      },
+      {
+        "label": "occ_union_grid",
+        "arg": 2000,
+        "status": "ok",
+        "outer_wall": 37.64691470899561,
+        "data": {
+          "n": 2000,
+          "t_build": 0.7286200829985319,
+          "t_bool": 33.73497375000443,
+          "wall": 34.46359383300296,
+          "volume": 8692.288000000002,
+          "valid": true,
+          "faces": 10
+        }
+      },
+      {
+        "label": "manifold_union_grid",
+        "arg": 2000,
+        "status": "ok",
+        "outer_wall": 3.9734664159914246,
+        "data": {
+          "n": 2000,
+          "t_build": 0.00828708401240874,
+          "t_bool": 0.2488630410080077,
+          "t_bake": 1.0354264170018723,
+          "wall": 0.25715012502041645,
+          "wall_with_bake": 1.2925765420222888,
+          "volume": 8692.288000000002,
+          "tris": 5586,
+          "bake": {
+            "verts": 2795,
+            "tris": 5586,
+            "n_shells": 1,
+            "result": "solid"
+          }
+        }
+      }
+    ],
+    "csg_tree": [
+      {
+        "label": "occ_csg_tree",
+        "arg": 4,
+        "status": "ok",
+        "outer_wall": 3.1123924999992596,
+        "data": {
+          "n": 4,
+          "wall": 0.08659958299540449,
+          "volume": 1636.5881555000788,
+          "valid": true,
+          "faces": 18
+        }
+      },
+      {
+        "label": "manifold_csg_tree",
+        "arg": 4,
+        "status": "ok",
+        "outer_wall": 2.721861458994681,
+        "data": {
+          "n": 4,
+          "wall": 0.003137749998131767,
+          "wall_with_bake": 0.1745815829926869,
+          "t_bake": 0.17144383299455512,
+          "volume": 1638.7446182076333,
+          "tris": 1122,
+          "bake": {
+            "verts": 565,
+            "tris": 1122,
+            "n_shells": 2,
+            "result": "solid"
+          }
+        }
+      },
+      {
+        "label": "occ_csg_tree",
+        "arg": 8,
+        "status": "ok",
+        "outer_wall": 2.7726723329978995,
+        "data": {
+          "n": 8,
+          "wall": 0.17186950000177603,
+          "volume": 1545.6008733472681,
+          "valid": true,
+          "faces": 30
+        }
+      },
+      {
+        "label": "manifold_csg_tree",
+        "arg": 8,
+        "status": "ok",
+        "outer_wall": 5.800345959010883,
+        "data": {
+          "n": 8,
+          "wall": 0.008645791007438675,
+          "wall_with_bake": 0.9086424580018502,
+          "t_bake": 0.8999966669944115,
+          "volume": 1549.890048133402,
+          "tris": 2284,
+          "bake": {
+            "verts": 1146,
+            "tris": 2284,
+            "n_shells": 2,
+            "result": "solid"
+          }
+        }
+      },
+      {
+        "label": "occ_csg_tree",
+        "arg": 12,
+        "status": "ok",
+        "outer_wall": 7.117279749989393,
+        "data": {
+          "n": 12,
+          "wall": 0.9523739160067635,
+          "volume": 1453.971134665769,
+          "valid": true,
+          "faces": 41
+        }
+      },
+      {
+        "label": "manifold_csg_tree",
+        "arg": 12,
+        "status": "ok",
+        "outer_wall": 7.5960273329983465,
+        "data": {
+          "n": 12,
+          "wall": 0.020205207998515107,
+          "wall_with_bake": 1.0222141669946723,
+          "t_bake": 1.0020089589961572,
+          "volume": 1460.3633885279346,
+          "tris": 3432,
+          "bake": {
+            "verts": 1720,
+            "tris": 3432,
+            "n_shells": 2,
+            "result": "solid"
+          }
+        }
+      },
+      {
+        "label": "occ_csg_tree",
+        "arg": 16,
+        "status": "ok",
+        "outer_wall": 5.321525417006342,
+        "data": {
+          "n": 16,
+          "wall": 0.48145649999787565,
+          "volume": 1370.5736081110729,
+          "valid": true,
+          "faces": 51
+        }
+      },
+      {
+        "label": "manifold_csg_tree",
+        "arg": 16,
+        "status": "ok",
+        "outer_wall": 3.6718925409950316,
+        "data": {
+          "n": 16,
+          "wall": 0.02371504199982155,
+          "wall_with_bake": 0.8872852920030709,
+          "t_bake": 0.8635702500032494,
+          "volume": 1378.7563807066485,
+          "tris": 4550,
+          "bake": {
+            "verts": 2277,
+            "tris": 4550,
+            "n_shells": 1,
+            "result": "solid"
+          }
+        }
+      },
+      {
+        "label": "occ_csg_tree",
+        "arg": 20,
+        "status": "ok",
+        "outer_wall": 6.472966000001179,
+        "data": {
+          "n": 20,
+          "wall": 1.0066494580096332,
+          "volume": 1323.907842177346,
+          "valid": true,
+          "faces": 65
+        }
+      },
+      {
+        "label": "manifold_csg_tree",
+        "arg": 20,
+        "status": "ok",
+        "outer_wall": 3.8411444579978706,
+        "data": {
+          "n": 20,
+          "wall": 0.03565537500253413,
+          "wall_with_bake": 0.9369431249942863,
+          "t_bake": 0.9012877499917522,
+          "volume": 1333.4550627692245,
+          "tris": 5414,
+          "bake": {
+            "verts": 2707,
+            "tris": 5414,
+            "n_shells": 1,
+            "result": "solid"
+          }
+        }
+      }
+    ],
+    "degenerate": [
+      {
+        "label": "occ_degenerate",
+        "arg": "coplanar_touch_union",
+        "status": "ok",
+        "outer_wall": 2.9865936249989318,
+        "data": {
+          "case": "coplanar_touch_union",
+          "wall": 0.011178500004461966,
+          "volume": 1.9999999999999996,
+          "valid": true,
+          "faces": 6
+        },
+        "expected_volume": 2.0
+      },
+      {
+        "label": "manifold_degenerate",
+        "arg": "coplanar_touch_union",
+        "status": "ok",
+        "outer_wall": 0.09079712501261383,
+        "data": {
+          "case": "coplanar_touch_union",
+          "wall": 0.00011041600373573601,
+          "volume": 2.0,
+          "tris": 20,
+          "empty": false
+        },
+        "expected_volume": 2.0
+      },
+      {
+        "label": "occ_degenerate",
+        "arg": "flush_face_cut",
+        "status": "ok",
+        "outer_wall": 2.7230581249896204,
+        "data": {
+          "case": "flush_face_cut",
+          "wall": 0.002795500011416152,
+          "volume": 55.999999999999986,
+          "valid": true,
+          "faces": 11
+        },
+        "expected_volume": 56.0
+      },
+      {
+        "label": "manifold_degenerate",
+        "arg": "flush_face_cut",
+        "status": "ok",
+        "outer_wall": 0.0819528749998426,
+        "data": {
+          "case": "flush_face_cut",
+          "wall": 7.120799273252487e-05,
+          "volume": 56.0,
+          "tris": 28,
+          "empty": false
+        },
+        "expected_volume": 56.0
+      },
+      {
+        "label": "occ_degenerate",
+        "arg": "self_subtract_empty",
+        "status": "ok",
+        "outer_wall": 2.495342249996611,
+        "data": {
+          "case": "self_subtract_empty",
+          "wall": 0.003033000000868924,
+          "volume": 0,
+          "valid": true,
+          "faces": 0
+        },
+        "expected_volume": 0.0
+      },
+      {
+        "label": "manifold_degenerate",
+        "arg": "self_subtract_empty",
+        "status": "ok",
+        "outer_wall": 0.11189116700552404,
+        "data": {
+          "case": "self_subtract_empty",
+          "wall": 4.8165995394811034e-05,
+          "volume": 0.0,
+          "tris": 0,
+          "empty": true
+        },
+        "expected_volume": 0.0
+      },
+      {
+        "label": "occ_degenerate",
+        "arg": "edge_touch_union",
+        "status": "ok",
+        "outer_wall": 3.2449116250063526,
+        "data": {
+          "case": "edge_touch_union",
+          "wall": 0.004157542003667913,
+          "volume": 1.9999999999999996,
+          "valid": true,
+          "faces": 12
+        },
+        "expected_volume": 2.0
+      },
+      {
+        "label": "manifold_degenerate",
+        "arg": "edge_touch_union",
+        "status": "ok",
+        "outer_wall": 0.10491337500570808,
+        "data": {
+          "case": "edge_touch_union",
+          "wall": 9.383399446960539e-05,
+          "volume": 2.0,
+          "tris": 24,
+          "empty": false
+        },
+        "expected_volume": 2.0
+      },
+      {
+        "label": "occ_degenerate",
+        "arg": "tangent_wall_cut",
+        "status": "ok",
+        "outer_wall": 3.2960188330034725,
+        "data": {
+          "case": "tangent_wall_cut",
+          "wall": 0.013313249990460463,
+          "volume": 38.867258771281655,
+          "valid": true,
+          "faces": 6
+        },
+        "expected_volume": null
+      },
+      {
+        "label": "manifold_degenerate",
+        "arg": "tangent_wall_cut",
+        "status": "ok",
+        "outer_wall": 0.09489491701242514,
+        "data": {
+          "case": "tangent_wall_cut",
+          "wall": 0.0005391250015236437,
+          "volume": 38.907612075632485,
+          "tris": 136,
+          "empty": false
+        },
+        "expected_volume": null
+      },
+      {
+        "label": "occ_degenerate",
+        "arg": "identical_intersect",
+        "status": "ok",
+        "outer_wall": 2.764534709000145,
+        "data": {
+          "case": "identical_intersect",
+          "wall": 0.003721542001585476,
+          "volume": 7.999999999999998,
+          "valid": true,
+          "faces": 6
+        },
+        "expected_volume": 8.0
+      },
+      {
+        "label": "manifold_degenerate",
+        "arg": "identical_intersect",
+        "status": "ok",
+        "outer_wall": 0.08133133299998008,
+        "data": {
+          "case": "identical_intersect",
+          "wall": 5.7958997786045074e-05,
+          "volume": 8.0,
+          "tris": 12,
+          "empty": false
+        },
+        "expected_volume": 8.0
+      },
+      {
+        "label": "occ_degenerate",
+        "arg": "zero_wall_cut",
+        "status": "ok",
+        "outer_wall": 2.5325827920023585,
+        "data": {
+          "case": "zero_wall_cut",
+          "wall": 0.0040276670042658225,
+          "volume": 31.999999999999993,
+          "valid": true,
+          "faces": 6
+        },
+        "expected_volume": 32.0
+      },
+      {
+        "label": "manifold_degenerate",
+        "arg": "zero_wall_cut",
+        "status": "ok",
+        "outer_wall": 0.09394104199600406,
+        "data": {
+          "case": "zero_wall_cut",
+          "wall": 0.00018104199261870235,
+          "volume": 31.999999999999996,
+          "tris": 12,
+          "empty": false
+        },
+        "expected_volume": 32.0
+      },
+      {
+        "label": "occ_degenerate",
+        "arg": "coplanar_stack_40",
+        "status": "ok",
+        "outer_wall": 2.7117109159880783,
+        "data": {
+          "case": "coplanar_stack_40",
+          "wall": 0.18736816600721795,
+          "volume": 39.99999999999999,
+          "valid": true,
+          "faces": 6
+        },
+        "expected_volume": 40.0
+      },
+      {
+        "label": "manifold_degenerate",
+        "arg": "coplanar_stack_40",
+        "status": "ok",
+        "outer_wall": 0.12480712500109803,
+        "data": {
+          "case": "coplanar_stack_40",
+          "wall": 0.004022749999421649,
+          "volume": 40.0,
+          "tris": 324,
+          "empty": false
+        },
+        "expected_volume": 40.0
+      },
+      {
+        "label": "occ_degenerate",
+        "arg": "sub_tolerance_offset_cut",
+        "status": "ok",
+        "outer_wall": 2.5233439590083435,
+        "data": {
+          "case": "sub_tolerance_offset_cut",
+          "wall": 0.00459075000253506,
+          "volume": 60.0000004,
+          "valid": true,
+          "faces": 11
+        },
+        "expected_volume": null
+      },
+      {
+        "label": "manifold_degenerate",
+        "arg": "sub_tolerance_offset_cut",
+        "status": "ok",
+        "outer_wall": 0.08440587499353569,
+        "data": {
+          "case": "sub_tolerance_offset_cut",
+          "wall": 7.479199848603457e-05,
+          "volume": 60.0000004,
+          "tris": 28,
+          "empty": false
+        },
+        "expected_volume": null
+      },
+      {
+        "label": "occ_degenerate",
+        "arg": "cylinder_tangent_union",
+        "status": "ok",
+        "outer_wall": 2.7578152080095606,
+        "data": {
+          "case": "cylinder_tangent_union",
+          "wall": 0.007754207996185869,
+          "volume": 25.132741228718345,
+          "valid": true,
+          "faces": 7
+        },
+        "expected_volume": null
+      },
+      {
+        "label": "manifold_degenerate",
+        "arg": "cylinder_tangent_union",
+        "status": "ok",
+        "outer_wall": 0.08522512500348967,
+        "data": {
+          "case": "cylinder_tangent_union",
+          "wall": 0.00047933400492183864,
+          "volume": 25.092387924367515,
+          "tris": 504,
+          "empty": false
+        },
+        "expected_volume": null
+      }
+    ],
+    "drill": [
+      {
+        "label": "occ_drill",
+        "arg": 10,
+        "status": "ok",
+        "outer_wall": 2.5308071250037756,
+        "data": {
+          "n": 10,
+          "t_build": 0.0028420830058166757,
+          "t_bool": 0.060453291996964253,
+          "wall": 0.06329537500278093,
+          "volume": 98743.3629385641,
+          "valid": true,
+          "faces": 16
+        }
+      },
+      {
+        "label": "manifold_drill",
+        "arg": 10,
+        "status": "ok",
+        "outer_wall": 2.8580412919982336,
+        "data": {
+          "n": 10,
+          "t_build": 0.0007777080027153715,
+          "t_bool": 0.006132666996563785,
+          "t_bake": 0.3117910419969121,
+          "wall": 0.006910374999279156,
+          "wall_with_bake": 0.31870141699619126,
+          "volume": 98746.94855468751,
+          "tris": 1972,
+          "bake": {
+            "verts": 968,
+            "tris": 1972,
+            "n_shells": 1,
+            "result": "solid"
+          }
+        }
+      },
+      {
+        "label": "occ_drill",
+        "arg": 50,
+        "status": "ok",
+        "outer_wall": 2.980151374998968,
+        "data": {
+          "n": 50,
+          "t_build": 0.012023208997561596,
+          "t_bool": 0.4209106670023175,
+          "wall": 0.4329338759998791,
+          "volume": 93716.81469282045,
+          "valid": true,
+          "faces": 56
+        }
+      },
+      {
+        "label": "manifold_drill",
+        "arg": 50,
+        "status": "ok",
+        "outer_wall": 4.904473999995389,
+        "data": {
+          "n": 50,
+          "t_build": 0.003471999996691011,
+          "t_bool": 0.02665958399302326,
+          "t_bake": 2.3394590839889133,
+          "wall": 0.030131583989714272,
+          "wall_with_bake": 2.3695906679786276,
+          "volume": 93734.74277343752,
+          "tris": 9812,
+          "bake": {
+            "verts": 4808,
+            "tris": 9812,
+            "n_shells": 1,
+            "result": "solid"
+          }
+        }
+      },
+      {
+        "label": "occ_drill",
+        "arg": 200,
+        "status": "ok",
+        "outer_wall": 6.698487875008141,
+        "data": {
+          "n": 200,
+          "t_build": 0.04769795900210738,
+          "t_bool": 4.029808125007548,
+          "wall": 4.077506084009656,
+          "volume": 74867.25877128191,
+          "valid": true,
+          "faces": 206
+        }
+      },
+      {
+        "label": "manifold_drill",
+        "arg": 200,
+        "status": "ok",
+        "outer_wall": 2.5920965419936692,
+        "data": {
+          "n": 200,
+          "t_build": 0.013774915991234593,
+          "t_bool": 0.07569379200867843,
+          "t_bake": null,
+          "wall": 0.08946870799991302,
+          "wall_with_bake": null,
+          "volume": 74938.9710937501,
+          "tris": 39212,
+          "bake": {
+            "tris": 39212,
+            "result": "bake skipped (>15000 tris)",
+            "skipped": true
+          }
+        }
+      },
+      {
+        "label": "occ_drill",
+        "arg": 500,
+        "status": "ok",
+        "outer_wall": 30.984828083004686,
+        "data": {
+          "n": 500,
+          "t_build": 0.12308408299577422,
+          "t_bool": 27.870490625005914,
+          "wall": 27.993574708001688,
+          "volume": 37168.146928204806,
+          "valid": true,
+          "faces": 506
+        }
+      },
+      {
+        "label": "manifold_drill",
+        "arg": 500,
+        "status": "ok",
+        "outer_wall": 3.0216904579865513,
+        "data": {
+          "n": 500,
+          "t_build": 0.037247917003696784,
+          "t_bool": 0.22291483299341053,
+          "t_bake": null,
+          "wall": 0.2601627499971073,
+          "wall_with_bake": null,
+          "volume": 37347.42773437524,
+          "tris": 98012,
+          "bake": {
+            "tris": 98012,
+            "result": "bake skipped (>15000 tris)",
+            "skipped": true
+          }
+        }
+      },
+      {
+        "label": "occ_drill",
+        "arg": 1000,
+        "status": "timeout",
+        "outer_wall": 120.01907158299582
+      },
+      {
+        "label": "manifold_drill",
+        "arg": 1000,
+        "status": "ok",
+        "outer_wall": 4.255137750005815,
+        "data": {
+          "n": 1000,
+          "t_build": 0.0691545000008773,
+          "t_bool": 0.4436852499929955,
+          "t_bake": null,
+          "wall": 0.5128397499938728,
+          "wall_with_bake": null,
+          "volume": 7945.682321428293,
+          "tris": 33388,
+          "bake": {
+            "tris": 33388,
+            "result": "bake skipped (>15000 tris)",
+            "skipped": true
+          }
+        }
+      }
+    ]
+  }
+}

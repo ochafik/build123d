@@ -1,0 +1,30 @@
+=== Direct-nofix phased breakdown, 1k..1M triangles ===
+
+[1000] 512 tris, 258 verts, 768 unique edges
+  build total  :    0.025 s       20223 tri/s  vol_err=0.0000%
+  phases: vertices=       1ms  edges+faces+shell=      24ms  make_solid=      0ms  wrap_b3d=0.09ms
+  is_valid()   : True  (0.03 s -- BRepCheck)
+
+[10000] 8192 tris, 4098 verts, 12288 unique edges
+  build total  :    0.406 s       20181 tri/s  vol_err=0.0000%
+  phases: vertices=       7ms  edges+faces+shell=     396ms  make_solid=      0ms  wrap_b3d=0.03ms
+  is_valid()   : True  (0.54 s -- BRepCheck)
+
+[100000] 100352 tris, 50178 verts, 150528 unique edges
+  build total  :    5.015 s       20010 tri/s  vol_err=0.0000%
+  phases: vertices=      89ms  edges+faces+shell=    4883ms  make_solid=      0ms  wrap_b3d=0.03ms
+  is_valid()   : True  (7.82 s -- BRepCheck)
+
+[1000000] 991232 tris, 495618 verts, 1486848 unique edges
+  build total  :   52.719 s       18802 tri/s  vol_err=0.0000%
+  phases: vertices=    1329ms  edges+faces+shell=   50522ms  make_solid=      0ms  wrap_b3d=0.03ms
+  is_valid()   : skipped(memory-heavy)
+
+=== build-time table (seconds) ===
+
+     tris     total     verts   edge+face   mkSolid      tri/s
+------------------------------------------------------------
+      512     0.025     0.001       0.024     0.000      20223
+     8192     0.406     0.007       0.396     0.000      20181
+   100352     5.015     0.089       4.883     0.000      20010
+   991232    52.719     1.329      50.522     0.000      18802

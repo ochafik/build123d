@@ -1,0 +1,33 @@
+#   OK   CSG-modules      valid    STEP-ok
+#   OK   CSG              valid    STEP-bad
+#   FAIL a11y             UNSUPPORTED: hull() of 3D solids — OCCT cannot synthesize th
+#   FAIL bosl2_math       front-end failure: name 'valid_range' is not defined
+#   FAIL bosl2_utility    front-end failure: 'function' object is not subscriptable
+#   FAIL box              UNSUPPORTED: hull() of 3D solids — OCCT cannot synthesize th
+#   OK   bug              valid    STEP-ok
+#   FAIL car              UNSUPPORTED: minkowski() — no BREP algorithm exists; definit
+#   TIMEOUT colors.scad      (>90s)
+#   TIMEOUT condensed-matter.scad (>90s)
+#   OK   cube             valid    STEP-ok
+#   FAIL customiser       renderer produced no geometry
+#   OK   cylinder         valid    STEP-ok
+#   OK   echo             valid    STEP-ok
+#   TIMEOUT example.scad     (>90s)
+#   FAIL extrusions       front-end failure: RotateExtrude.__init__() got an unexpecte
+#   FAIL import           render failure: Exception: Unknown file extension: .stl
+#   OK   lookup           valid    STEP-ok
+#   TIMEOUT menger.scad      (>90s)
+#   FAIL minkowski        UNSUPPORTED: minkowski() — no BREP algorithm exists; definit
+#   OK   mods1            valid    STEP-ok
+#   OK   mods2            valid    STEP-ok
+#   OK   polyhedron       valid    STEP-ok
+#   FAIL runtime          front-end failure: 
+#   FAIL scalemail        UNSUPPORTED: hull() of 3D solids — OCCT cannot synthesize th
+#   FAIL scopes           renderer produced no geometry
+#   OK   shapes           valid    STEP-ok
+#   OK   simplecolors     valid    STEP-ok
+#   FAIL simplecustom     UNSUPPORTED: hull() of 3D solids — OCCT cannot synthesize th
+#   OK   sphere           valid    STEP-ok
+#   OK   spheres          valid    STEP-ok
+#   FAIL torus            UNSUPPORTED: hull() of 3D solids — OCCT cannot synthesize th
+#   OK   vars             valid    STEP-ok

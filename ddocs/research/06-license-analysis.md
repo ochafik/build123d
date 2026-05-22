@@ -19,7 +19,7 @@
 | Goal | Verdict | Why |
 |---|---|---|
 | Ship a manifold3d mesh feature in build123d | **GO** | manifold3d is Apache-2.0, same as build123d. Pure-Apache combination. |
-| Merge scad2py into build123d, or ship as sibling package | **GO, with cleanup** | scad2py is intended Apache-2.0 but **has no LICENSE file** — fix that first. The transpiler design does not create a GPL obligation. |
+| Merge scad2py into build123d, or ship as sibling package | **GO, but TWO files must be dealt with first** | The owner is the sole copyright holder of his *original* scad2py code, so relicensing it to Apache-2.0 is unobstructed. **However**, `scad2py/calc.py` and `scad2py/colors.py` carry **GPL-2.0-or-later headers, copyright Clifford Wolf / Marius Kintel** — they are line-by-line ports of OpenSCAD C++ and are **NOT the owner's copyright**. They cannot be relicensed and cannot enter an Apache-2.0 build123d. See §6.4 / §8. |
 | Distribute build123d wheels (current state) | **GO** | The OCCT (LGPL+exception) dependency is dynamically linked via a separate wheel. Add a NOTICE file. |
 | Re-license / close-source any of this | **NO for OCCT path** | OCCT is LGPL — you can build *on top of* it but cannot relicense it. Not a problem for an open-source project; just be aware. |
 | Ship scad2py's `examples/` as-is | **CAUTION** | Some `.scad` examples (`bosl2_*.scad`) are derived from BOSL2 (BSD-2-Clause) and need attribution; others have unclear provenance. |
@@ -30,11 +30,17 @@
 **LGPL-2.1 + the Open CASCADE Exception 1.0**. Because OCCT is consumed as a
 *dynamically linked, separately distributed* binary (the `cadquery-ocp` / `cadquery-ocp-novtk`
 wheel), and because build123d is itself open source, the LGPL imposes only mild,
-satisfiable obligations (notice + ability for users to swap the library). Nothing in
-the stack pulls in GPL. OpenSCAD itself (GPL-2.0-or-later) is **not linked** by scad2py —
-scad2py is a re-implementation/transpiler, and transpiling source code does not make the
-transpiler a derivative of OpenSCAD. The main *action items* are housekeeping:
-add a `LICENSE` file to scad2py, add a `NOTICE` file, and clean up example-file provenance.
+satisfiable obligations (notice + ability for users to swap the library). The owner is the
+**sole copyright holder of his original scad2py code**, so he can place that code under any
+license he chooses (Apache-2.0) with zero relicensing friction — the missing LICENSE file
+is a formality, not a legal blocker. **The one genuine GPL landmine** is that two scad2py
+files (`calc.py`, `colors.py`) are *not* the owner's code — they are GPL-2.0+ ports of
+OpenSCAD C++ by Clifford Wolf / Marius Kintel, and they are *actively imported by core
+scad2py runtime modules*. Those two files must be re-implemented or removed before scad2py
+can ship inside Apache-2.0 build123d (see §6.4). The transpiler *architecture* itself does
+not create a GPL obligation — that conclusion stands. Remaining *action items* are
+housekeeping: add a `LICENSE` file to scad2py, add a `NOTICE` file, clean up example-file
+provenance, and resolve the two GPL-headed files.
 
 ---
 
@@ -296,7 +302,7 @@ the expression is not protected), and scad2py expresses them in a *different for
   `# Grammar re-implemented in PLY; OpenSCAD's parser.y and FreeCAD's importCSG.py were`
   `# consulted as references for the OpenSCAD language. No code copied from either.`
 
-### 6.3 Does scad2py depend on any GPL code transitively? — No.
+### 6.3 Does scad2py depend on any GPL code transitively (via PyPI dependencies)? — No.
 
 Walking scad2py's `requirements.txt`:
 `build`, `gradio` (Apache-2.0), `lxml` (BSD-3), `manifold3d` (Apache-2.0),
@@ -305,8 +311,9 @@ Walking scad2py's `requirements.txt`:
 for a dependency), `svg.path` (MIT), `typeguard` (MIT), the **trimesh fork** (MIT),
 and the *commented-out optional* `coacd` (**MIT**, confirmed) / `vhacdx`.
 
-**No GPL anywhere in scad2py's dependency graph.** The only OpenSCAD relationship is
-"reads its language," which §6.2 covers.
+**No GPL anywhere in scad2py's external dependency graph.** *However*, "no GPL via
+dependencies" is **not** the same as "no GPL in the scad2py tree" — see §6.4, which is the
+real landmine.
 
 > One real risk worth flagging in the dependency list: scad2py depends on a **personal
 > fork of trimesh** (`git+https://github.com/ochafik/trimesh.git@ochafik-svg-io-color`).
@@ -316,6 +323,85 @@ and the *commented-out optional* `coacd` (**MIT**, confirmed) / `vhacdx`.
 > either upstream the SVG-color patch to trimesh, publish the fork to PyPI, or vendor the
 > small patch. This is an engineering concern, not strictly a licensing one, but it would
 > block a clean build123d release.
+
+### 6.4 GPL code that IS inside the scad2py tree — `calc.py` and `colors.py` (LANDMINE)
+
+The owner has stated that all scad2py code is his own copyright *"unless stated
+otherwise."* A scan of the scad2py source for copyright/license headers surfaces exactly
+the *"otherwise"* case, and it is significant.
+
+**Two files carry explicit third-party copyright + GPL headers:**
+
+- `/Users/ochafik/github/scad2py/scad2py/calc.py` (186 lines)
+- `/Users/ochafik/github/scad2py/scad2py/colors.py` (231 lines)
+
+Both begin with the verbatim OpenSCAD GPL header:
+
+```
+#  OpenSCAD (www.openscad.org)
+#  Copyright (C) 2009-2011 Clifford Wolf <clifford@clifford.at> and
+#                          Marius Kintel <marius@kintel.net>
+#
+#  This program is free software; you can redistribute it and/or modify
+#  it under the terms of the GNU General Public License as published by
+#  the Free Software Foundation; either version 2 of the License, or
+#  (at your option) any later version.
+#  ...
+```
+
+and their bodies are **explicitly labelled line-by-line ports** of OpenSCAD C++ source —
+the in-file comments cite the exact upstream files and line numbers, e.g.:
+
+- `calc.py` → ports of `openscad/src/utils/calc.cc`, `src/core/TransformNode.cc`,
+  `src/utils/degree_trig.cc`.
+- `colors.py` → ports of `openscad/src/core/ColorNode.cc`, `src/glview/ColorMap.cc`.
+
+**Why this matters — these are NOT covered by the owner's "I can relicense it" statement.**
+The copyright in `calc.py`/`colors.py` belongs to **Clifford Wolf and Marius Kintel**, not
+to ochafik. A "port" / translation of source code from C++ to Python is, under copyright
+law, a **derivative work** — translation is one of the enumerated exclusive rights of a
+copyright holder. So these two files are **derivative works of GPL-2.0-or-later code**, and
+**they are themselves GPL-2.0-or-later**. The owner cannot relicense them; only Clifford
+Wolf / Marius Kintel could.
+
+This is materially different from the §6.2 conclusion. §6.2 says scad2py's *grammar/parser
+architecture* is a clean re-implementation that does not create a GPL obligation — that
+remains true and was verified. But `calc.py` and `colors.py` are **not** re-implementations
+of an interface; by their own headers and comments they are *direct translations of
+OpenSCAD's implementation code*. That is exactly the kind of copying that the GPL reaches.
+
+**They are not dead code.** A reverse-dependency scan shows `scad2py.calc` and
+`scad2py.colors` are imported by core runtime modules — `scad2py/csg.py`, `scad2py/io.py`,
+`scad2py/runtime/modules.py`, `scad2py/rendering/rendering.py`,
+`scad2py/rendering/manifold_renderer.py`, `scad2py/rendering/modifiers_rendering.py`.
+`get_fragments_from_r` (the `$fn/$fs/$fa` circle-tessellation function) and the OpenSCAD
+color tables / `parse_color` are on the **hot path** of producing geometry. So scad2py *as
+it stands today* is a combined work that includes GPL-2.0+ code.
+
+**Consequence for the build123d merge.** You **cannot** drop `calc.py`/`colors.py` into an
+Apache-2.0 build123d (or even ship scad2py-as-Apache-2.0) while those files remain GPL
+ports. The Apache-2.0 ↔ GPL-2.0 incompatibility (§5) bites here. Two clean fixes:
+
+1. **Re-implement both files from the specification, not the source.** The functionality
+   is small and almost entirely *mathematical / tabular*: `get_fragments_from_r` is a
+   documented formula (`$fn`, `$fs`, `$fa` → fragment count); the OpenSCAD color tables are
+   essentially the **CSS/X11 named-color list** (those RGB values are facts — colour
+   *names mapped to RGB triples are not copyrightable expression*) plus a small number of
+   OpenSCAD-specific scheme colours. Rewrite both from the OpenSCAD *documentation* / the
+   CSS colour spec, by someone who has **not** copied the `.cc` files, and place the
+   rewrite under Apache-2.0 with the owner's own copyright. Then the GPL headers come off
+   legitimately. (The math formula itself is not copyrightable; only OpenSCAD's particular
+   *expression* of it is — a fresh expression is fine.)
+2. **Or** keep them GPL and *exclude* them from anything Apache-2.0 — not viable if scad2py
+   is to be merged into build123d, since they are on the hot path.
+
+Option 1 is the right answer and is a few hours of work. Until it is done, **scad2py is a
+GPL-2.0-or-later combined work**, regardless of the owner's intent to license it Apache-2.0.
+
+> Note: the OpenSCAD GPL header in these files includes the historical *"CGAL linking
+> exception"* (permission to link with CGAL). That exception only widens what GPL'd
+> OpenSCAD may *link*; it does **not** turn the file permissive and does **not** help an
+> Apache-2.0 consumer. Ignore it for this analysis.
 
 ---
 
@@ -340,17 +426,35 @@ and the *commented-out optional* `coacd` (**MIT**, confirmed) / `vhacdx`.
 
 ## 8. Goal 2 in detail — bringing scad2py into build123d
 
-- **Licenses:** build123d Apache-2.0; scad2py *intended* Apache-2.0 but **the repo has no
-  `LICENSE` file**. `setup.py` only contains a *commented-out* block referencing the
-  Apache URL, and the active `setup()` call passes no `license=`. `scad2py.egg-info` has no
-  usable PKG-INFO license either.
-  **→ Action item: add a real `LICENSE` file (Apache-2.0 text) + SPDX headers to scad2py
-  before merging. Until then, scad2py is technically "all rights reserved" by default
-  copyright law**, even though the owner clearly intends Apache-2.0. Since the owner of
-  scad2py is the same person (olivier.chafik@gmail.com), self-licensing is a formality —
-  but it *must actually be done* for downstream users and for a clean build123d merge.
-- **Transpiler ↔ GPL:** covered in §6 — no GPL obligation. Safe.
-- **Dependencies:** all permissive (§6.3). Two things to clean up before a build123d merge:
+- **Copyright ownership / relicensing.** The owner (olivier.chafik@gmail.com) has confirmed
+  he is the **sole copyright holder of all original scad2py code**. That is the decisive
+  fact for the *owned* code: with no third-party contributors, there are **no other
+  copyrights to reconcile**, so he can place his original code under **any license he
+  chooses** — Apache-2.0, MIT, a dual license, or contribute it *directly into build123d*
+  under Apache-2.0 — simply by deciding to. There is **zero relicensing friction** and no
+  CLA/permission round-trip. See the dedicated subsection §8.1 below.
+- **The missing `LICENSE` file is a formality, not a legal blocker.** scad2py's repo has no
+  `LICENSE` file; `setup.py` only contains a *commented-out* block referencing the Apache
+  URL, and the active `setup()` call passes no `license=`. This should be fixed (add the
+  Apache-2.0 text + SPDX `# SPDX-License-Identifier: Apache-2.0` headers), but because the
+  owner holds all rights to the original code, doing so is a one-line decision he is fully
+  entitled to make — not a blocked relicensing.
+- **The real blocker is NOT the owned code — it is `calc.py` / `colors.py` (§6.4).** These
+  two files are *"stated otherwise"*: they carry GPL-2.0+ headers and are line-by-line
+  ports of OpenSCAD C++ by Clifford Wolf / Marius Kintel. They are **not the owner's
+  copyright** and **cannot be relicensed by him**. They are on the geometry hot path
+  (imported by `csg.py`, `io.py`, `runtime/modules.py`, the renderers). **They must be
+  re-implemented from spec (or removed) before scad2py merges into Apache-2.0 build123d.**
+  This is the one genuine GPL issue and it is the gating action item for Goal 2.
+- **Transpiler architecture ↔ GPL:** covered in §6.2 — the grammar/parser re-implementation
+  does not create a GPL obligation. That conclusion is unchanged and is *separate from* the
+  `calc.py`/`colors.py` problem (which is copied implementation code, not a re-implemented
+  interface).
+- **Third-party dependencies are unaffected by the owner's scad2py copyright.** The owner
+  owning scad2py says nothing about `ply`, the trimesh fork, `manifold3d`, `CoACD`,
+  `shapely`, etc. — those remain governed by *their own* licenses (all permissive: BSD /
+  MIT / Apache-2.0 / Boost — see §2, §6.3). No relicensing of a dependency is implied or
+  possible. Two dependency clean-ups before a build123d merge:
   1. The **trimesh personal-fork** `git+https` dependency (§6.3 risk box) — replace with a
      released package or vendored patch.
   2. **CoACD** is only an *optional* convex-decomposition dependency used by
@@ -376,6 +480,44 @@ and the *commented-out optional* `coacd` (**MIT**, confirmed) / `vhacdx`.
     This is a low-severity issue (test fixtures, permissive upstream) but it is a real
     attribution obligation and the kind of thing a build123d code review would flag.
 
+### 8.1 Relicensing scad2py — explicitly unobstructed for the owner's own code
+
+Because the owner is the **sole author and copyright holder of all original scad2py code**,
+the relicensing question for that code is genuinely trivial, and worth stating plainly:
+
+- **A copyright holder may license his own work however he likes, as many times as he
+  likes.** Putting code on GitHub without a `LICENSE` file does not surrender any rights;
+  it just means no license has been *granted to others* yet. The owner can grant one at any
+  time. The earlier draft of this document framed the missing `LICENSE` file as scad2py
+  being *"all rights reserved"* — that is technically true *for third parties*, but it is
+  **not a relicensing obstacle for the owner himself**. He simply decides.
+- **No CLA, no contributor sign-off, no permission round-trip** is needed for the original
+  scad2py code, because there are no other contributors whose copyright would have to be
+  collected. (If scad2py *had* outside contributors, each contributor's copyright in their
+  contribution would normally need their agreement to relicense — that situation does not
+  apply here.)
+- **Merging scad2py's original source into build123d under Apache-2.0 is therefore
+  unobstructed from a copyright-ownership standpoint.** The owner can: (a) add an Apache-2.0
+  `LICENSE` to scad2py and depend on it; (b) dual-license scad2py; or (c) copy scad2py's
+  source files directly into the build123d tree under Apache-2.0 with build123d's headers.
+  Any of these is his to choose.
+- **This subsection covers ONLY the owner's own code.** It does **not** extend to:
+  - **`calc.py` / `colors.py`** — GPL-2.0+, copyright Clifford Wolf / Marius Kintel. The
+    owner cannot relicense these; they must be re-implemented from spec or removed (§6.4).
+  - **The BOSL2-derived `examples/bosl2_*.scad`** — third-party BSD-2-Clause; the owner
+    cannot relicense them, only attribute them (§8 example-provenance bullet).
+  - **Third-party PyPI dependencies** (`ply`, trimesh fork, `manifold3d`, `CoACD`, etc.) —
+    governed by their own licenses; unaffected by the owner's copyright in scad2py.
+  - Any other file flagged by the *"unless stated otherwise"* self-audit (action item
+    9.2.8). The scan run for this document found `calc.py` and `colors.py` as the only
+    files with a non-ochafik copyright header; a fuller audit before merge is still
+    advisable to catch any vendored snippet without a header.
+
+**Bottom line for §8.1:** the owner's own scad2py code → Apache-2.0 → into build123d is a
+free, friction-free decision. The only things standing between scad2py and a clean
+Apache-2.0 merge are the *non-owned* artifacts (the two GPL files and the BOSL2 examples),
+not any limitation on the owner's authority over his own work.
+
 ---
 
 ## 9. Concrete obligations checklist — what to actually do
@@ -384,8 +526,13 @@ and the *commented-out optional* `coacd` (**MIT**, confirmed) / `vhacdx`.
 
 - **Ship a manifold3d-based mesh feature in build123d** — upstreamed or as a sibling
   package. Pure Apache-2.0. No restrictions.
-- **Merge scad2py into build123d**, or ship it as a sibling package — once scad2py has a
-  real Apache-2.0 LICENSE file. The transpiler design is GPL-clean.
+- **License his own scad2py code however he wants** — Apache-2.0, MIT, dual, or copied
+  straight into build123d under Apache-2.0. As sole copyright holder of the original code
+  there is **zero relicensing friction** (§8.1). Adding the missing `LICENSE` file is a
+  formality fully within his authority, not a blocker.
+- **Merge scad2py into build123d**, or ship it as a sibling package — *after* the two
+  non-owned GPL files `calc.py`/`colors.py` are re-implemented from spec or removed (§6.4),
+  and BOSL2 example attribution is fixed. The transpiler *architecture* itself is GPL-clean.
 - **Distribute build123d wheels** that depend (via `cadquery-ocp-novtk`) on LGPL'd OCCT —
   because OCCT arrives as a *separate, dynamically linked* wheel and build123d is open
   source. LGPL §5 "work that uses the Library" + the OCCT exception cover this.
@@ -399,9 +546,18 @@ and the *commented-out optional* `coacd` (**MIT**, confirmed) / `vhacdx`.
 ### 9.2 What the owner must be careful about / must do first (yellow / action items)
 
 1. **Add a `LICENSE` file to scad2py** (full Apache-2.0 text) and set `license` in its
-   packaging metadata, plus SPDX `# SPDX-License-Identifier: Apache-2.0` headers. Without
-   this, scad2py is legally "all rights reserved" regardless of intent.
-2. **Add/refresh a `NOTICE` file in build123d** that attributes, at minimum:
+   packaging metadata, plus SPDX `# SPDX-License-Identifier: Apache-2.0` headers. This is a
+   *formality* — as sole copyright holder of the original code the owner is fully entitled
+   to do this unilaterally (§8.1) — but it must actually be done so downstream users have a
+   grant and the build123d merge is clean.
+2. **GATING: re-implement or remove `scad2py/calc.py` and `scad2py/colors.py`.** These are
+   GPL-2.0+ ports of OpenSCAD C++ (copyright Wolf / Kintel — *not* the owner's, despite the
+   owner owning the rest of scad2py) and they are on the geometry hot path (§6.4).
+   Re-implement `get_fragments_from_r` from the documented `$fn/$fs/$fa` formula and rebuild
+   the colour tables from the CSS/X11 named-colour spec — by someone who has not read the
+   `.cc` files — then place the rewrites under Apache-2.0. Until this is done, scad2py is a
+   GPL-2.0+ combined work and **cannot** legally enter Apache-2.0 build123d.
+3. **Add/refresh a `NOTICE` file in build123d** that attributes, at minimum:
    - OpenCASCADE Technology — LGPL-2.1 + Open CASCADE Exception 1.0 (with a pointer to the
      LGPL text and the exception text, and a statement that build123d "makes use of /
      is based on facilities provided by the Open CASCADE Technology software" — that exact
@@ -411,7 +567,7 @@ and the *commented-out optional* `coacd` (**MIT**, confirmed) / `vhacdx`.
    - trimesh (MIT), ply (BSD), shapely (BSD), rtree (MIT), pyrender (MIT), gradio
      (Apache-2.0) once scad2py lands.
    - lib3mf (BSD-2-Clause), ezdxf (MIT), ocpsvg/ocp_gordon (Apache-2.0) — existing deps.
-3. **OCCT / LGPL §6 redistribution obligation.** If build123d ever distributes a wheel that
+4. **OCCT / LGPL §6 redistribution obligation.** If build123d ever distributes a wheel that
    *itself bundles* the OCCT `libTK*` binaries (today it does not — it depends on the
    separate `cadquery-ocp` wheel), then build123d must also: ship the LGPL-2.1 text, ship
    the OCCT notice, and provide a **written offer / link to the OCCT corresponding source**
@@ -419,17 +575,25 @@ and the *commented-out optional* `coacd` (**MIT**, confirmed) / `vhacdx`.
    `cadquery-ocp-novtk` (separate package), that §6 burden sits with the `cadquery-ocp`
    maintainers — but build123d should still name OCCT in NOTICE and link to OCCT's source
    repo as a courtesy and to satisfy the exception's "prominent notice" clause.
-4. **Example-file provenance.** Add BOSL2 (BSD-2-Clause) attribution to `bosl2_*.scad`, or
+5. **Example-file provenance.** Add BOSL2 (BSD-2-Clause) attribution to `bosl2_*.scad`, or
    remove them; audit `a11y.scad` and other third-party `.scad` examples for license.
-5. **trimesh personal fork.** Do not ship a build123d release with a `git+https` dependency
+   These are third-party files — the owner's copyright over scad2py does not extend to them
+   and cannot relicense them; he can only attribute (or drop) them.
+6. **trimesh personal fork.** Do not ship a build123d release with a `git+https` dependency
    on `ochafik/trimesh@ochafik-svg-io-color`. Upstream the patch, publish the fork, or
    vendor it. (Engineering issue with licensing-adjacent packaging impact.)
-6. **Provenance comments in scad2py parser files** — reword so they unambiguously say
+7. **Provenance comments in scad2py parser files** — reword so they unambiguously say
    "re-implemented; reference consulted; no code copied," to pre-empt any
    derivative-work misreading.
-7. **Self-audit** that no block of scad2py's parser was lifted verbatim from OpenSCAD's
-   `parser.y` (GPL) or FreeCAD's `importCSG.py` (LGPL). The inspected files look like
-   genuine PLY re-implementations, but a deliberate check is cheap insurance.
+8. **"Unless stated otherwise" self-audit.** The owner stated all scad2py code is his
+   *except where headers state otherwise*. The scan run for this document found exactly two
+   such files — `calc.py` and `colors.py` (item 2 above) — by their explicit GPL headers.
+   Before merge, run a fuller audit: grep every source file for non-ochafik copyright lines
+   *and* check for vendored third-party snippets that may lack a header (e.g. an algorithm
+   copy-pasted without attribution). Also confirm no block of scad2py's parser was lifted
+   verbatim from OpenSCAD's `parser.y` (GPL) or FreeCAD's `importCSG.py` (LGPL); the
+   inspected parser files look like genuine PLY re-implementations, but a deliberate check
+   is cheap insurance.
 
 ### 9.3 What the owner CANNOT do (red light)
 
@@ -438,13 +602,23 @@ and the *commented-out optional* `coacd` (**MIT**, confirmed) / `vhacdx`.
   OSS project, just a hard fact.)
 - **Cannot drop the OCCT "prominent notice"** — the OCCT exception's *only* condition is
   that notice; omitting it forfeits the exception and drops you back to bare LGPL-2.1 §6.
-- **Cannot copy GPL'd OpenSCAD source** (e.g. paste OpenSCAD's `parser.y` semantic-action
-  C++ into scad2py) — that *would* create a GPL-derivative obligation. Re-implementing the
-  grammar is fine; copying the code is not.
+- **Cannot ship `scad2py/calc.py` or `scad2py/colors.py` as-is inside Apache-2.0
+  build123d** — they are GPL-2.0+ ports of OpenSCAD C++, copyright Wolf / Kintel. The owner
+  does **not** hold copyright in them and **cannot relicense them**; they must be
+  re-implemented from spec or removed (§6.4, action item 9.2.2). This is the one hard GPL
+  blocker and it is *separate from* the owner's freedom to relicense his own code.
+- **Cannot relicense any third-party code** he did not write — the BOSL2 `.scad` examples
+  (BSD-2-Clause), the `calc.py`/`colors.py` GPL ports, or any PyPI dependency. Owning the
+  rest of scad2py grants no authority over code authored by others.
+- **Cannot copy GPL'd OpenSCAD *implementation* source** (translating C++ to Python counts
+  as copying — that is exactly how `calc.py`/`colors.py` became GPL). Re-implementing the
+  *grammar/interface* from a reading of `parser.y` is fine (§6.2); translating OpenSCAD's
+  *implementation code* is not.
 - **Cannot ship the BOSL2-derived `.scad` examples without BSD-2-Clause attribution** —
   permissive does not mean attribution-free.
-- **Cannot merge scad2py into build123d while scad2py still lacks a LICENSE file** —
-  fix item 9.2(1) first.
+- **Cannot merge scad2py into build123d while `calc.py`/`colors.py` remain GPL** — fix
+  action item 9.2.2 first. (The missing `LICENSE` file, by contrast, is the owner's to add
+  at will and is not itself a blocker — §8.1.)
 
 ---
 
@@ -472,14 +646,20 @@ The brief asks specifically whether build123d (Apache-2.0) depending on OCCT
    FSF-considered-incompatible, but **LGPL-2.1 used as a separable library is a different
    case** — you are not merging Apache and LGPL into one combined source work; you are
    linking a separable LGPL library, which both licenses contemplate.)
-5. **The new code changes nothing.** Adding manifold3d (Apache) keeps it Apache-on-Apache.
-   Adding scad2py (Apache) keeps it Apache-on-Apache. Neither introduces a static link to
-   OCCT or any GPL code.
+5. **The new code changes nothing — once cleaned up.** Adding manifold3d (Apache) keeps it
+   Apache-on-Apache. Adding scad2py's *original* code (Apache, once licensed by its sole
+   owner) keeps it Apache-on-Apache. The **one exception** is scad2py's `calc.py`/`colors.py`,
+   which are GPL ports of OpenSCAD *implementation* code (§6.4) — those must be re-implemented
+   from spec before scad2py merges. Neither manifold3d nor the cleaned scad2py introduces a
+   static link to OCCT.
 
 **Conclusion:** the current build123d → OCCT relationship is compliant, and both project
-goals preserve that compliance. The whole exercise reduces to *housekeeping*: a LICENSE
-file for scad2py, a NOTICE file for build123d, example-file attribution, and replacing the
-trimesh `git+https` pin.
+goals can preserve that compliance. The manifold3d feature is pure housekeeping. For
+scad2py, the owner's sole copyright over his original code means relicensing it to
+Apache-2.0 is friction-free — the real work is *(a)* re-implementing the two GPL-headed
+files `calc.py`/`colors.py` from spec, *(b)* attributing or dropping the BOSL2 examples,
+*(c)* adding LICENSE/NOTICE files, and *(d)* replacing the trimesh `git+https` pin. Of
+those, only *(a)* is a true legal blocker; the rest is hygiene.
 
 ---
 
@@ -490,6 +670,7 @@ trimesh `git+https` pin.
 - manifold3d 2.3.1 — `…/miniforge/base/lib/python3.10/site-packages/manifold3d-2.3.1.dist-info/{METADATA,licenses/LICENSE,licenses/AUTHORS}`
 - cadquery-ocp-novtk wheel — `/tmp/pipcheck/cadquery_ocp_novtk-7.9.3.1-cp310-cp310-macosx_11_0_arm64.whl` (`.dist-info/METADATA`, `OCP/.dylibs/libTK*.dylib`)
 - scad2py — `/Users/ochafik/github/scad2py/{setup.py,requirements.txt,README.md}`, `scad2py/scadast.py`, `scad2py/parser/__init__.py`, `scad2py/parser/tokrules.py`, `scad2py/minkowski_impl.py`, `examples/bosl2_*.scad`
+- scad2py GPL-headed files — `/Users/ochafik/github/scad2py/scad2py/calc.py` and `…/scad2py/colors.py` (verbatim OpenSCAD GPL-2.0+ header, copyright Clifford Wolf / Marius Kintel; in-file comments cite the upstream `.cc` source files they were ported from); imported by `scad2py/{csg.py,io.py,runtime/modules.py,rendering/rendering.py,rendering/manifold_renderer.py,rendering/modifiers_rendering.py}`
 - [Open CASCADE Exception 1.0 — SPDX](https://spdx.org/licenses/OCCT-exception-1.0.html)
 - [Licensing — Open CASCADE Technology](https://dev.opencascade.org/resources/licensing)
 - [OCCT_LGPL_EXCEPTION.txt — OCCT GitHub repo](https://github.com/Open-Cascade-SAS/OCCT/blob/master/OCCT_LGPL_EXCEPTION.txt)
