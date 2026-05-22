@@ -164,6 +164,28 @@ build123d has **no kernel abstraction layer** — OCP is assumed in every module
 produce correctly-typed `Part`/`Solid` results without import cycles. Reuse it;
 touch nothing else in core that an opt-in extra shouldn't.
 
+### P7 — Fillet/chamfer before meshing; operation ordering is one-way
+
+The mesh backend replaces *booleans* (and adds hull / Minkowski / SDF). It never
+replaces *finishing* operations: `fillet`, `chamfer`, `loft`, `sweep`, exact
+`shell`/`offset`, draft, and STEP-fidelity export are BREP-only — they need the
+analytic edges and surfaces a triangle mesh does not have (`p8` VERDICT; §6.5).
+And because BREP→mesh→BREP returns a *faceted* `Solid` with no analytic edges, a
+`fillet()` *after* a mesh stage has nothing to grab. The modelling pipeline is
+therefore one-way:
+
+```
+BREP feature modelling → fillet / chamfer → mesh backend (bulk CSG, hull,
+   Minkowski) → bake once → faceted Solid → export
+```
+
+Fillets and chamfers belong on BREP, *before* geometry enters the mesh backend —
+never after. The API enforces this structurally: `MeshPart` exposes no
+`fillet`/`chamfer`, and a curved-analytic selector on a meshed result raises
+(P3, §6.5). The one partial exception — a planar–planar edge can sometimes be
+re-fitted and filleted after `ReFacer` reconstruction — is fragile and not a
+supported path.
+
 ---
 
 ## 3. Architecture
@@ -680,7 +702,38 @@ integration risk — end-to-end against build123d's *real* `ShapeList` selectors
   solid's id; nothing is orphaned.
 - **Planar faces rebuild losslessly into REAL build123d `Face` objects.**
 
-### 6.2 The tag-and-remerge strategy (the `ReFacer`)
+### 6.2 Manifold's metadata channels — ids vs properties
+
+What survives a boolean (§6.1) is not BREP topology — it is *tags*. manifold3d
+exposes three metadata channels, and choosing the right one is load-bearing:
+
+| Channel | Granularity | Through booleans | Use for |
+|---|---|---|---|
+| `run_original_id` (+ `reserve_ids`, `as_original`) | per-triangle run → input **solid**; per input **face** with `reserve_ids` | **exact** — union/diff/intersect/chained; cut faces inherit the tool id | discrete identity / provenance |
+| `face_id` | per-triangle → coplanar-region group | partial — **unique only within a run, collides across runs** | a *hint* for coplanar grouping, never a global key |
+| `vert_properties` cols 3+ | per-**vertex** floats (color, UV, normals) | carried, but **linearly interpolated at cut vertices** | smoothly-varying data only |
+
+**The rule: discrete identity goes in the integer id channels, never in
+`vert_properties`.** A vertex created on a cut edge gets an *interpolated*
+property value — fine for a color gradient, corrupting for a discrete face/part
+tag (tag `3` averaged with `7` becomes `5`). `research/03` §2.8 and `p8` both
+hit this with color.
+
+`face_id` is tempting as a ready-made "face" tag, but `p8` found it unusable as
+a global key: it is unique only *within a run*, and a face cut into two disjoint
+pieces keeps a single id. The `ReFacer` (§6.3) therefore ignores raw `face_id`
+and reconstructs faces from `run_original_id` + welded-edge connectivity +
+dihedral angle.
+
+Crucially, none of these channels is *topology*. There is **no usable edge
+channel** (`p8` notes a halfedge-level original-id analogue exists but is
+unexposed), no adjacency graph, and no surface equations. They are a *labelled
+partition of the triangle soup* — enough to rebuild planar `Face`s and drive
+provenance selectors (§6.3–6.5), not enough to recover analytic geometry or to
+support a fillet (which needs the exact edge and the exact adjacent surfaces,
+not a tag — §6.5, P7).
+
+### 6.3 The tag-and-remerge strategy (the `ReFacer`)
 
 `p8`'s `refacer.py` is the reference algorithm. **Tag-and-rebuild, never
 preserve** — identity is *reconstructed*, not free (`p8` rec 2):
@@ -710,7 +763,7 @@ API, the real `ShapeList`.
 the re-facer must surface: too small fragments faceted curves; too large merges
 genuinely distinct faces.
 
-### 6.3 Provenance as a new selector dimension
+### 6.4 Provenance as a new selector dimension
 
 Mesh tagging is **strictly additive** on one axis: `MeshPart.faces_from(name)`
 returns "all faces originating from input solid `name`", including
@@ -719,7 +772,7 @@ capability. (build123d's BREP `_bool_op` *could* expose `BRepAlgoAPI_*.History()
 for the analytic analogue — `p8` POINT 4 — but that is an orthogonal core
 improvement, not this design.)
 
-### 6.4 The planar-recoverable / curved-lost split — the API contract
+### 6.5 The planar-recoverable / curved-lost split — the API contract
 
 - **Planar-dominated CSG** (transpiled OpenSCAD, plate/bracket work): the
   tag-and-remerge path is **fully sufficient** — exact `Face` counts, all
@@ -895,7 +948,7 @@ browser build feasible.
 |---|---|---|---|
 | R1 | **Un-welded tessellation → silent empty boolean.** `Shape.tessellate()` emits a 24-vert soup; manifold rejects it as `NotManifold`, `volume()==0`, boolean silently empty. | **High** (silent wrong result) | Mandatory weld pass in the bridge (§3.4). Verified by `p1` §1, `p8` test. The weld is the *first* thing `from_part()` does; assert `status()==NoError` after construction and raise if not. |
 | R2 | **Implicit per-step bake erases the speedup.** `p2` W2: 20–47× boolean win → 0.2–1.1× with per-op back-conversion. | **High** | Free functions and `MeshPart` operators return `MeshPart`, never `Shape` (§3.3). The user *structurally cannot* bake mid-chain. Bake is one explicit `.to_solid()` (P1, §5.2). |
-| R3 | **Silent geometry degradation.** A naive `tessellate→boolean→sew` yields a 268-face soup whose `geom_type` still lies "PLANE" and whose `sort_by(Axis.Z)[-1]` is a 2 mm sliver. | **High** | P3. mesh→BREP is explicit (P2). `MeshPart.faces()` rebuilds planar faces; curved-analytic selectors **raise a clear error** (§6.4). Never mis-answer. |
+| R3 | **Silent geometry degradation.** A naive `tessellate→boolean→sew` yields a 268-face soup whose `geom_type` still lies "PLANE" and whose `sort_by(Axis.Z)[-1]` is a 2 mm sliver. | **High** | P3. mesh→BREP is explicit (P2). `MeshPart.faces()` rebuilds planar faces; curved-analytic selectors **raise a clear error** (§6.5). Never mis-answer. |
 | R4 | **Curvature & fillets permanently lost** through BREP→mesh→BREP. | **Medium** (inherent, not a bug) | Document prominently; `to_solid()` docstring shouts. Route fillet/chamfer/STEP-grade work through OCC and never let it leave (NG4, NG5). Not "fixable" — communicated. |
 | R5 | **Huge-BREP downstream cost.** A 1M-face baked `Solid`: `BRepCheck` ~76 s/15 GB, STEP ~147 s/2.5 GB (`p7` §7). | **Medium** | P5: bake once/late, do not validate intermediates, optional `unify_coplanar`. Keep geometry in `MeshPart` form; warn in `to_solid()` above ~10⁵ triangles. |
 | R6 | **`Mesher._get_shape` void-detection bug** mis-classifies a multi-body mesh as one Solid-with-fake-void (`p1` §2). | **Medium** | `Solid.from_mesh` (core addition #2) uses bbox-nesting classification, not "largest = outer, rest = voids". `p1`'s `bridge.py` already has the fix to port. Latent build123d bug — document, fix in the new code path, do not silently inherit. |
@@ -905,7 +958,7 @@ browser build feasible.
 | R10 | **Intermittent 2.3.1 segfault** (doc 03 §3.5) in a long-lived process. | **Low** | Not reproduced on 3.4.x by any prototype (doc 09 §4.1). Pin 3.x; spot-check under a long-lived process in Phase 0 hardening. |
 | R11 | **`MeshPart` cannot enter `BuildPart`/`ShapeList`/joints** — not a `Shape`. | **Low** (by design) | Accepted (NG2, §3.2). Explicit `to_solid()` is the bridge into builder contexts. The capability boundary is *intentionally* visible. |
 | R12 | **No pickling of `MeshPart`.** `persistence.modify_copyreg` patches OCP types only; `manifold3d.Manifold` picklability is unconfirmed. | **Low** | Pickle the raw `Mesh` arrays (`npz`-style), not the `Manifold` object (doc 08 open Q2). Add a `__reduce__` to `MeshPart` that round-trips through `to_arrays()`. |
-| R13 | **`crease_deg` mis-tuning** in the ReFacer over/under-merges faces. | **Low** | Expose `crease_deg` as the one documented tunable (§6.2, `p8` rec 6); default 20° verified by `p8`. |
+| R13 | **`crease_deg` mis-tuning** in the ReFacer over/under-merges faces. | **Low** | Expose `crease_deg` as the one documented tunable (§6.3, `p8` rec 6); default 20° verified by `p8`. |
 | R14 | **Threading contention** — manifold3d's TBB pool vs OCC's. | **Low** | Both are CPU pools; no measured contention in prototypes. Monitor; manifold3d falls back to serial below a size threshold. |
 
 ---
@@ -956,7 +1009,7 @@ standalone class, no `Shape` changes.
 
 - The `ReFacer`: tag-and-remerge → real build123d `Face` objects (§6, `p8`).
 - `MeshPart.faces(crease_deg=...)` and `MeshPart.faces_from(name)`.
-- Curved-analytic selectors raise clear errors (§6.4, P3).
+- Curved-analytic selectors raise clear errors (§6.5, P3).
 - `Mesher.add_mesh(verts, tris, color)` in core → genuinely cheap STL/3MF
   export without a bake (§4.7, `p3` rec 5).
 
