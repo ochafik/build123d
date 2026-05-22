@@ -39,13 +39,19 @@ from build123d import (
     Axis,
     Box,
     Compound,
+    Cone,
     Cylinder,
+    Face,
     GeomType,
     Location,
     Part,
+    Plane,
     Pos,
+    ShapeList,
     Solid,
+    SortBy,
     Sphere,
+    Torus,
 )
 
 # manifold3d is an optional extra; skip the whole module if it is absent. The
@@ -59,7 +65,10 @@ from build123d.mesh import (  # noqa: E402
     is_available,
     mesh_cut,
     mesh_fuse,
+    mesh_hull,
     mesh_intersect,
+    mesh_minkowski,
+    mesh_minkowski_difference,
     recover_brep,
 )
 from build123d.mesh.bridge import read_result, shape_to_manifold  # noqa: E402
@@ -747,3 +756,314 @@ def test_payoff_recovered_solid_bakes_to_a_part():
     part = mesh_cut(Box(40, 30, 12), Pos(0, 0, 3) * Box(14, 10, 12)).to_part()
     assert isinstance(part, Part)
     assert part.volume == pytest.approx(13140.0, abs=1e-6)
+
+
+# --------------------------------------------------------------------------
+# Faceted primitive constructors
+# --------------------------------------------------------------------------
+
+
+def test_meshpart_box_matches_build123d_box():
+    """MeshPart.box has the volume of build123d's Box and full provenance."""
+    mesh_box = MeshPart.box(20, 10, 4)
+    assert mesh_box.is_valid
+    assert mesh_box.volume == pytest.approx(Box(20, 10, 4).volume, rel=1e-6)
+    # A box is six analytic faces -> six seeded provenance records.
+    assert len(mesh_box.side_map) == 6
+
+
+def test_meshpart_box_is_origin_centred():
+    """MeshPart.box follows build123d's origin-centred convention."""
+    bbox = MeshPart.box(20, 10, 4).bounding_box()
+    assert bbox.center().X == pytest.approx(0.0, abs=1e-6)
+    assert bbox.center().Y == pytest.approx(0.0, abs=1e-6)
+    assert bbox.center().Z == pytest.approx(0.0, abs=1e-6)
+    assert bbox.size.X == pytest.approx(20.0, rel=1e-6)
+
+
+def test_meshpart_sphere_volume_close_to_build123d():
+    """MeshPart.sphere is a faceted sphere: volume close, slightly under-filled."""
+    mesh_sphere = MeshPart.sphere(5)
+    assert mesh_sphere.is_valid
+    # Faceting under-fills the sphere; compare against the analytic volume.
+    assert mesh_sphere.volume == pytest.approx(4 / 3 * pi * 5**3, rel=0.05)
+    assert mesh_sphere.volume < 4 / 3 * pi * 5**3
+
+
+def test_meshpart_cylinder_volume_close_to_build123d():
+    """MeshPart.cylinder is a faceted cylinder with a close volume."""
+    mesh_cylinder = MeshPart.cylinder(3, 10)
+    assert mesh_cylinder.is_valid
+    assert mesh_cylinder.volume == pytest.approx(pi * 3**2 * 10, rel=0.02)
+    # Two flat caps + one curved lateral face -> three provenance records.
+    assert len(mesh_cylinder.side_map) == 3
+
+
+def test_meshpart_cone_volume_close_to_build123d():
+    """MeshPart.cone is a faceted cone with a close volume."""
+    mesh_cone = MeshPart.cone(4, 0, 9)
+    assert mesh_cone.is_valid
+    assert mesh_cone.volume == pytest.approx(Cone(4, 0, 9).volume, rel=0.03)
+
+
+def test_meshpart_torus_volume_close_to_build123d():
+    """MeshPart.torus is a faceted torus with a close volume."""
+    mesh_torus = MeshPart.torus(10, 2)
+    assert mesh_torus.is_valid
+    assert mesh_torus.volume == pytest.approx(Torus(10, 2).volume, rel=0.05)
+
+
+def test_meshpart_primitive_is_a_csg_operand():
+    """A primitive MeshPart drops straight into a CSG chain with provenance."""
+    drilled = MeshPart.box(20, 20, 10) - MeshPart.cylinder(3, 20)
+    assert drilled.is_valid
+    assert drilled.volume == pytest.approx(20 * 20 * 10 - pi * 9 * 10, rel=0.02)
+
+
+# --------------------------------------------------------------------------
+# Convex hull
+# --------------------------------------------------------------------------
+
+
+def test_mesh_hull_of_two_boxes_is_their_envelope():
+    """mesh_hull of two separated boxes is the convex envelope around them.
+
+    Two 4x4x4 boxes 20 apart along X: the hull is a 24x4x4 prism whose ends
+    are the box ends, so its volume is the prism minus nothing -- exactly the
+    24*4*4 envelope (the gap between the boxes is filled by the hull).
+    """
+    left = Box(4, 4, 4)
+    right = Box(4, 4, 4).moved(Pos(20, 0, 0))
+    hull = mesh_hull(left, right)
+    assert hull.is_valid
+    # Convex hull of two axis-aligned cubes spanning X in [-2, 22]: a prism.
+    assert hull.volume == pytest.approx(24 * 4 * 4, rel=1e-6)
+
+
+def test_mesh_hull_of_a_single_box_is_the_box():
+    """The convex hull of an already-convex box is the box itself."""
+    hull = mesh_hull(Box(10, 6, 4))
+    assert hull.volume == pytest.approx(240.0, rel=1e-6)
+
+
+def test_mesh_hull_fills_a_concavity():
+    """The hull of a notched body fills its concave notch.
+
+    Slicing a 4-thick slot fully across a 10-cube leaves two prongs; the
+    convex hull bridges them, so the hull is strictly larger than the notched
+    body and no larger than the original cube.
+    """
+    notched = Box(10, 10, 10) - Box(4, 12, 6).moved(Pos(0, 0, 2))
+    hull = mesh_hull(notched)
+    assert hull.is_valid
+    assert hull.volume > notched.volume
+    # The slot is open only at the top, so the hull bridges it back to the
+    # full 10x10x10 cube.
+    assert hull.volume == pytest.approx(1000.0, rel=1e-6)
+
+
+def test_mesh_hull_method_on_meshpart():
+    """MeshPart.hull() envelops self, and self.hull(other) envelops both."""
+    box = MeshPart.box(4, 4, 4)
+    assert box.hull().volume == pytest.approx(64.0, rel=1e-6)
+    enveloped = box.hull(Box(4, 4, 4).moved(Pos(20, 0, 0)))
+    assert enveloped.volume == pytest.approx(24 * 4 * 4, rel=1e-6)
+
+
+def test_mesh_hull_carries_no_provenance():
+    """A hull is new geometry: the result carries an empty side-map."""
+    hull = mesh_hull(Box(4, 4, 4), Box(4, 4, 4).moved(Pos(20, 0, 0)))
+    assert len(hull.side_map) == 0
+    # With no provenance, to_solid falls back to the faceted bake.
+    solid = hull.to_solid()
+    assert solid.is_valid
+
+
+def test_mesh_hull_rejects_no_operands():
+    """mesh_hull raises when given no operands."""
+    with pytest.raises(ValueError):
+        mesh_hull()
+
+
+# --------------------------------------------------------------------------
+# Minkowski sum / difference
+# --------------------------------------------------------------------------
+
+
+def test_mesh_minkowski_sphere_box_rounds_the_box():
+    """Minkowski sum of a box with a sphere rounds the box's edges.
+
+    A 10-cube dilated by a radius-3 sphere is a rounded box: the 10-cube core,
+    a 3-thick slab over each of the 6 faces, a quarter-cylinder over each of
+    the 12 edges, and an eighth-sphere at each of the 8 corners.
+    """
+    rounded = mesh_minkowski(Box(10, 10, 10), Sphere(3))
+    assert rounded.is_valid
+    core = 10**3
+    faces = 6 * 100 * 3
+    edges = 12 * 10 * (pi * 3**2 / 4)
+    corners = 4 / 3 * pi * 3**3
+    analytic = core + faces + edges + corners
+    # The sphere is faceted, so the rounded volume is slightly under analytic.
+    assert rounded.volume == pytest.approx(analytic, rel=0.05)
+    assert rounded.volume < analytic
+    # The rounded body is strictly larger than the bare core box.
+    assert rounded.volume > core
+    # A Minkowski sum is new geometry: no provenance survives.
+    assert len(rounded.side_map) == 0
+
+
+def test_mesh_minkowski_box_box_is_exact_convex_case():
+    """Minkowski sum of two boxes is exact: a box of summed dimensions."""
+    summed = mesh_minkowski(Box(10, 10, 10), Box(2, 2, 2))
+    assert summed.is_valid
+    # (10+2) cube -- box(+)box is exact, no faceting error.
+    assert summed.volume == pytest.approx(12**3, rel=1e-6)
+
+
+def test_mesh_minkowski_decompose_matches_native_for_convex():
+    """The decompose backend agrees with the native backend on convex inputs."""
+    native = mesh_minkowski(Sphere(3), Box(10, 10, 10), method="native")
+    decompose = mesh_minkowski(Sphere(3), Box(10, 10, 10), method="decompose")
+    assert decompose.is_valid
+    assert decompose.volume == pytest.approx(native.volume, rel=1e-3)
+
+
+def test_mesh_minkowski_decompose_rejects_nonconvex():
+    """The decompose backend raises on a connected non-convex operand."""
+    notched = Box(10, 10, 10) - Box(6, 6, 12).moved(Pos(3, 3, 0))
+    with pytest.raises(ValueError, match="non-convex"):
+        mesh_minkowski(notched, Sphere(1), method="decompose")
+
+
+def test_mesh_minkowski_rejects_unknown_method():
+    """mesh_minkowski raises on an unknown method name."""
+    with pytest.raises(ValueError, match="method"):
+        mesh_minkowski(Box(2, 2, 2), Box(2, 2, 2), method="bogus")
+
+
+def test_mesh_minkowski_native_handles_nonconvex():
+    """The native backend dilates a non-convex body without raising."""
+    notched = Box(10, 10, 10) - Box(6, 6, 12).moved(Pos(3, 3, 0))
+    dilated = mesh_minkowski(notched, Sphere(1))
+    assert dilated.is_valid
+    assert dilated.volume > notched.volume
+
+
+def test_mesh_minkowski_difference_erodes_a_box():
+    """Minkowski difference erodes a box inward by the eroding box's extent."""
+    eroded = mesh_minkowski_difference(Box(20, 20, 20), Box(4, 4, 4))
+    assert eroded.is_valid
+    # Eroding a 20-cube by a 4-cube shrinks each face inward by 2 -> 16-cube.
+    assert eroded.volume == pytest.approx(16**3, rel=1e-6)
+
+
+def test_mesh_minkowski_method_on_meshpart():
+    """MeshPart.minkowski / .minkowski_difference mirror the free functions."""
+    summed = MeshPart.box(10, 10, 10).minkowski(Box(2, 2, 2))
+    assert summed.volume == pytest.approx(12**3, rel=1e-6)
+    eroded = MeshPart.box(20, 20, 20).minkowski_difference(Box(4, 4, 4))
+    assert eroded.volume == pytest.approx(16**3, rel=1e-6)
+
+
+# --------------------------------------------------------------------------
+# faces() / faces_from() selectors
+# --------------------------------------------------------------------------
+
+
+def test_faces_of_a_planar_meshpart_returns_six_faces():
+    """faces() on an all-planar box returns exactly six analytic faces."""
+    faces = MeshPart.box(20, 10, 4).faces()
+    assert isinstance(faces, ShapeList)
+    assert len(faces) == 6
+    assert all(isinstance(face, Face) for face in faces)
+    assert all(face.geom_type == GeomType.PLANE for face in faces)
+
+
+def test_faces_of_a_drilled_block_matches_native_count():
+    """faces() on a planar CSG result returns the native boolean's face count."""
+    plate = Box(40, 30, 12)
+    pocket = Pos(0, 0, 3) * Box(14, 10, 12)
+    native = plate - pocket
+    faces = mesh_cut(plate, pocket).faces()
+    assert len(faces) == len(native.faces())
+    assert all(face.geom_type == GeomType.PLANE for face in faces)
+
+
+def test_faces_supports_build123d_selectors():
+    """build123d's own sort_by / filter_by / group_by work on faces()."""
+    faces = MeshPart.box(20, 10, 4).faces()
+    # sort_by an axis -- the real ShapeList selector, not a mock.
+    sorted_by_z = faces.sort_by(Axis.Z)
+    assert len(sorted_by_z) == 6
+    # filter_by a plane: a 20x10x4 box has exactly two faces parallel to XY.
+    xy_faces = faces.filter_by(Plane.XY)
+    assert len(xy_faces) == 2
+    # filter_by GeomType.PLANE keeps every face of an all-planar body.
+    assert len(faces.filter_by(GeomType.PLANE)) == 6
+    # group_by area buckets the three distinct face sizes of the box.
+    grouped = faces.group_by(SortBy.AREA)
+    assert len(grouped) == 3
+
+
+def test_faces_rejects_a_meshpart_without_provenance():
+    """faces() raises on a MeshPart that carries no side-map (a raw mesh)."""
+    source = MeshPart.from_part(Box(8, 8, 8))
+    vertices, triangles = source.to_arrays()
+    wrapped = MeshPart.from_mesh(vertices, triangles)
+    with pytest.raises(ValueError, match="provenance"):
+        wrapped.faces()
+
+
+def test_analytic_faces_raises_on_a_curved_region():
+    """analytic_faces() raises rather than mis-answering on curved geometry.
+
+    The design's P3 contract: a curved mesh region recovers faceted, not
+    analytic; a curved-analytic selector on it must raise a clear error, never
+    silently return faceted patches as if they were analytic faces.
+    """
+    drilled = mesh_cut(Box(30, 30, 12), Cylinder(5, 40))
+    with pytest.raises(ValueError, match="curved"):
+        drilled.analytic_faces()
+    # faces() still works -- it returns the faceted patches honestly.
+    assert len(drilled.faces()) > 0
+
+
+def test_analytic_faces_returns_planar_faces():
+    """analytic_faces() returns faces for an all-planar body."""
+    faces = MeshPart.box(10, 10, 10).analytic_faces()
+    assert len(faces) == 6
+    assert all(face.geom_type == GeomType.PLANE for face in faces)
+
+
+def test_faces_from_filters_by_provenance():
+    """faces_from() returns only the faces originating from a named input.
+
+    A genuine new selector dimension: filter recovered faces by which input
+    shape they trace back to (design 6.4) -- including boolean cut faces.
+    """
+    plate = MeshPart.from_part(Box(40, 30, 12), source="plate")
+    pocket = MeshPart.from_part(Pos(0, 0, 3) * Box(14, 10, 12), source="pocket")
+    drilled = mesh_cut(plate, pocket)
+
+    all_faces = drilled.faces()
+    from_plate = drilled.faces_from("plate")
+    from_pocket = drilled.faces_from("pocket")
+
+    # Every recovered face traces back to exactly one of the two inputs.
+    assert len(from_plate) + len(from_pocket) == len(all_faces)
+    # The plate contributes its outer faces; the pocket contributes the cut.
+    assert len(from_plate) > 0
+    assert len(from_pocket) > 0
+    assert all(face.geom_type == GeomType.PLANE for face in from_plate)
+
+
+def test_faces_from_unknown_source_is_empty():
+    """faces_from() with an unknown source name returns an empty ShapeList."""
+    drilled = mesh_cut(
+        MeshPart.from_part(Box(20, 20, 10), source="block"),
+        MeshPart.from_part(Box(6, 6, 20), source="tool"),
+    )
+    nothing = drilled.faces_from("does-not-exist")
+    assert isinstance(nothing, ShapeList)
+    assert len(nothing) == 0

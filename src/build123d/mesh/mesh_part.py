@@ -65,7 +65,7 @@ import manifold3d as m3d  # type: ignore[import-not-found]
 from OCP.Bnd import Bnd_Box
 
 from build123d.geometry import BoundBox, Location
-from build123d.topology import Compound, Part, Shape, Solid
+from build123d.topology import Compound, Face, Part, Shape, ShapeList, Solid
 
 from .bridge import SideMap, read_result, shape_to_manifold
 from .recovery import recover_brep
@@ -205,6 +205,113 @@ class MeshPart:
             )
         return cls(manifold)
 
+    # ---- Faceted primitive constructors ----
+
+    @classmethod
+    def box(cls, length: float, width: float, height: float) -> MeshPart:
+        """A faceted box — the mesh analogue of :class:`~build123d.Box`.
+
+        Built by tessellating a build123d :class:`~build123d.Box` through the
+        seeding bridge, so it matches build123d's centering convention exactly
+        (origin-centred) **and** carries a full six-record side-map — a
+        :meth:`to_solid` on a box-derived CSG result therefore still recovers
+        an exact analytic B-rep.
+
+        Args:
+            length (float): box length (X extent).
+            width (float): box width (Y extent).
+            height (float): box height (Z extent).
+
+        Returns:
+            MeshPart: an origin-centred faceted box with seeded provenance.
+        """
+        # pylint: disable=import-outside-toplevel
+        from build123d.objects_part import Box
+
+        return cls.from_part(Box(length, width, height), source="box")
+
+    @classmethod
+    def sphere(cls, radius: float) -> MeshPart:
+        """A faceted sphere — the mesh analogue of :class:`~build123d.Sphere`.
+
+        Built by tessellating a build123d :class:`~build123d.Sphere` through
+        the seeding bridge (origin-centred, like build123d's default). The
+        sphere is a single curved face: its side-map holds one record, and
+        :meth:`to_solid` recovers it faceted (a curved surface is not analytic
+        on a mesh — see :meth:`faces`).
+
+        Args:
+            radius (float): sphere radius.
+
+        Returns:
+            MeshPart: an origin-centred faceted sphere with seeded provenance.
+        """
+        # pylint: disable=import-outside-toplevel
+        from build123d.objects_part import Sphere
+
+        return cls.from_part(Sphere(radius), source="sphere")
+
+    @classmethod
+    def cylinder(cls, radius: float, height: float) -> MeshPart:
+        """A faceted cylinder — the mesh analogue of :class:`~build123d.Cylinder`.
+
+        Built by tessellating a build123d :class:`~build123d.Cylinder` through
+        the seeding bridge (origin-centred, like build123d's default). The two
+        flat caps are planar faces; the lateral surface is one curved face.
+
+        Args:
+            radius (float): cylinder radius.
+            height (float): cylinder height (Z extent).
+
+        Returns:
+            MeshPart: an origin-centred faceted cylinder with seeded
+            provenance.
+        """
+        # pylint: disable=import-outside-toplevel
+        from build123d.objects_part import Cylinder
+
+        return cls.from_part(Cylinder(radius, height), source="cylinder")
+
+    @classmethod
+    def cone(cls, bottom_radius: float, top_radius: float, height: float) -> MeshPart:
+        """A faceted cone — the mesh analogue of :class:`~build123d.Cone`.
+
+        Built by tessellating a build123d :class:`~build123d.Cone` through the
+        seeding bridge (origin-centred, like build123d's default). Set
+        ``top_radius=0`` for a pointed cone.
+
+        Args:
+            bottom_radius (float): radius of the bottom circle.
+            top_radius (float): radius of the top circle; may be zero.
+            height (float): cone height (Z extent).
+
+        Returns:
+            MeshPart: an origin-centred faceted cone with seeded provenance.
+        """
+        # pylint: disable=import-outside-toplevel
+        from build123d.objects_part import Cone
+
+        return cls.from_part(Cone(bottom_radius, top_radius, height), source="cone")
+
+    @classmethod
+    def torus(cls, major_radius: float, minor_radius: float) -> MeshPart:
+        """A faceted torus — the mesh analogue of :class:`~build123d.Torus`.
+
+        Built by tessellating a build123d :class:`~build123d.Torus` through the
+        seeding bridge (origin-centred, like build123d's default).
+
+        Args:
+            major_radius (float): major (centre-line) radius.
+            minor_radius (float): minor (tube) radius.
+
+        Returns:
+            MeshPart: an origin-centred faceted torus with seeded provenance.
+        """
+        # pylint: disable=import-outside-toplevel
+        from build123d.objects_part import Torus
+
+        return cls.from_part(Torus(major_radius, minor_radius), source="torus")
+
     # ---- Properties ----
 
     @property
@@ -309,6 +416,73 @@ class MeshPart:
     def __iand__(self, other: MeshOperand) -> MeshPart:
         """In-place intersection: ``self &= other``."""
         return mesh_intersect(self, other)
+
+    # ---- Geometry-generating operations ----
+
+    def hull(self, *others: MeshOperand) -> MeshPart:
+        """Convex hull of this body — optionally enveloping further operands.
+
+        ``self.hull()`` is the convex hull of this mesh body alone;
+        ``self.hull(a, b)`` is the single hull that envelops ``self`` and every
+        extra operand (a ``Shape`` operand is tessellated under the hood).
+
+        A hull synthesises new envelope facets, so **no input ``face_id``
+        survives**: the returned :class:`MeshPart` carries an empty side-map and
+        :meth:`to_solid` bakes it faceted. See :func:`build123d.mesh.mesh_hull`.
+
+        Args:
+            *others: optional extra build123d Shapes / MeshParts to envelop
+                together with ``self``.
+
+        Returns:
+            MeshPart: the convex hull, with no provenance.
+        """
+        # pylint: disable=import-outside-toplevel
+        from .ops import mesh_hull
+
+        return mesh_hull(self, *others)
+
+    def minkowski(self, other: MeshOperand, *, method: str = "native") -> MeshPart:
+        """Minkowski sum of this body with ``other`` — the dilation ``self ⊕ other``.
+
+        Sweeps ``other`` over every point of ``self`` (a sphere over a box
+        rounds the box's edges). ``method`` selects the backend — ``"native"``
+        (default, handles non-convex) or ``"decompose"`` (the scad2py
+        convex-pairs port). See :func:`build123d.mesh.mesh_minkowski`.
+
+        A Minkowski sum synthesises a new shell, so the result carries an empty
+        side-map and bakes faceted.
+
+        Args:
+            other: the other operand (build123d Shape or MeshPart).
+            method (str): ``"native"`` (default) or ``"decompose"``.
+
+        Returns:
+            MeshPart: the Minkowski sum, with no provenance.
+        """
+        # pylint: disable=import-outside-toplevel
+        from .ops import mesh_minkowski
+
+        return mesh_minkowski(self, other, method=method)
+
+    def minkowski_difference(self, other: MeshOperand) -> MeshPart:
+        """Minkowski difference with ``other`` — the erosion ``self ⊖ other``.
+
+        Erodes ``self`` by sweeping ``other`` across its surface (the inverse
+        of :meth:`minkowski`). See
+        :func:`build123d.mesh.mesh_minkowski_difference`.
+
+        Args:
+            other: the eroding body (build123d Shape or MeshPart).
+
+        Returns:
+            MeshPart: the Minkowski difference, with no provenance (may be an
+            empty body if ``other`` is larger than ``self``).
+        """
+        # pylint: disable=import-outside-toplevel
+        from .ops import mesh_minkowski_difference
+
+        return mesh_minkowski_difference(self, other)
 
     # ---- Transforms ----
 
@@ -460,6 +634,139 @@ class MeshPart:
         baked = self.to_solid()
         solids = baked.solids() if isinstance(baked, Compound) else [baked]
         return Part(solids)
+
+    # ---- Face-identity selectors ----
+
+    def faces(self) -> ShapeList[Face]:
+        """Return the recovered build123d :class:`~build123d.Face`s of this body.
+
+        Runs the faceID-grouped B-rep recovery (the same path
+        :meth:`to_solid` uses) and returns its faces as a real build123d
+        :class:`~build123d.topology.ShapeList` — so ``sort_by``, ``filter_by``
+        and ``group_by`` all work on the result. Planar seeded ids become
+        **exact analytic** :class:`~build123d.Face`s on the known
+        ``Geom_Plane``; curved ids are returned as faceted triangle patches.
+
+        For an all-planar :class:`MeshPart` (a box, or any CSG of boxes) this
+        returns exactly the faces a native BREP boolean would — every one an
+        analytic ``GeomType.PLANE``.
+
+        **Curved geometry is provenance-only (design §6.5, P3).** A curved
+        region's facet patches are *not* analytic; a curved-analytic selector
+        run on them — ``filter_by(GeomType.CYLINDER)``, a ``fillet`` — would
+        mis-answer. :meth:`faces` returns the patches so directional and planar
+        selectors keep working, but does not pretend they are analytic. The one
+        forbidden outcome is a silent wrong answer; see :meth:`analytic_faces`.
+
+        Returns:
+            ShapeList[Face]: every recovered face. Planar faces are analytic;
+            curved regions are faceted triangle patches.
+
+        Raises:
+            ValueError: if this MeshPart is empty, or carries no side-map (a
+                raw mesh has no face provenance to group on — use
+                :meth:`to_solid` with ``reconstruct=False`` for a faceted
+                bake).
+        """
+        if self._manifold.is_empty():
+            raise ValueError("Cannot recover faces of an empty MeshPart")
+        if not self._side_map:
+            raise ValueError(
+                "MeshPart.faces() needs a non-empty SideMap; a MeshPart built "
+                "from raw arrays (or by hull/minkowski) carries no face "
+                "provenance. Use to_solid(reconstruct=False) for a faceted "
+                "bake instead."
+            )
+        recovery = recover_brep(read_result(self._manifold), self._side_map)
+        faces: list[Face] = []
+        for recovered in recovery.recovered_faces:
+            faces.extend(recovered.faces)
+        return ShapeList(faces)
+
+    def analytic_faces(self) -> ShapeList[Face]:
+        """Return the recovered faces, but only if **every** one is analytic.
+
+        The strict counterpart of :meth:`faces` and the enforcement point of
+        the design's P3 contract (§6.5): a curved region of a mesh body
+        recovers *faceted*, not analytic, so a curved-analytic selector run on
+        it (``filter_by(GeomType.CYLINDER)``, a ``fillet``) would silently
+        mis-answer. Rather than hand back faceted patches that *look* like faces
+        to such a selector, this method **raises** when any curved region is
+        present — a clear error instead of a silent wrong answer.
+
+        Use this when downstream code will apply analytic selectors or fillets
+        and an all-planar result is required; use :meth:`faces` when faceted
+        patches for curved regions are acceptable.
+
+        Returns:
+            ShapeList[Face]: every recovered face, all guaranteed analytic
+            (``GeomType.PLANE``).
+
+        Raises:
+            ValueError: if this MeshPart is empty, carries no side-map, or
+                contains any curved (non-planar) region — a curved mesh region
+                cannot be recovered as an analytic face.
+        """
+        if self._manifold.is_empty():
+            raise ValueError("Cannot recover faces of an empty MeshPart")
+        if not self._side_map:
+            raise ValueError(
+                "MeshPart.analytic_faces() needs a non-empty SideMap; a "
+                "MeshPart built from raw arrays (or by hull/minkowski) carries "
+                "no face provenance."
+            )
+        recovery = recover_brep(read_result(self._manifold), self._side_map)
+        if recovery.n_faceted_curved:
+            raise ValueError(
+                "MeshPart.analytic_faces() refuses to return faces: this body "
+                f"has {recovery.n_faceted_curved} curved region(s) that "
+                "recover only as faceted patches, not analytic faces. A "
+                "curved-analytic selector (filter_by(GeomType.CYLINDER), "
+                "fillet) on a mesh-origin curved region would mis-answer. Use "
+                "MeshPart.faces() to accept faceted patches for curved regions."
+            )
+        faces: list[Face] = []
+        for recovered in recovery.recovered_faces:
+            faces.extend(recovered.faces)
+        return ShapeList(faces)
+
+    def faces_from(self, source: str) -> ShapeList[Face]:
+        """Return the recovered faces that originate from input shape ``source``.
+
+        Filters :meth:`faces` by :class:`~build123d.mesh.bridge.SideMap`
+        provenance: every recovered face whose seeded ``face_id`` traces back to
+        an input shape named ``source`` (the ``source`` argument of
+        :meth:`from_part` or a primitive constructor). **This includes
+        boolean-created cut faces** — a cut face inherits the id of the input
+        face it was cut from — which has no BREP equivalent (design §6.4): a
+        genuinely new selector dimension.
+
+        Args:
+            source (str): the source-shape name to filter on — matched against
+                :attr:`~build123d.mesh.bridge.FaceRecord.source`.
+
+        Returns:
+            ShapeList[Face]: the recovered faces originating from ``source``
+            (empty if no input shape carried that name).
+
+        Raises:
+            ValueError: if this MeshPart is empty or carries no side-map.
+        """
+        if self._manifold.is_empty():
+            raise ValueError("Cannot recover faces of an empty MeshPart")
+        if not self._side_map:
+            raise ValueError(
+                "MeshPart.faces_from() needs a non-empty SideMap; a MeshPart "
+                "built from raw arrays (or by hull/minkowski) carries no face "
+                "provenance."
+            )
+        recovery = recover_brep(read_result(self._manifold), self._side_map)
+        faces: list[Face] = []
+        for recovered in recovery.recovered_faces:
+            record = self._side_map.records.get(recovered.face_id)
+            if record is not None and record.source == source:
+                faces.extend(recovered.faces)
+        return ShapeList(faces)
 
     # ---- Export ----
 

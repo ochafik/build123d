@@ -78,6 +78,11 @@ except ImportError as exc:  # pragma: no cover - exercised only without the extr
 # pylint: disable=wrong-import-position
 from .bridge import FaceRecord, ResultMesh, SideMap, read_result, shape_to_manifold
 from .mesh_part import MeshPart, mesh_cut, mesh_fuse, mesh_intersect
+from .ops import (
+    mesh_hull,
+    mesh_minkowski,
+    mesh_minkowski_difference,
+)
 from .recovery import RecoveredFace, RecoveryResult, recover_brep
 
 __all__ = [
@@ -90,7 +95,10 @@ __all__ = [
     "is_available",
     "mesh_cut",
     "mesh_fuse",
+    "mesh_hull",
     "mesh_intersect",
+    "mesh_minkowski",
+    "mesh_minkowski_difference",
     "read_result",
     "recover_brep",
     "shape_to_manifold",
