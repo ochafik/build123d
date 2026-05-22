@@ -5,11 +5,12 @@ name: mesh_part.py
 
 desc:
 
-The :class:`MeshPart` value type and the free-function CSG API (:func:`mesh_fuse`,
-:func:`mesh_cut`, :func:`mesh_intersect`) — the Phase 0 surface of the
-``build123d[manifold]`` extra.
+The :class:`MeshPart` value type, its CSG operators, and the free-function CSG
+API (:func:`mesh_fuse`, :func:`mesh_cut`, :func:`mesh_intersect`) — the surface
+of the ``build123d[manifold]`` extra.
 
-:class:`MeshPart` is a thin wrapper around a ``manifold3d.Manifold``. It is a
+:class:`MeshPart` is a wrapper around a ``manifold3d.Manifold`` *plus* the
+:class:`~build123d.mesh.bridge.SideMap` provenance carried alongside it. It is a
 *standalone value type*, deliberately **not** a :class:`~build123d.Shape`
 subclass: a ``Shape`` is by contract an exact-BREP entity (analytic faces,
 fillets, STEP export), and a faceted mesh is none of those things. Crossing the
@@ -17,10 +18,23 @@ mesh↔BREP boundary is therefore always an explicit, named verb
 (:meth:`MeshPart.from_part`, :meth:`MeshPart.to_solid`) — never an implicit
 coercion.
 
-The free functions are the primary surface: they accept any mix of build123d
-``Shape`` and :class:`MeshPart` operands, tessellate the ``Shape`` operands
-under the hood, and return a :class:`MeshPart` so the user stays in fast mesh
-space across a CSG chain and pays the BREP bake at most once, at the end.
+CSG happens two ways, both returning a :class:`MeshPart` so the user stays in
+fast mesh space across a chain and pays the BREP bake at most once:
+
+* **Operators** — ``+`` / ``-`` / ``&`` (and their in-place forms). A
+  ``Shape`` operand is coerced (tessellated + seeded) so
+  ``mesh_part - native_part`` and ``native_part + mesh_part`` both work. The
+  *mesh operand must be on the left* for ``-`` and ``&`` (see §4.5 of the design
+  doc); use the free functions when operand direction needs to be explicit.
+* **Free functions** — :func:`mesh_fuse` / :func:`mesh_cut` /
+  :func:`mesh_intersect` resolve an N-way boolean in a single ``batch_boolean``
+  pass.
+
+Because face ids are globally unique, every boolean simply *merges* the operand
+side-maps. A :class:`MeshPart` that carries a non-empty side-map can be baked
+back to an **exact, analytic, filletable** B-rep for an all-planar result; one
+built from raw arrays (:meth:`from_mesh`) has no provenance and bakes to a
+faceted solid.
 
 license:
 
@@ -43,17 +57,18 @@ license:
 from __future__ import annotations
 
 import struct
-from typing import TYPE_CHECKING, Sequence, Union
+from typing import TYPE_CHECKING, Optional, Sequence, Union
 
 import numpy as np
 
 import manifold3d as m3d  # type: ignore[import-not-found]
 from OCP.Bnd import Bnd_Box
 
-from build123d.geometry import BoundBox
+from build123d.geometry import BoundBox, Location
 from build123d.topology import Compound, Part, Shape, Solid
 
-from .bridge import shape_to_manifold
+from .bridge import SideMap, read_result, shape_to_manifold
+from .recovery import recover_brep
 
 # manifold3d is a C extension; pylint cannot introspect its members statically.
 # pylint: disable=c-extension-no-member
@@ -66,31 +81,37 @@ MeshOperand = Union[Shape, "MeshPart"]
 
 
 class MeshPart:
-    """A ``manifold3d``-backed 3D mesh body.
+    """A ``manifold3d``-backed 3D mesh body with face-identity provenance.
 
     A sibling of build123d's :class:`~build123d.Part` — **not** a
     :class:`~build123d.Shape` subclass. Booleans on a :class:`MeshPart` are fast
-    and robust (``manifold3d`` guarantees a watertight, 2-manifold result), but
-    the geometry is *faceted*: curves and fillets are lost. Convert to an exact
-    BREP :class:`~build123d.Solid` explicitly with :meth:`to_solid`.
+    and robust (``manifold3d`` guarantees a watertight, 2-manifold result), and
+    every triangle carries a seeded ``face_id`` tracing it to an input
+    :class:`~build123d.Face`. For an all-planar CSG result :meth:`to_solid`
+    therefore rebuilds an *exact, analytic, filletable* B-rep; curved geometry is
+    recovered faceted.
 
-    This is the Phase 0 minimal wrapper: construction, queries, the explicit
-    BREP bake, and STL export. Operators, primitives, hull, and face-identity
-    selectors are later phases.
+    A :class:`MeshPart` holds a ``manifold3d.Manifold`` *and* a
+    :class:`~build123d.mesh.bridge.SideMap`. Booleans merge the operand
+    side-maps. A :class:`MeshPart` built from raw arrays (:meth:`from_mesh`)
+    carries an empty side-map and bakes to a faceted solid.
     """
 
-    __slots__ = ("_manifold",)
+    __slots__ = ("_manifold", "_side_map")
 
     # ---- Constructors ----
 
-    def __init__(self, manifold: m3d.Manifold):
-        """Wrap a ``manifold3d.Manifold`` directly.
+    def __init__(self, manifold: m3d.Manifold, side_map: Optional[SideMap] = None):
+        """Wrap a ``manifold3d.Manifold`` and its provenance side-map.
 
         Usually one of the classmethod constructors (:meth:`from_part`,
-        :meth:`from_mesh`) is more convenient.
+        :meth:`from_mesh`) or a CSG operator is more convenient.
 
         Args:
             manifold (manifold3d.Manifold): the underlying manifold.
+            side_map (SideMap | None): the ``faceID → provenance`` map. Defaults
+                to an empty :class:`~build123d.mesh.bridge.SideMap` (no
+                provenance — :meth:`to_solid` then falls back to a faceted bake).
 
         Raises:
             TypeError: if ``manifold`` is not a ``manifold3d.Manifold``.
@@ -100,37 +121,45 @@ class MeshPart:
                 f"MeshPart expects a manifold3d.Manifold, got {type(manifold)}"
             )
         self._manifold = manifold
+        self._side_map = side_map if side_map is not None else SideMap()
 
     @classmethod
     def from_part(
         cls,
         shape: Shape,
         *,
+        source: str = "shape",
         linear_tolerance: float = 0.1,
         angular_tolerance: float = 0.2,
     ) -> MeshPart:
-        """Build a MeshPart from a build123d Shape by tessellation.
+        """Build a MeshPart from a build123d Shape by per-face tessellation.
 
-        This is the BREP → mesh boundary (the OUT leg). It is reasonably cheap
-        but *lossy*: exact curves become facets at the given tolerance.
+        This is the BREP → mesh boundary (the OUT leg). It tessellates the shape
+        per :class:`~build123d.Face`, seeds every triangle with a unique
+        ``face_id``, and records the originating face's exact surface in a
+        :class:`~build123d.mesh.bridge.SideMap`. It is reasonably cheap but
+        *lossy*: exact curves become facets at the given tolerance — though the
+        seeded provenance lets :meth:`to_solid` recover exact *planar* faces.
 
         Args:
             shape (Shape): a build123d 3D shape.
-            linear_tolerance (float, optional): absolute linear deflection of
-                the tessellation. Defaults to 0.1.
-            angular_tolerance (float, optional): angular deflection in radians.
-                Defaults to 0.2.
+            source (str): a name for the shape, recorded on every face record
+                for provenance reporting. Defaults to ``"shape"``.
+            linear_tolerance (float): absolute linear deflection of the
+                tessellation. Defaults to 0.1.
+            angular_tolerance (float): angular deflection in radians. Defaults
+                to 0.2.
 
         Returns:
-            MeshPart: a guaranteed-manifold mesh body.
+            MeshPart: a guaranteed-manifold mesh body carrying seeded face ids.
         """
-        return cls(
-            shape_to_manifold(
-                shape,
-                linear_tolerance=linear_tolerance,
-                angular_tolerance=angular_tolerance,
-            )
+        manifold, side_map = shape_to_manifold(
+            shape,
+            source=source,
+            linear_tolerance=linear_tolerance,
+            angular_tolerance=angular_tolerance,
         )
+        return cls(manifold, side_map)
 
     @classmethod
     def from_mesh(
@@ -144,13 +173,17 @@ class MeshPart:
         guaranteed-manifold body. The mesh must already be a closed, oriented,
         indexed 2-manifold; the manifold status is asserted after construction.
 
+        The resulting :class:`MeshPart` carries an **empty** side-map: a raw mesh
+        has no analytic provenance, so :meth:`to_solid` falls back to the faceted
+        bake (one planar face per triangle).
+
         Args:
             vertices: ``(N, 3)`` array of vertex coordinates.
             triangles: ``(M, 3)`` array of triangle vertex indices, wound
                 counter-clockwise for outward normals.
 
         Returns:
-            MeshPart: a guaranteed-manifold mesh body.
+            MeshPart: a guaranteed-manifold mesh body with no provenance.
 
         Raises:
             ValueError: if the arrays are mis-shaped or the mesh does not import
@@ -201,6 +234,16 @@ class MeshPart:
         """
         return self._manifold
 
+    @property
+    def side_map(self) -> SideMap:
+        """The ``faceID → provenance`` map carried with this mesh body.
+
+        Empty for a :class:`MeshPart` built from raw arrays. Non-empty for one
+        built from a build123d shape or by a CSG operator/free function — the
+        provenance :meth:`to_solid` uses to rebuild an exact B-rep.
+        """
+        return self._side_map
+
     # ---- Queries ----
 
     def bounding_box(self) -> BoundBox:
@@ -226,30 +269,179 @@ class MeshPart:
         triangles = np.asarray(mesh.tri_verts, dtype=np.int64)
         return vertices, triangles
 
-    # ---- The explicit BREP boundary ----
+    # ---- CSG operators ----
 
-    def to_solid(self, *, unify_coplanar: bool = False) -> Solid | Compound:
-        """Bake this mesh body into a build123d BREP ``Solid``.
+    def __add__(self, other: MeshOperand) -> MeshPart:
+        """Union: ``self + other``. Returns a :class:`MeshPart`."""
+        return mesh_fuse(self, other)
 
-        This is the mesh → BREP boundary (the IN leg). It is **expensive** and
-        the result is *faceted*: one planar face per triangle, no analytic
-        surfaces. Do all CSG in mesh space first and bake once, at the end.
+    def __radd__(self, other: MeshOperand) -> MeshPart:
+        """Union with ``self`` on the right: coerces a ``Shape`` left operand."""
+        return mesh_fuse(other, self)
+
+    def __iadd__(self, other: MeshOperand) -> MeshPart:
+        """In-place union: ``self += other``."""
+        return mesh_fuse(self, other)
+
+    def __sub__(self, other: MeshOperand) -> MeshPart:
+        """Difference: ``self - other``. Returns a :class:`MeshPart`."""
+        return mesh_cut(self, other)
+
+    def __rsub__(self, other: MeshOperand) -> MeshPart:
+        """Difference with ``self`` on the right: ``shape - self``.
+
+        Coerces a ``Shape`` left operand so ``native_part - mesh_part`` works.
+        """
+        return mesh_cut(other, self)
+
+    def __isub__(self, other: MeshOperand) -> MeshPart:
+        """In-place difference: ``self -= other``."""
+        return mesh_cut(self, other)
+
+    def __and__(self, other: MeshOperand) -> MeshPart:
+        """Intersection: ``self & other``. Returns a :class:`MeshPart`."""
+        return mesh_intersect(self, other)
+
+    def __rand__(self, other: MeshOperand) -> MeshPart:
+        """Intersection with ``self`` on the right: coerces a ``Shape`` left."""
+        return mesh_intersect(other, self)
+
+    def __iand__(self, other: MeshOperand) -> MeshPart:
+        """In-place intersection: ``self &= other``."""
+        return mesh_intersect(self, other)
+
+    # ---- Transforms ----
+
+    def translate(self, offset: Sequence[float]) -> MeshPart:
+        """Return this mesh body translated by ``offset``.
+
+        faceID *identity* is transform-invariant; the side-map's exact plane
+        parameters are moved alongside the mesh so :meth:`to_solid` still
+        reconstructs in the new frame.
 
         Args:
-            unify_coplanar (bool, optional): when True, merge coplanar facets
-                into single faces (``ShapeUpgrade_UnifySameDomain``), collapsing
-                the facet explosion. Run it when the baked solid is user-facing;
-                skip it for throwaway intermediates. Defaults to False.
+            offset (Sequence[float]): an ``(x, y, z)`` translation vector.
 
         Returns:
-            Solid | Compound: a faceted build123d solid (a :class:`Compound`
-            when the mesh has several disjoint bodies).
+            MeshPart: the translated mesh body.
+        """
+        vector = np.array([float(c) for c in offset], dtype=np.float64)
+        moved = self._manifold.translate(list(vector))
+        matrix = np.hstack([np.identity(3), vector.reshape(3, 1)])
+        return MeshPart(moved, self._side_map.transformed(matrix))
+
+    def rotate(self, x: float = 0.0, y: float = 0.0, z: float = 0.0) -> MeshPart:
+        """Return this mesh body rotated by Euler angles (degrees).
+
+        The Euler order matches ``manifold3d``: a global-frame X, then Y, then Z
+        rotation. faceID identity is transform-invariant; the side-map's exact
+        plane parameters are rotated alongside the mesh.
+
+        Args:
+            x (float): rotation about the global X axis, in degrees.
+            y (float): rotation about the global Y axis, in degrees.
+            z (float): rotation about the global Z axis, in degrees.
+
+        Returns:
+            MeshPart: the rotated mesh body.
+        """
+        rotated = self._manifold.rotate([float(x), float(y), float(z)])
+        rotation = _euler_rotation_matrix(x, y, z)
+        matrix = np.hstack([rotation, np.zeros((3, 1))])
+        return MeshPart(rotated, self._side_map.transformed(matrix))
+
+    def scale(self, factor: float | Sequence[float]) -> MeshPart:
+        """Return this mesh body scaled by ``factor``.
+
+        faceID identity is transform-invariant; the side-map's exact plane
+        parameters are scaled alongside the mesh.
+
+        Args:
+            factor (float | Sequence[float]): a uniform scalar, or a per-axis
+                ``(sx, sy, sz)`` vector.
+
+        Returns:
+            MeshPart: the scaled mesh body.
+        """
+        if isinstance(factor, (int, float)):
+            vector = [float(factor)] * 3
+        else:
+            vector = [float(c) for c in factor]
+        matrix = np.hstack([np.diag(vector), np.zeros((3, 1))])
+        return MeshPart(
+            self._manifold.scale(vector), self._side_map.transformed(matrix)
+        )
+
+    def move(self, location: Location) -> MeshPart:
+        """Return this mesh body moved by a build123d :class:`~build123d.Location`.
+
+        Applies the location's full affine transform (rotation + translation).
+        faceID identity is transform-invariant; the side-map's exact plane
+        parameters are moved alongside the mesh.
+
+        Args:
+            location (Location): a build123d Location.
+
+        Returns:
+            MeshPart: the moved mesh body.
+        """
+        transformation = location.wrapped.Transformation()
+        matrix = np.array(
+            [
+                [transformation.Value(row + 1, col + 1) for col in range(4)]
+                for row in range(3)
+            ],
+            dtype=np.float64,
+        )
+        return MeshPart(
+            self._manifold.transform(matrix), self._side_map.transformed(matrix)
+        )
+
+    # ---- The explicit BREP boundary ----
+
+    def to_solid(
+        self, *, reconstruct: bool = True, unify_coplanar: bool = False
+    ) -> Solid | Compound:
+        """Bake this mesh body into a build123d BREP ``Solid``.
+
+        This is the mesh → BREP boundary (the IN leg). Two paths:
+
+        * **faceID-grouped reconstruction** (the default, when a non-empty
+          side-map is present): output triangles are grouped by their seeded
+          ``face_id``; planar groups rebuild **exact analytic faces** on the
+          known ``Geom_Plane``; curved groups are recovered faceted. For an
+          all-planar CSG result this yields a bit-exact, *filletable* B-rep.
+        * **faceted bake** (the fallback, or when ``reconstruct=False``): direct
+          shell assembly — one planar face per triangle, no analytic surfaces.
+
+        Args:
+            reconstruct (bool): when ``True`` (default) use faceID-grouped
+                reconstruction if a side-map is present. Set ``False`` to force
+                the pure faceted path.
+            unify_coplanar (bool): when ``True``, merge coplanar facets of the
+                faceted path into single faces (``ShapeUpgrade_UnifySameDomain``).
+                Only affects the faceted bake. Defaults to False.
+
+        Returns:
+            Solid | Compound: a build123d solid (a :class:`Compound` when the
+            mesh has several disjoint bodies).
 
         Raises:
             ValueError: if this MeshPart is empty.
         """
         if self._manifold.is_empty():
             raise ValueError("Cannot bake an empty MeshPart to a Solid")
+
+        if reconstruct and self._side_map:
+            result_mesh = read_result(self._manifold)
+            recovered = recover_brep(result_mesh, self._side_map)
+            if recovered.solid is not None and isinstance(
+                recovered.solid, (Solid, Compound)
+            ):
+                return recovered.solid
+            # Recovery failed to produce a closed solid; fall through to the
+            # faceted bake rather than returning a bare Shell.
+
         vertices, triangles = self.to_arrays()
         solid = Solid.from_mesh(vertices, triangles, fix=False)
         if unify_coplanar:
@@ -263,7 +455,7 @@ class MeshPart:
         algebra API's :class:`~build123d.Part` type.
 
         Returns:
-            Part: a faceted build123d Part.
+            Part: a build123d Part.
         """
         baked = self.to_solid()
         solids = baked.solids() if isinstance(baked, Compound) else [baked]
@@ -281,8 +473,8 @@ class MeshPart:
 
         Args:
             path: destination file path.
-            ascii_format (bool, optional): write ASCII STL instead of binary.
-                Defaults to False.
+            ascii_format (bool): write ASCII STL instead of binary. Defaults to
+                False.
 
         Returns:
             bool: True on success.
@@ -306,40 +498,97 @@ class MeshPart:
         return (
             f"MeshPart(triangles={manifold.num_tri()}, "
             f"vertices={manifold.num_vert()}, "
-            f"volume={manifold.volume():.3f})"
+            f"volume={manifold.volume():.3f}, "
+            f"face_records={len(self._side_map)})"
         )
+
+
+# ---- Transform helpers ----
+
+
+def _euler_rotation_matrix(x: float, y: float, z: float) -> np.ndarray:
+    """Return the 3x3 rotation matrix for ``manifold3d``'s Euler convention.
+
+    ``manifold3d.Manifold.rotate`` rotates about the global X axis, then the
+    global Y axis, then the global Z axis — so the composite matrix is
+    ``Rz @ Ry @ Rx``.
+
+    Args:
+        x (float): rotation about the global X axis, in degrees.
+        y (float): rotation about the global Y axis, in degrees.
+        z (float): rotation about the global Z axis, in degrees.
+
+    Returns:
+        np.ndarray: the ``(3, 3)`` rotation matrix.
+    """
+    angle_x, angle_y, angle_z = np.radians([x, y, z])
+    cos_x, sin_x = np.cos(angle_x), np.sin(angle_x)
+    cos_y, sin_y = np.cos(angle_y), np.sin(angle_y)
+    cos_z, sin_z = np.cos(angle_z), np.sin(angle_z)
+    rotate_x = np.array(
+        [[1, 0, 0], [0, cos_x, -sin_x], [0, sin_x, cos_x]], dtype=np.float64
+    )
+    rotate_y = np.array(
+        [[cos_y, 0, sin_y], [0, 1, 0], [-sin_y, 0, cos_y]], dtype=np.float64
+    )
+    rotate_z = np.array(
+        [[cos_z, -sin_z, 0], [sin_z, cos_z, 0], [0, 0, 1]], dtype=np.float64
+    )
+    return rotate_z @ rotate_y @ rotate_x
 
 
 # ---- Operand coercion ----
 
 
-def _to_manifold(operand: MeshOperand) -> m3d.Manifold:
-    """Coerce a free-function operand into a ``manifold3d.Manifold``.
+def _coerce(operand: MeshOperand) -> MeshPart:
+    """Coerce a free-function / operator operand into a :class:`MeshPart`.
 
-    A :class:`MeshPart` yields its manifold directly; a build123d
-    :class:`~build123d.Shape` is tessellated and welded (the OUT leg).
+    A :class:`MeshPart` is returned unchanged; a build123d
+    :class:`~build123d.Shape` is tessellated and seeded (the OUT leg) so it
+    arrives in mesh space *with* provenance.
 
     Args:
         operand: a build123d Shape or a MeshPart.
 
     Returns:
-        manifold3d.Manifold: the operand in mesh space.
+        MeshPart: the operand in mesh space, carrying a side-map.
 
     Raises:
         TypeError: if ``operand`` is neither a Shape nor a MeshPart.
     """
     if isinstance(operand, MeshPart):
-        return operand.manifold
+        return operand
     if isinstance(operand, Shape):
-        return shape_to_manifold(operand)
+        return MeshPart.from_part(operand)
     raise TypeError(f"Expected a build123d Shape or a MeshPart, got {type(operand)}")
 
 
-def _check_result(manifold: m3d.Manifold, operation: str) -> MeshPart:
-    """Wrap a boolean result, raising on a non-``NoError`` status.
+def _merge_side_maps(parts: Sequence[MeshPart]) -> SideMap:
+    """Merge the side-maps of several :class:`MeshPart` operands.
+
+    Face ids are globally unique, so the merge is a collision-free dictionary
+    update.
+
+    Args:
+        parts: the operand mesh parts.
+
+    Returns:
+        SideMap: the union of every operand's provenance records.
+    """
+    merged = SideMap()
+    for part in parts:
+        merged = merged.merged(part.side_map)
+    return merged
+
+
+def _check_result(
+    manifold: m3d.Manifold, side_map: SideMap, operation: str
+) -> MeshPart:
+    """Wrap a boolean result with its merged side-map, raising on a bad status.
 
     Args:
         manifold: the manifold produced by a boolean.
+        side_map: the merged provenance side-map.
         operation: a human-readable operation name for the error message.
 
     Returns:
@@ -350,9 +599,9 @@ def _check_result(manifold: m3d.Manifold, operation: str) -> MeshPart:
     """
     if manifold.status() != m3d.Error.NoError:
         raise ValueError(
-            f"mesh {operation} produced an invalid manifold: " f"{manifold.status()}"
+            f"mesh {operation} produced an invalid manifold: {manifold.status()}"
         )
-    return MeshPart(manifold)
+    return MeshPart(manifold, side_map)
 
 
 # ---- Free-function CSG API ----
@@ -361,12 +610,13 @@ def _check_result(manifold: m3d.Manifold, operation: str) -> MeshPart:
 def mesh_fuse(*shapes: MeshOperand) -> MeshPart:
     """Fast union of any mix of build123d Shapes and MeshParts.
 
-    ``Shape`` operands are tessellated under the hood. The N-way union is
-    resolved in a single ``manifold3d`` ``batch_boolean`` pass — materially
-    faster than folding ``+`` in Python.
+    ``Shape`` operands are tessellated and seeded under the hood. The N-way
+    union is resolved in a single ``manifold3d`` ``batch_boolean`` pass —
+    materially faster than folding ``+`` in Python — and the operand side-maps
+    are merged so the result carries full provenance.
 
     Args:
-        *shapes: two or more build123d Shapes / MeshParts.
+        *shapes: one or more build123d Shapes / MeshParts.
 
     Returns:
         MeshPart: the union, in mesh space.
@@ -376,17 +626,23 @@ def mesh_fuse(*shapes: MeshOperand) -> MeshPart:
     """
     if not shapes:
         raise ValueError("mesh_fuse needs at least one operand")
-    manifolds = [_to_manifold(shape) for shape in shapes]
-    result = m3d.Manifold.batch_boolean(manifolds, m3d.OpType.Add)
-    return _check_result(result, "fuse")
+    parts = [_coerce(shape) for shape in shapes]
+    side_map = _merge_side_maps(parts)
+    if len(parts) == 1:
+        return MeshPart(parts[0].manifold, side_map)
+    result = m3d.Manifold.batch_boolean(
+        [part.manifold for part in parts], m3d.OpType.Add
+    )
+    return _check_result(result, side_map, "fuse")
 
 
 def mesh_cut(base: MeshOperand, *tools: MeshOperand) -> MeshPart:
     """Fast difference: subtract every tool from ``base``.
 
     ``base`` and ``tools`` may be any mix of build123d Shapes and MeshParts;
-    ``Shape`` operands are tessellated under the hood. The subtraction is
-    resolved in a single ``manifold3d`` ``batch_boolean`` pass.
+    ``Shape`` operands are tessellated and seeded under the hood. The
+    subtraction is resolved in a single ``manifold3d`` ``batch_boolean`` pass and
+    the operand side-maps are merged.
 
     Args:
         base: the shape / mesh to subtract from.
@@ -395,22 +651,26 @@ def mesh_cut(base: MeshOperand, *tools: MeshOperand) -> MeshPart:
     Returns:
         MeshPart: the difference, in mesh space.
     """
-    base_manifold = _to_manifold(base)
+    base_part = _coerce(base)
     if not tools:
-        return MeshPart(base_manifold)
-    manifolds = [base_manifold] + [_to_manifold(tool) for tool in tools]
-    result = m3d.Manifold.batch_boolean(manifolds, m3d.OpType.Subtract)
-    return _check_result(result, "cut")
+        return MeshPart(base_part.manifold, base_part.side_map)
+    parts = [base_part] + [_coerce(tool) for tool in tools]
+    side_map = _merge_side_maps(parts)
+    result = m3d.Manifold.batch_boolean(
+        [part.manifold for part in parts], m3d.OpType.Subtract
+    )
+    return _check_result(result, side_map, "cut")
 
 
 def mesh_intersect(*shapes: MeshOperand) -> MeshPart:
     """Fast intersection of any mix of build123d Shapes and MeshParts.
 
-    ``Shape`` operands are tessellated under the hood. The N-way intersection is
-    resolved in a single ``manifold3d`` ``batch_boolean`` pass.
+    ``Shape`` operands are tessellated and seeded under the hood. The N-way
+    intersection is resolved in a single ``manifold3d`` ``batch_boolean`` pass
+    and the operand side-maps are merged.
 
     Args:
-        *shapes: two or more build123d Shapes / MeshParts.
+        *shapes: one or more build123d Shapes / MeshParts.
 
     Returns:
         MeshPart: the intersection, in mesh space.
@@ -420,9 +680,14 @@ def mesh_intersect(*shapes: MeshOperand) -> MeshPart:
     """
     if not shapes:
         raise ValueError("mesh_intersect needs at least one operand")
-    manifolds = [_to_manifold(shape) for shape in shapes]
-    result = m3d.Manifold.batch_boolean(manifolds, m3d.OpType.Intersect)
-    return _check_result(result, "intersect")
+    parts = [_coerce(shape) for shape in shapes]
+    side_map = _merge_side_maps(parts)
+    if len(parts) == 1:
+        return MeshPart(parts[0].manifold, side_map)
+    result = m3d.Manifold.batch_boolean(
+        [part.manifold for part in parts], m3d.OpType.Intersect
+    )
+    return _check_result(result, side_map, "intersect")
 
 
 # ---- STL serialization (dependency-free) ----

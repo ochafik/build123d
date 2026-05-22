@@ -314,8 +314,9 @@ wants a `Solid` back types `.to_solid()`.
 
 ### 3.4 The bridge — OUT leg (`Shape` → `Manifold`)
 
-`Shape.tessellate(tolerance, angular_tolerance)` → **weld** → `manifold3d.Mesh`
-(double-precision `Mesh64` — see §8) → `manifold3d.Manifold`.
+Per-`TopoDS_Face` `Shape.tessellate` → **seed `face_id`** → **weld** →
+`manifold3d.Mesh64` (double precision — see §8) → `manifold3d.Manifold` **plus a
+`SideMap`**.
 
 - **Welding is mandatory.** `tessellate()` concatenates per-face triangulations
   with no cross-face vertex dedup (`shape_core.py:2241`). manifold3d does not
@@ -325,6 +326,18 @@ wants a `Solid` back types `.to_solid()`.
   `np.unique(axis=0)` pass, un-snapped coordinates averaged back per cluster so
   no grid bias is introduced. `p1` verified: box 24→8 verts, sphere 5153→5089,
   every test shape `Error.NoError`, genus preserved.
+- **faceID seeding is systematic, not opt-in.** The bridge tessellates the
+  shape **per `TopoDS_Face`** and stamps every triangle of each face with a
+  globally unique integer id, then builds the `Mesh64` with that seeded
+  `face_id` array. This is the *default* behaviour — exact B-rep recovery (§6.3)
+  is therefore automatic, not a separate pass. If `face_id` is left unseeded
+  manifold fills it from its own coplanar calculation, which shatters every
+  curved face into dozens of ids (`p9` §6, the p8 finding); seeded, the id is
+  *maintained* through the boolean (`p9` §1–2). The seed array must be a flat
+  `(N,)` uint64 — the prior "incompatible arguments" blocker was a rank bug, not
+  a dtype one (`p9`). The bridge also returns a `SideMap`
+  (`faceID → {build123d Face, its Geom_Surface, planar? + exact plane, source}`)
+  — the provenance §6.3's exact reconstruction consumes.
 - **Cost: production-ready.** Sub-100 ms for every shape `p1` tried except a
   31k-triangle torus (0.47 s — it is just a big mesh). The OUT leg is the easy
   half.
@@ -719,7 +732,8 @@ exposes three metadata channels, and choosing the right one is load-bearing:
 | Channel | Granularity | Through booleans | Use for |
 |---|---|---|---|
 | `run_original_id` (+ `reserve_ids`, `as_original`) | per-triangle run → input **solid**; per input **face** with `reserve_ids` | **exact** — union/diff/intersect/chained; cut faces inherit the tool id | discrete identity / provenance |
-| `face_id` | per-triangle → coplanar-region group | partial — **unique only within a run, collides across runs** | a *hint* for coplanar grouping, never a global key |
+| `face_id` — **unseeded** | per-triangle → manifold's coplanar-region calc | **shatters** — one id per facet strip on a curved face | nothing reliable; the p8 finding |
+| `face_id` — **seeded** (one id per input `TopoDS_Face`) | per-triangle → input **face** | **maintained** — union/diff/intersect/chained (`p9`) | the **recommended** per-face identity channel |
 | `vert_properties` cols 3+ | per-**vertex** floats (color, UV, normals) | carried, but **linearly interpolated at cut vertices** | smoothly-varying data only |
 
 **The rule: discrete identity goes in the integer id channels, never in
@@ -728,11 +742,18 @@ property value — fine for a color gradient, corrupting for a discrete face/par
 tag (tag `3` averaged with `7` becomes `5`). `research/03` §2.8 and `p8` both
 hit this with color.
 
-`face_id` is tempting as a ready-made "face" tag, but `p8` found it unusable as
-a global key: it is unique only *within a run*, and a face cut into two disjoint
-pieces keeps a single id. The `ReFacer` (§6.3) therefore ignores raw `face_id`
-and reconstructs faces from `run_original_id` + welded-edge connectivity +
-dihedral angle.
+`face_id` has **two regimes, and they must not be conflated.** *Unseeded*,
+manifold fills `face_id` from its own coplanar-face calculation — which shatters
+a tessellated cylinder into dozens of ids; that is the channel `p8` correctly
+called unusable. *Seeded* — one unique id stamped on every triangle of each
+input `TopoDS_Face` via `Mesh64(face_id=...)` — is **maintained** through the
+boolean and is the **recommended** per-face identity channel (`p9` §6,
+reconciliation). It is a better Python fit than `run_original_id`: natively
+per-**face**, not per-**solid**, so seeding is one flat `(N,)` uint64 array per
+solid (the "incompatible arguments" scare was a rank bug — pass a 1-D array),
+and it matches the OCCT C++ design (`MeshGL64::faceID`). build123d's bridge
+seeds `face_id` **systematically** (§3.4); §6.3's exact reconstruction groups on
+it directly.
 
 Crucially, none of these channels is *topology*. There is **no usable edge
 channel** (`p8` notes a halfedge-level original-id analogue exists but is
@@ -772,6 +793,30 @@ API, the real `ShapeList`.
 the re-facer must surface: too small fragments faceted curves; too large merges
 genuinely distinct faces.
 
+**faceID-grouped *exact* reconstruction (the recommended strategy, `p9`).** The
+`ReFacer` above rebuilds faces but not *provably exact* ones — it fits a plane
+to the triangle cluster. With the bridge's systematic `face_id` seeding (§3.4)
+there is a strictly stronger strategy, and it is what `MeshPart.to_solid()` does
+by default:
+
+1. **Group output triangles by seeded `face_id`** — identity, not geometry, is
+   the grouping key.
+2. **Split each id into edge-connected components.** A seeded id whose face the
+   boolean cut into two disjoint pieces becomes *two* `TopoDS_Face`s (p8's
+   split-face concern, confirmed real — connectivity is still used, but to split
+   a known id, not as the primary key).
+3. **Planar group → exact `TopoDS_Face` on the *known input* `Geom_Plane`** from
+   the `SideMap` — boundary vertices are orthogonally projected onto that exact
+   plane, erasing tessellation jitter. The result is not *fitted*; it lies on
+   the input analytic surface.
+4. **Curved group → faceted patch** (identity preserved, geometry approximate).
+5. **Sew → `Solid`** (or `Compound` for disjoint bodies).
+
+`p9` measured: an all-planar mesh-CSG result recovers with the **same face/edge
+count as the native boolean** and **bit-exact volume**, every face an analytic
+`GeomType.PLANE`. This is what makes the §6.5 / P7 planar path *exact and
+filletable*, not merely "rebuilt".
+
 ### 6.4 Provenance as a new selector dimension
 
 Mesh tagging is **strictly additive** on one axis: `MeshPart.faces_from(name)`
@@ -784,11 +829,16 @@ improvement, not this design.)
 ### 6.5 The planar-recoverable / curved-lost split — the API contract
 
 - **Planar-dominated CSG** (transpiled OpenSCAD, plate/bracket work): the
-  tag-and-remerge path is **fully sufficient** — exact `Face` counts, all
-  directional and plane selectors.
-- **Curved geometry:** **provenance-only.** The bore is one provenance cluster
-  (addressable by `faces_from`), but `geom_type`/curved selectors are
-  unavailable.
+  faceID-grouped path is **fully sufficient and exact** — `MeshPart.to_solid()`
+  rebuilds an analytic B-rep with the same face/edge count as the native
+  boolean, bit-exact volume, all directional and plane selectors, **clean STEP
+  export, and real `fillet()`/`chamfer()`** that produce analytic blend
+  surfaces (`p9` payoff). The mesh path is no longer "faceted only" for this
+  whole class of part.
+- **Curved geometry:** **provenance-only.** The bore is one seeded-`face_id`
+  cluster (the `SideMap` even names its `Geom_Cylinder`), but it is recovered
+  *faceted* — `geom_type`/curved selectors and a fillet on a curved region are
+  unavailable. Exact re-trim of the known surface is a research item (Tier C).
 
 **The contract (P3):** `MeshPart.faces()` returns rebuilt planar faces and
 faceted patches for curved regions. A curved-analytic selector

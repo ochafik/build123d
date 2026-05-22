@@ -476,9 +476,15 @@ class Compound(Mixin3D[TopoDS_Compound]):
         if other is None:
             summands = ShapeList()
         else:
+            try:
+                operands = [other] if isinstance(other, Shape) else list(other)
+            except TypeError:
+                # `other` is neither a Shape nor iterable (e.g. a MeshPart from
+                # the optional mesh backend): defer to its reflected operator.
+                return NotImplemented
             summands = ShapeList(
                 shape
-                for o in ([other] if isinstance(other, Shape) else other)
+                for o in operands
                 if o is not None
                 for shape in o.get_top_level_shapes()
             )
@@ -503,6 +509,10 @@ class Compound(Mixin3D[TopoDS_Compound]):
     def __and__(self, other: Shape | Iterable[Shape]) -> Compound:
         """Intersect other to self `&` operator"""
         intersection = Shape.__and__(self, other)
+        if intersection is NotImplemented:
+            # `other` is not a Shape (e.g. a MeshPart): defer to its reflected
+            # operator so `native_compound & mesh_part` is coerced.
+            return NotImplemented
         if intersection is None:
             return Compound()
         if isinstance(intersection, list):
@@ -553,6 +563,10 @@ class Compound(Mixin3D[TopoDS_Compound]):
     def __sub__(self, other: None | Shape | Iterable[Shape]) -> Compound:
         """Cut other to self `-` operator"""
         difference = Shape.__sub__(self, other)
+        if difference is NotImplemented:
+            # `other` is not a Shape (e.g. a MeshPart): defer to its reflected
+            # operator so `native_compound - mesh_part` is coerced.
+            return NotImplemented
         if not isinstance(difference, Compound):
             difference = Compound([difference])
         self.copy_attributes_to(difference, ["wrapped", "_NodeMixin__children"])

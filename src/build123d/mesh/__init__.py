@@ -76,14 +76,22 @@ except ImportError as exc:  # pragma: no cover - exercised only without the extr
 # Imports are deliberately placed after the guarded manifold3d import above so
 # that a missing extra raises the actionable ImportError before these run.
 # pylint: disable=wrong-import-position
-from .bridge import shape_to_manifold
+from .bridge import FaceRecord, ResultMesh, SideMap, read_result, shape_to_manifold
 from .mesh_part import MeshPart, mesh_cut, mesh_fuse, mesh_intersect
+from .recovery import RecoveredFace, RecoveryResult, recover_brep
 
 __all__ = [
+    "FaceRecord",
     "MeshPart",
+    "RecoveredFace",
+    "RecoveryResult",
+    "ResultMesh",
+    "SideMap",
     "is_available",
     "mesh_cut",
     "mesh_fuse",
     "mesh_intersect",
+    "read_result",
+    "recover_brep",
     "shape_to_manifold",
 ]

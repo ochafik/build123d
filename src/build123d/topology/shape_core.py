@@ -966,10 +966,15 @@ class Shape(NodeMixin, Generic[TOPODS]):
         if other is None:
             summands = []
         else:
+            try:
+                operands = [other] if isinstance(other, Shape) else list(other)
+            except TypeError:
+                # `other` is neither a Shape nor iterable (e.g. a MeshPart from
+                # the optional mesh backend): defer to its reflected operator.
+                return NotImplemented
             summands = [
                 shape
-                # for o in (other if isinstance(other, (list, tuple)) else [other])
-                for o in ([other] if isinstance(other, Shape) else other)
+                for o in operands
                 if o is not None
                 for shape in o.get_top_level_shapes()
             ]
@@ -997,6 +1002,11 @@ class Shape(NodeMixin, Generic[TOPODS]):
 
     def __and__(self, other: Shape | Iterable[Shape]) -> None | Self | Compound:
         """intersect shape with self operator &"""
+        if not isinstance(other, (Shape, list, tuple)):
+            # `other` is neither a Shape nor a sequence of Shapes (e.g. a
+            # MeshPart from the optional mesh backend): defer to its reflected
+            # operator so `native_shape & mesh_part` is coerced into mesh space.
+            return NotImplemented
         others = other if isinstance(other, (list, tuple)) else [other]
 
         if not self or (isinstance(other, Shape) and not other):
@@ -1103,10 +1113,15 @@ class Shape(NodeMixin, Generic[TOPODS]):
         if other is None:
             subtrahends = []
         else:
+            try:
+                operands = [other] if isinstance(other, Shape) else list(other)
+            except TypeError:
+                # `other` is neither a Shape nor iterable (e.g. a MeshPart from
+                # the optional mesh backend): defer to its reflected operator.
+                return NotImplemented
             subtrahends = [
                 shape
-                # for o in (other if isinstance(other, (list, tuple)) else [other])
-                for o in ([other] if isinstance(other, Shape) else other)
+                for o in operands
                 if o is not None
                 for shape in o.get_top_level_shapes()
             ]
