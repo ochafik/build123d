@@ -142,7 +142,9 @@ from .two_d import Face, Mixin2D, Shell, sort_wires_by_build_order
 from .utils import (
     _extrude_topods_shape,
     _make_loft,
+    connected_components_by_vertex,
     find_max_dimension,
+    group_shells_into_solids,
 )
 from .zero_d import Vertex
 
@@ -1441,7 +1443,9 @@ class Solid(Mixin3D[TopoDS_Solid]):
         # triangles sharing a vertex index belong to the same body. Each
         # component becomes its own TopoDS_Shell so a multi-body mesh yields
         # several shells rather than one container of unrelated faces.
-        component_of_triangle = _connected_components(triangle_array, len(vertex_array))
+        component_of_triangle = connected_components_by_vertex(
+            triangle_array, len(vertex_array)
+        )
 
         component_shells: list[Shell] = []
         for component in np.unique(component_of_triangle):
@@ -1481,12 +1485,12 @@ class Solid(Mixin3D[TopoDS_Solid]):
             raise ValueError("No valid face could be built from the mesh")
 
         # Classify the disjoint shells by bounding-box nesting (see
-        # _group_shells_into_solids): a shell nested inside another is that
+        # group_shells_into_solids): a shell nested inside another is that
         # body's internal void; separate bodies are separate Solids. This
         # deliberately avoids the "largest = outer, rest = voids" heuristic,
         # which mis-builds a multi-body mesh as one Solid-with-voids.
         solids: list[Solid] = []
-        for outer_shell, void_shells in _group_shells_into_solids(component_shells):
+        for outer_shell, void_shells in group_shells_into_solids(component_shells):
             solid_builder = BRepBuilderAPI_MakeSolid(outer_shell.wrapped)
             for void_shell in void_shells:
                 solid_builder.Add(void_shell.wrapped)
@@ -2033,91 +2037,3 @@ class DraftAngleError(RuntimeError):
         super().__init__(message)
         self.face = face
         self.problematic_shape = problematic_shape
-
-
-def _connected_components(triangles: np.ndarray, vertex_count: int) -> np.ndarray:
-    """Label each triangle with the index of its connected component.
-
-    Two triangles belong to the same component (disjoint mesh body) when they
-    share a vertex index. Implemented with a weighted union-find over the
-    vertex set; used by :meth:`Solid.from_mesh` to split a multi-body mesh.
-
-    Args:
-        triangles: ``(M, 3)`` array of triangle vertex indices.
-        vertex_count: number of unique vertices in the mesh.
-
-    Returns:
-        An ``(M,)`` array of component labels (0-based, contiguous).
-    """
-    parent = np.arange(vertex_count, dtype=np.int64)
-
-    def find(node: int) -> int:
-        root = node
-        while parent[root] != root:
-            root = parent[root]
-        while parent[node] != root:  # path compression
-            parent[node], node = root, parent[node]
-        return root
-
-    for triangle in triangles:
-        first = find(int(triangle[0]))
-        for other in (int(triangle[1]), int(triangle[2])):
-            parent[find(other)] = first
-
-    roots = np.array([find(int(triangle[0])) for triangle in triangles], dtype=np.int64)
-    _, labels = np.unique(roots, return_inverse=True)
-    return labels.reshape(-1)
-
-
-def _group_shells_into_solids(
-    shells: Sequence[Shell],
-) -> list[tuple[Shell, list[Shell]]]:
-    """Group reconstructed shells into ``(outer, [voids])`` tuples.
-
-    Used by :meth:`Solid.from_mesh`. A shell whose bounding box is strictly
-    contained in another shell's bounding box is classified as an internal void
-    of the *smallest* such enclosing shell; every non-nested shell is a
-    top-level body. This bounding-box-nesting rule replaces the incorrect
-    "largest shell is outer, all others are voids" heuristic, which mis-builds a
-    mesh of several disjoint bodies as a single invalid solid-with-voids.
-
-    Args:
-        shells: the connected shells obtained from a reconstructed mesh.
-
-    Returns:
-        One ``(outer_shell, void_shells)`` tuple per top-level body.
-    """
-    boxes = [shell.bounding_box() for shell in shells]
-
-    def is_inside(inner: BoundBox, outer: BoundBox) -> bool:
-        eps = 1e-7
-        return (
-            outer.min.X - eps <= inner.min.X
-            and outer.min.Y - eps <= inner.min.Y
-            and outer.min.Z - eps <= inner.min.Z
-            and inner.max.X <= outer.max.X + eps
-            and inner.max.Y <= outer.max.Y + eps
-            and inner.max.Z <= outer.max.Z + eps
-        )
-
-    def box_volume(box: BoundBox) -> float:
-        size = box.size
-        return size.X * size.Y * size.Z
-
-    parent: list[int | None] = [None] * len(shells)
-    for i in range(len(shells)):
-        for j in range(len(shells)):
-            if i == j:
-                continue
-            if is_inside(boxes[i], boxes[j]):
-                # j encloses i; keep the smallest such enclosing shell.
-                current = parent[i]
-                if current is None or box_volume(boxes[j]) < box_volume(boxes[current]):
-                    parent[i] = j
-
-    groups: list[tuple[Shell, list[Shell]]] = []
-    for i, shell in enumerate(shells):
-        if parent[i] is None:  # a top-level (outer) shell
-            voids = [shells[k] for k in range(len(shells)) if parent[k] == i]
-            groups.append((shell, voids))
-    return groups

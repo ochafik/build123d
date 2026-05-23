@@ -111,11 +111,11 @@ from .corners import (
     detect_corners,
     per_chain_setback,
 )
+from ._utils import triangle_normals
 from .feature_edges import (
     FeatureChain,
     FeatureChainSelection,
     edge_convexity_sign,
-    triangle_normals,
 )
 
 # manifold3d is a C extension; pylint cannot introspect its members statically.

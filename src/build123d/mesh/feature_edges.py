@@ -56,6 +56,8 @@ from typing import Callable, Iterable, Iterator, Literal, Sequence
 
 import numpy as np
 
+from ._utils import triangle_normals
+
 # Sign threshold (along an edge) below which an edge counts as "flat" — i.e. the
 # two adjacent faces are nearly coplanar and no chamfer/fillet is needed.
 _FLAT_TOL = 1e-6
@@ -150,23 +152,6 @@ def _unit(vector: np.ndarray) -> np.ndarray:
     """Normalize a 3-vector; return the input unchanged if it is near-zero."""
     norm = float(np.linalg.norm(vector))
     return vector / norm if norm > 1e-12 else vector
-
-
-def triangle_normals(vertices: np.ndarray, triangles: np.ndarray) -> np.ndarray:
-    """Return ``(M, 3)`` unit outward normals (one per triangle, CCW winding).
-
-    Args:
-        vertices (np.ndarray): ``(N, 3)`` vertex coordinates.
-        triangles (np.ndarray): ``(M, 3)`` triangle vertex indices.
-
-    Returns:
-        np.ndarray: ``(M, 3)`` unit normals.
-    """
-    corners = vertices[triangles]
-    normals = np.cross(corners[:, 1] - corners[:, 0], corners[:, 2] - corners[:, 0])
-    lengths = np.linalg.norm(normals, axis=1, keepdims=True)
-    lengths[lengths == 0.0] = 1.0
-    return normals / lengths
 
 
 def edge_convexity_sign(vertices: np.ndarray, edge: FeatureEdge) -> float:
@@ -674,5 +659,4 @@ __all__ = [
     "classify_vertex_kinds",
     "edge_convexity_sign",
     "extract_feature_edges",
-    "triangle_normals",
 ]

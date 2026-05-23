@@ -75,7 +75,7 @@ from OCP.TopExp import TopExp_Explorer
 from OCP.TopoDS import TopoDS
 
 from build123d.topology import Compound, Face, Shell, Solid
-from build123d.topology.three_d import _group_shells_into_solids
+from build123d.topology.utils import group_shells_into_solids
 
 from .bridge import FaceRecord, ResultMesh, SideMap
 
@@ -493,7 +493,7 @@ def recover_brep(result: ResultMesh, side_map: SideMap) -> RecoveryResult:
     #   * a body with a cavity    -> the cavity's inward-facing shell is an
     #                                internal VOID of the enclosing body.
     # Summing a positive Solid per shell would ADD a cavity instead of carving
-    # it out. _group_shells_into_solids classifies by bounding-box nesting: a
+    # it out. group_shells_into_solids classifies by bounding-box nesting: a
     # shell nested inside another is that body's void (one level of nesting,
     # matching Solid.from_mesh); non-nested shells are separate bodies.
     shells: list[Shell] = []
@@ -506,7 +506,7 @@ def recover_brep(result: ResultMesh, side_map: SideMap) -> RecoveryResult:
         explorer.Next()
 
     solids: list[Solid] = []
-    for outer_shell, void_shells in _group_shells_into_solids(shells):
+    for outer_shell, void_shells in group_shells_into_solids(shells):
         solid_builder = BRepBuilderAPI_MakeSolid(outer_shell.wrapped)
         for void_shell in void_shells:
             solid_builder.Add(void_shell.wrapped)

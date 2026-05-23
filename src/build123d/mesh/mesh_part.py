@@ -67,6 +67,7 @@ from OCP.Bnd import Bnd_Box
 from build123d.geometry import BoundBox, Location
 from build123d.topology import Compound, Face, Part, Shape, ShapeList, Solid
 
+from ._utils import triangle_normals
 from .bridge import SideMap, read_result, shape_to_manifold
 from .recovery import recover_brep
 
@@ -1257,24 +1258,6 @@ def mesh_intersect(*shapes: MeshOperand) -> MeshPart:
 # ---- STL serialization (dependency-free) ----
 
 
-def _triangle_normals(vertices: np.ndarray, triangles: np.ndarray) -> np.ndarray:
-    """Return the unit normal of every triangle.
-
-    Args:
-        vertices: ``(N, 3)`` vertex coordinates.
-        triangles: ``(M, 3)`` triangle vertex indices.
-
-    Returns:
-        np.ndarray: ``(M, 3)`` unit normals; a degenerate (zero-area) triangle
-        yields a zero normal.
-    """
-    corners = vertices[triangles]  # (M, 3, 3)
-    normals = np.cross(corners[:, 1] - corners[:, 0], corners[:, 2] - corners[:, 0])
-    lengths = np.linalg.norm(normals, axis=1, keepdims=True)
-    lengths[lengths == 0.0] = 1.0
-    return normals / lengths
-
-
 def _write_binary_stl(
     path: str | PathLike, vertices: np.ndarray, triangles: np.ndarray
 ) -> None:
@@ -1286,7 +1269,7 @@ def _write_binary_stl(
         triangles: ``(M, 3)`` triangle vertex indices.
     """
     corners = vertices[triangles].astype(np.float32)  # (M, 3, 3)
-    normals = _triangle_normals(vertices, triangles).astype(np.float32)
+    normals = triangle_normals(vertices, triangles).astype(np.float32)
     # The binary-STL 50-byte facet record: normal, 3 corners, 2-byte attribute.
     record = np.dtype([("n", "<f4", 3), ("c", "<f4", (3, 3)), ("attr", "<u2")])
     facets = np.zeros(len(triangles), dtype=record)
@@ -1309,7 +1292,7 @@ def _write_ascii_stl(
         triangles: ``(M, 3)`` triangle vertex indices.
     """
     corners = vertices[triangles]  # (M, 3, 3)
-    normals = _triangle_normals(vertices, triangles)
+    normals = triangle_normals(vertices, triangles)
     lines = ["solid build123d_MeshPart"]
     for normal, triangle in zip(normals, corners):
         lines.append(f"  facet normal {normal[0]:.6e} {normal[1]:.6e} {normal[2]:.6e}")
