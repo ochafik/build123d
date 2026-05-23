@@ -77,6 +77,7 @@ if TYPE_CHECKING:  # pragma: no cover
     from os import PathLike
 
     from .feature_edges import FeatureChainSelection
+    from .fillet import FilletReport
 
 # A free-function / operator operand: either a build123d shape or a MeshPart.
 MeshOperand = Union[Shape, "MeshPart"]
@@ -99,7 +100,12 @@ class MeshPart:
     carries an empty side-map and bakes to a faceted solid.
     """
 
-    __slots__ = ("_manifold", "_side_map", "_feature_edges_cache")
+    __slots__ = (
+        "_manifold",
+        "_side_map",
+        "_feature_edges_cache",
+        "_last_fillet_report",
+    )
 
     # ---- Constructors ----
 
@@ -125,6 +131,9 @@ class MeshPart:
         self._manifold = manifold
         self._side_map = side_map if side_map is not None else SideMap()
         self._feature_edges_cache: Optional["FeatureChainSelection"] = None
+        # Populated by :meth:`fillet` / :meth:`chamfer` when ``on_infeasible="skip"``
+        # drops one or more chains. ``None`` otherwise (design §8.2 / A4).
+        self._last_fillet_report: Optional["FilletReport"] = None
 
     @classmethod
     def from_part(
@@ -353,6 +362,19 @@ class MeshPart:
         provenance :meth:`to_solid` uses to rebuild an exact B-rep.
         """
         return self._side_map
+
+    @property
+    def last_fillet_report(self) -> Optional["FilletReport"]:
+        """The :class:`~build123d.mesh.FilletReport` from the last fillet/chamfer.
+
+        Populated by :meth:`fillet` / :meth:`chamfer` when ``on_infeasible="skip"``
+        dropped any chain or corner; ``None`` otherwise (and ``None`` after a
+        successful all-feasible call). Carries the dropped chain/corner records,
+        the failing constraint, and the request/measurement that triggered the
+        skip (design §8.2 / A4). Logged at WARNING level so a skip is never
+        completely silent (P3 — never silently mis-answer).
+        """
+        return self._last_fillet_report
 
     # ---- Queries ----
 
@@ -830,26 +852,29 @@ class MeshPart:
     def chamfer(
         self,
         edges: object,
-        size: float,
+        size: object,
         *,
         on_infeasible: str = "raise",
     ) -> "MeshPart":
-        """Apply a faceted chamfer of ``size`` to ``edges`` (Phase A3a).
+        """Apply a faceted chamfer to ``edges``.
 
         Method form of :func:`build123d.mesh.mesh_chamfer`. The selection
         argument follows design §8.1: a :class:`FeatureChainSelection` (from
         :meth:`feature_edges`), a single :class:`FeatureChain`, or any iterable
         of :class:`FeatureChain`.
 
-        A3a's profile is a flat triangular wedge with both legs of length
-        ``size``; ``size`` is the chamfer leg length on each adjacent face
-        (matching native :meth:`Part.chamfer`'s ``length`` semantics). The
-        construction is one **swept tool per chain** (design §3) — convex
+        ``size`` may be a scalar ``float`` (uniform chamfer leg) or, per A4's
+        variable-radius extension, a callable ``(chain, vertex_index) -> float``
+        evaluated at every chain vertex (design §2.4 deferred this to A4).
+        The construction is one **swept tool per chain** (design §3) — convex
         chains have their wedge subtracted, concave chains have it added; both
-        directions are batched into a single ``manifold3d`` boolean. Multi-chain
-        corner vertices and over-size requests **raise**
-        :class:`~build123d.mesh.MeshFilletInfeasible` (P3 — never silently
-        clamp).
+        directions are batched into a single ``manifold3d`` boolean.
+
+        Over-size requests, mixed corners, and ``k > 6`` corners **raise**
+        :class:`~build123d.mesh.MeshFilletInfeasible` by default (P3 — never
+        silently clamp). Pass ``on_infeasible="skip"`` (design §8.2 / A4) to
+        drop the offending chain or corner from the operation; the dropped
+        items are reported on :attr:`last_fillet_report`.
 
         Args:
             edges: chains to chamfer — a
@@ -857,56 +882,71 @@ class MeshPart:
                 :class:`~build123d.mesh.FeatureChain`, or any iterable of
                 :class:`~build123d.mesh.FeatureChain`. Chains must originate
                 from this mesh's own chain graph.
-            size (float): chamfer leg length (> 0).
-            on_infeasible (str): A3a only supports ``"raise"`` (the default).
-                Other modes (``"skip"``) land in A4.
+            size: chamfer leg length — a scalar ``float`` (> 0) or a callable
+                ``(chain, vertex_index) -> float`` returning a positive size at
+                every chain vertex.
+            on_infeasible (str): ``"raise"`` (default — P3 contract) or
+                ``"skip"`` (A4). ``"clamp"`` is not shipped — design §5.4.
 
         Returns:
-            MeshPart: the chamfered mesh body.
+            MeshPart: the chamfered mesh body. When ``on_infeasible="skip"``
+            dropped any chain/corner, the returned mesh's
+            :attr:`last_fillet_report` carries the structured drop list.
 
         Raises:
-            ValueError: if ``size <= 0`` or this MeshPart is empty.
-            MeshFilletInfeasible: if any feasibility constraint fails — see
-                :class:`~build123d.mesh.MeshFilletInfeasible`.
+            ValueError: if ``size <= 0`` (scalar), this MeshPart is empty, or
+                ``on_infeasible`` is not one of ``"raise"`` / ``"skip"``.
+            MeshFilletInfeasible: if any feasibility constraint fails and
+                ``on_infeasible="raise"``.
             TypeError: if ``edges`` is none of the accepted shapes.
         """
         # pylint: disable=import-outside-toplevel
         from .fillet import mesh_chamfer
 
         return mesh_chamfer(
-            self, edges, size, on_infeasible=on_infeasible  # type: ignore[arg-type]
+            self,
+            edges,  # type: ignore[arg-type]
+            size,  # type: ignore[arg-type]
+            on_infeasible=on_infeasible,  # type: ignore[arg-type]
         )
 
     def fillet(
         self,
         edges: object,
-        radius: float,
+        radius: object,
         *,
         segments: int = 8,
         on_infeasible: str = "raise",
     ) -> "MeshPart":
-        """Apply a faceted fillet of ``radius`` to ``edges`` (Phase A3b).
+        """Apply a faceted fillet to ``edges``.
 
         Method form of :func:`build123d.mesh.mesh_fillet`. The selection
         argument follows design §8.1: a :class:`FeatureChainSelection` (from
         :meth:`feature_edges`), a single :class:`FeatureChain`, or any iterable
         of :class:`FeatureChain`.
 
-        A3b's profile is a ``segments``-faceted quarter-disc tangent to both
-        adjacent faces at distance ``radius`` from the edge (the rolling-ball
-        cross-section). The construction is one **swept tool per chain**
-        (design §3) using the same per-vertex frame + ``hull_points`` loft
-        substrate as A3a's chamfer. Convex chains have their tool subtracted
-        (round the edge); concave chains have it unioned (fill the channel).
-        Mixed convex/concave chains are split at the sign flip into single-sign
-        sub-runs (design §3.4 / §8.3); each sub-run becomes its own swept tool
-        and is added to the appropriate cut or add batch.
+        ``radius`` may be a scalar ``float`` (uniform rolling-ball radius along
+        every selected chain) or, per A4's variable-radius extension, a
+        callable ``(chain, vertex_index) -> float`` evaluated at every chain
+        vertex — the per-vertex frame's profile then carries that vertex's
+        radius and the ribbon loft interpolates between adjacent rings (design
+        §2.4 deferred this to A4). For a scalar input the result is bit-identical
+        to A3b's scalar path (regression-tested).
 
-        Over-size requests **raise** :class:`~build123d.mesh.MeshFilletInfeasible`
-        (P3 — never silently clamp). Multi-chain corner blends (setback +
-        spherical patch) land in A3c; for A3b, corners are handled by the
-        chain tool's endpoint overshoot (the result is valid but the corner is
-        a thin patch rather than a real ball corner).
+        The cross-section is a ``segments``-faceted quarter-disc tangent to
+        both adjacent faces; the construction is one **swept tool per chain**
+        (design §3) using the same per-vertex frame + ribbon-loft substrate as
+        A3a/A3b. Convex chains have their tool subtracted (round the edge);
+        concave chains have it unioned (fill the channel). Mixed convex/concave
+        chains are split at the sign flip into single-sign sub-runs (design
+        §3.4 / §8.3); A3c's setback + spherical-patch corner blend rounds
+        every multi-chain corner.
+
+        Over-size requests, mixed corners, and ``k > 6`` corners **raise**
+        :class:`~build123d.mesh.MeshFilletInfeasible` by default (P3 — never
+        silently clamp). Pass ``on_infeasible="skip"`` (design §8.2 / A4) to
+        drop the offending chain or corner from the operation; the dropped
+        items are reported on :attr:`last_fillet_report`.
 
         Args:
             edges: chains to fillet — a
@@ -914,19 +954,24 @@ class MeshPart:
                 :class:`~build123d.mesh.FeatureChain`, or any iterable of
                 :class:`~build123d.mesh.FeatureChain`. Chains must originate
                 from this mesh's own chain graph.
-            radius (float): rolling-ball radius (> 0).
+            radius: rolling-ball radius — a scalar ``float`` (> 0) or a
+                callable ``(chain, vertex_index) -> float`` returning a
+                positive radius at every chain vertex.
             segments (int): arc facet count for the cross-section (default 8).
-            on_infeasible (str): A3b only supports ``"raise"`` (the default).
-                Other modes (``"skip"``) land in A4.
+            on_infeasible (str): ``"raise"`` (default — P3 contract) or
+                ``"skip"`` (A4). ``"clamp"`` is not shipped — design §5.4.
 
         Returns:
-            MeshPart: the filleted mesh body.
+            MeshPart: the filleted mesh body. When ``on_infeasible="skip"``
+            dropped any chain/corner, the returned mesh's
+            :attr:`last_fillet_report` carries the structured drop list.
 
         Raises:
-            ValueError: if ``radius <= 0``, ``segments < 1``, or this MeshPart
-                is empty.
-            MeshFilletInfeasible: if any feasibility constraint fails — see
-                :class:`~build123d.mesh.MeshFilletInfeasible`.
+            ValueError: if ``radius <= 0`` (scalar), ``segments < 1``, this
+                MeshPart is empty, or ``on_infeasible`` is not one of
+                ``"raise"`` / ``"skip"``.
+            MeshFilletInfeasible: if any feasibility constraint fails and
+                ``on_infeasible="raise"``.
             TypeError: if ``edges`` is none of the accepted shapes.
         """
         # pylint: disable=import-outside-toplevel
@@ -935,7 +980,7 @@ class MeshPart:
         return mesh_fillet(
             self,
             edges,  # type: ignore[arg-type]
-            radius,
+            radius,  # type: ignore[arg-type]
             segments=segments,
             on_infeasible=on_infeasible,  # type: ignore[arg-type]
         )

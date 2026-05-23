@@ -5,11 +5,11 @@ name: fillet.py
 
 desc:
 
-Selective chamfer (Phase A3a) and selective fillet (Phase A3b) for
-:class:`~build123d.mesh.MeshPart` — the per-chain swept-tool implementation
-specified in the mesh-fillet engineering design (§3, §5). Multi-chain corner
-blends (A3c) are not yet shipped; A3a/A3b establish the substrate they will
-share.
+Selective chamfer / fillet for :class:`~build123d.mesh.MeshPart` — the
+per-chain swept-tool implementation specified in the mesh-fillet engineering
+design (§3, §5). Phases A3a/A3b/A3c established the substrate, single-chain
+arc tool, and the setback + vertex-patch corner blend; A4 (this revision)
+adds variable radius along a chain and ``on_infeasible="skip"`` mode.
 
 A user names edges via a :class:`~build123d.mesh.FeatureChainSelection`; this
 module turns each selected chain into one swept boolean tool, applies all
@@ -22,26 +22,48 @@ segment. p10's per-segment tools overlapped heavily on curved feature loops
 construction shares its boundary cross-section between successive
 ``hull_points`` lofts, removing the overlap by construction.
 
-A3b's fillet uses the same swept substrate but with an arc cross-section: a
-faceted quarter-disc tangent to both adjacent faces at distance ``radius``
-from the edge. Mixed convex/concave chains are handled by **per-edge sign
-splitting** (design §3.4 / §8.3): the chain is broken at every sign flip
-into single-sign sub-runs, each built as its own swept tool and added to the
-appropriate cut / add batch. This deprecates A3a's chamfer
+The fillet uses the same swept substrate as the chamfer but with an arc
+cross-section: a faceted quarter-disc tangent to both adjacent faces at
+distance ``radius`` from the edge. Mixed convex/concave chains are handled
+by **per-edge sign splitting** (design §3.4 / §8.3): the chain is broken at
+every sign flip into single-sign sub-runs, each built as its own swept tool
+and added to the appropriate cut / add batch. This deprecates A3a's chamfer
 ``"mixed-convexity"`` infeasibility for fillets — chamfer keeps the old check
 because its profile geometry has no equivalent per-vertex framing for mixed
 chains.
 
-Three feasibility checks (design §5.1) pre-flight every chain; failing any
-raises :exc:`MeshFilletInfeasible` with a clear message — A3a/A3b never clamp
-(P3: ``"raise"`` is the default; ``"skip"`` lands in A4).
+**A4 — variable radius along a chain.** ``radius`` / ``size`` now accept
+either a scalar ``float`` (uniform — the A3 behaviour, bit-identical) **or**
+a callable ``(chain, vertex_index) -> float`` evaluated at every chain
+vertex. The per-vertex profile is generated at that vertex's local radius;
+the ribbon-mesh loft (:func:`_ribbon_mesh_from_rings`) naturally interpolates
+between adjacent rings of different sizes. The feasibility pre-flight is
+evaluated per vertex using each vertex's local radius (the worst case is
+also the strictest case, since the half-thickness threshold scales with the
+size). Sequences ``Sequence[float]`` indexed per chain are *not* a separate
+shape — the simpler callable form covers every case the design's §2.4
+mentions, and forces the caller to write a one-liner that names *what is
+varying* explicitly.
+
+**A4 — ``on_infeasible="skip"``.** Default stays ``"raise"`` (P3 — never
+silently mis-answer). ``"skip"`` drops the offending chain (per
+:class:`MeshFilletInfeasible`) or corner from the operation and continues;
+the dropped items are recorded on a :class:`FilletReport` attached to the
+returned :class:`~build123d.mesh.MeshPart` (``mp.last_fillet_report``,
+design §8.2). A skip is also logged at WARNING level — never silent in P3's
+sense. ``"clamp"`` is **not** shipped (design §5.4 forbids it in A3 / A4).
+
+Feasibility checks (design §5.1) pre-flight every chain; failing any
+raises :exc:`MeshFilletInfeasible` (default) or appends a
+:class:`SkippedItem` to the :class:`FilletReport` (skip mode).
 
 A3a/A3b handle single chains whose endpoints are multi-chain corner vertices
 natively — design §9 notes the corner-fragility vanishes for chamfer because
 chamfer corners are planar half-space intersections; for fillet the per-chain
 swept arc-tool similarly intersects cleanly at corners up to the small-corner
-patch quality limit. The "real" multi-chain corner blend (setback + spherical
-patch) is A3c work.
+patch quality limit. A3c's "real" multi-chain corner blend (setback +
+spherical patch) is integrated through :func:`build_corner_fillet_patch` /
+:func:`build_corner_chamfer_patch`.
 
 license:
 
@@ -63,8 +85,18 @@ license:
 
 from __future__ import annotations
 
+import logging
 from collections import defaultdict
-from typing import TYPE_CHECKING, Iterable, Literal, Optional, Sequence, Union
+from dataclasses import dataclass, field
+from typing import (
+    TYPE_CHECKING,
+    Callable,
+    Iterable,
+    Literal,
+    Optional,
+    Sequence,
+    Union,
+)
 
 import numpy as np
 
@@ -107,6 +139,9 @@ _DEFAULT_FILLET_SEGMENTS = 8
 # Per-edge convexity sign threshold (an edge counts as flat below this and is
 # elided when splitting a mixed chain into sub-runs).
 _SIGN_TOL = 1e-6
+
+# Skip-mode WARNING logger (design §8.2 — a skip is never completely silent).
+_LOG = logging.getLogger("build123d.mesh.fillet")
 
 
 # ---------------------------------------------------------------------------
@@ -162,6 +197,199 @@ class MeshFilletInfeasible(ValueError):
         self.constraint: str = constraint
         self.requested: float = float(requested)
         self.measured: float = float(measured)
+
+
+# ---------------------------------------------------------------------------
+# A4 — variable radius + skip-mode reporting
+# ---------------------------------------------------------------------------
+
+
+#: A per-vertex radius/size callable. ``chain`` is the parent
+#: :class:`FeatureChain` and ``vertex_index`` is the position into
+#: ``chain.verts`` (NOT the host-mesh vertex index — the caller usually wants a
+#: parameter along the chain, which is what the positional index is). The
+#: callable must return a strictly positive float at every vertex of every
+#: selected chain. Returning ``0`` or a negative value raises
+#: :class:`ValueError` from the dispatcher.
+RadiusFunc = Callable[["FeatureChain", int], float]
+
+
+@dataclass
+class SkippedItem:
+    """One chain or corner dropped by ``on_infeasible="skip"``.
+
+    Records the reason every dropped item was infeasible so the user can react
+    programmatically (e.g. log the drop, adjust the radius and re-run on the
+    skipped subset, or raise to a caller). Carries the same structured payload
+    as a :class:`MeshFilletInfeasible` would have.
+
+    Attributes:
+        chains (list[FeatureChain]): the chains that were dropped — either a
+            single chain (chain-level failure: half-thickness, chain-length,
+            mixed-convexity) or every chain incident to a dropped corner
+            (corner-level failure: mixed-corner, k>6-corner).
+        constraint (str): one of ``"half-thickness"``, ``"chain-length"``,
+            ``"mixed-convexity"``, ``"mixed-corner"``, ``"k>6-corner"``, or
+            ``"degenerate-tool"`` (the tool builder returned ``None``).
+        requested (float): the requested radius / size (at the failing vertex
+            for variable-radius inputs, the input scalar otherwise).
+        measured (float): the measured feature size (0.0 when the constraint
+            has no numeric measurement — mixed-corner, mixed-convexity,
+            k>6-corner, degenerate-tool).
+        vertex (int | None): for a chain-level half-thickness failure under
+            variable radius, the offending host-mesh vertex index; ``None``
+            for constraints that do not pin a single vertex.
+        message (str): human-readable diagnostic.
+    """
+
+    chains: list[FeatureChain]
+    constraint: str
+    requested: float
+    measured: float = 0.0
+    vertex: Optional[int] = None
+    message: str = ""
+
+
+@dataclass
+class FilletReport:
+    """The skip-mode return shape — every chain / corner dropped from the op.
+
+    Attached to the returned :class:`~build123d.mesh.MeshPart` as
+    :attr:`~build123d.mesh.MeshPart.last_fillet_report` whenever
+    ``on_infeasible="skip"`` drops at least one item (design §8.2 / A4). The
+    method form is the only return surface — the free-function variants
+    (:func:`mesh_fillet` / :func:`mesh_chamfer`) also return a single
+    :class:`~build123d.mesh.MeshPart` and attach the report there, to keep
+    the two API surfaces interchangeable and the type stable.
+
+    Attributes:
+        operation (str): ``"fillet"`` or ``"chamfer"`` — which op produced the
+            report.
+        requested (float | None): the input scalar (``None`` when ``radius``
+            / ``size`` was a callable — each :class:`SkippedItem` then names
+            its own per-vertex measurement).
+        skipped_chains (list[SkippedItem]): every chain dropped at the
+            chain-level pre-flight.
+        skipped_corners (list[SkippedItem]): every corner dropped at the
+            corner-level pre-flight (mixed-corner, k>6-corner).
+
+    The report is *empty-equivalent* (boolean ``False``) iff nothing was
+    dropped; the method/free function then attaches ``None`` (not an empty
+    report) so callers can compare to ``None`` without inspecting the lists.
+    """
+
+    operation: str
+    requested: Optional[float] = None
+    skipped_chains: list[SkippedItem] = field(default_factory=list)
+    skipped_corners: list[SkippedItem] = field(default_factory=list)
+
+    def __bool__(self) -> bool:
+        """True if anything was dropped — empty report is falsy."""
+        return bool(self.skipped_chains) or bool(self.skipped_corners)
+
+    @property
+    def total_skipped(self) -> int:
+        """The total count of dropped chains + dropped corners."""
+        return len(self.skipped_chains) + len(self.skipped_corners)
+
+
+# A user-facing input shape: scalar float or per-vertex callable. ``int`` is
+# accepted (and immediately float-coerced) so ``radius=2`` works as expected.
+RadiusInput = Union[float, int, RadiusFunc]
+
+
+def _normalise_radius(
+    value: RadiusInput,
+    operation: str,
+) -> tuple[Optional[float], RadiusFunc]:
+    """Resolve a ``radius``/``size`` input into ``(scalar_or_none, per_vertex_fn)``.
+
+    For a scalar input the returned ``scalar`` carries the float and the
+    per-vertex function is a constant. For a callable input ``scalar`` is
+    ``None`` (no single representative value) and the callable is wrapped to
+    coerce its return to ``float`` and to validate positivity per call site.
+
+    This keeps the call sites simple: every per-vertex profile query goes
+    through the ``per_vertex_fn``, so the scalar path is a no-op specialisation
+    of the variable path.
+
+    Args:
+        value: the ``radius`` / ``size`` argument from the public API.
+        operation: ``"fillet"`` or ``"chamfer"`` — used only in the error
+            message.
+
+    Returns:
+        tuple[float | None, RadiusFunc]: ``(scalar, per_vertex_fn)``. ``scalar``
+        is the float input itself, or ``None`` when the input is a callable.
+
+    Raises:
+        ValueError: scalar input is ``<= 0``.
+        TypeError: input is neither a scalar number nor a callable.
+    """
+    if callable(value):
+        fn = value
+
+        def _per_vertex(chain: "FeatureChain", index: int) -> float:
+            return float(fn(chain, index))
+
+        return None, _per_vertex
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        scalar = float(value)
+        if scalar <= 0.0:
+            raise ValueError(
+                f"{operation} {('radius' if operation == 'fillet' else 'size')} "
+                f"must be > 0, got {scalar!r}"
+            )
+        return scalar, lambda _chain, _index: scalar
+    raise TypeError(
+        f"{operation} {('radius' if operation == 'fillet' else 'size')} must "
+        f"be a positive number or a callable (chain, vertex_index) -> float; "
+        f"got {type(value)!r}"
+    )
+
+
+def _chain_radius_samples(
+    chain: "FeatureChain",
+    per_vertex_fn: RadiusFunc,
+) -> np.ndarray:
+    """Sample ``per_vertex_fn`` at every vertex of ``chain``; validate positivity.
+
+    Args:
+        chain: the chain being processed.
+        per_vertex_fn: the resolved per-vertex callable from
+            :func:`_normalise_radius`.
+
+    Returns:
+        np.ndarray: ``(len(chain.verts),)`` array of positive floats.
+
+    Raises:
+        ValueError: any sample is ``<= 0`` (the variable-radius callable
+            returned a non-positive size at some vertex — refuse loudly, P3).
+    """
+    n_verts = len(chain.verts)
+    samples = np.empty(n_verts, dtype=np.float64)
+    for index in range(n_verts):
+        value = float(per_vertex_fn(chain, index))
+        if value <= 0.0:
+            raise ValueError(
+                f"per-vertex radius/size returned non-positive value "
+                f"{value!r} at chain pair {chain.pair} vertex index {index} "
+                f"(host vertex {chain.verts[index]}). Every vertex must "
+                f"receive a strictly positive size."
+            )
+        samples[index] = value
+    return samples
+
+
+def _chain_max_size(samples: np.ndarray) -> float:
+    """Return the maximum per-vertex size on a chain.
+
+    Used wherever the existing scalar-radius code reasoned about overshoot /
+    feasibility distance — the conservative choice is the chain's *largest*
+    radius (the strictest feasibility threshold and the longest overshoot the
+    swept tool needs).
+    """
+    return float(samples.max()) if samples.size else 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -312,7 +540,8 @@ def _vertex_frames(
 def _chamfer_segment_hull(
     frame_i: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray],
     frame_j: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray],
-    size: float,
+    size_i: float,
+    size_j: Optional[float] = None,
 ) -> Optional[m3d.Manifold]:
     """Build one ``batch_hull`` loft between two consecutive vertex frames.
 
@@ -325,7 +554,11 @@ def _chamfer_segment_hull(
     Args:
         frame_i (tuple): ``(origin, tangent, u_axis, w_axis)`` at vertex i.
         frame_j (tuple): ``(origin, tangent, u_axis, w_axis)`` at vertex i+1.
-        size (float): chamfer leg length.
+        size_i (float): chamfer leg length at vertex i.
+        size_j (float | None): chamfer leg length at vertex i+1. ``None``
+            means "same as ``size_i``" — the scalar / A3 path. Passing a
+            distinct ``size_j`` lofts between two different cross-section
+            sizes (A4 variable size).
 
     Returns:
         manifold3d.Manifold | None: the loft segment, or ``None`` if
@@ -334,14 +567,15 @@ def _chamfer_segment_hull(
     """
     o_i, _t_i, u_i, w_i = frame_i
     o_j, _t_j, u_j, w_j = frame_j
+    s_j = size_i if size_j is None else size_j
     points = np.vstack(
         [
             o_i,
-            o_i + u_i * size,
-            o_i + w_i * size,
+            o_i + u_i * size_i,
+            o_i + w_i * size_i,
             o_j,
-            o_j + u_j * size,
-            o_j + w_j * size,
+            o_j + u_j * s_j,
+            o_j + w_j * s_j,
         ]
     )
     hull = m3d.Manifold.hull_points(points.tolist())
@@ -356,7 +590,7 @@ def _build_chain_chamfer_tool(
     triangles: np.ndarray,
     face_id: np.ndarray,
     tri_normals: np.ndarray,
-    size: float,
+    sizes: np.ndarray,
     endpoint_overshoots: Optional[tuple[float, float]] = None,
 ) -> Optional[m3d.Manifold]:
     """Build the swept chamfer tool for one chain (a single manifold body).
@@ -372,13 +606,20 @@ def _build_chain_chamfer_tool(
     ring" some distance from the corner vertex, where the vertex patch
     (sphere / polyhedron) picks up.
 
+    A4: ``sizes`` is a per-vertex ``(len(chain.verts),)`` array of chamfer
+    leg lengths. A scalar input is broadcast to a constant array by the
+    dispatcher; a variable input passes its per-vertex samples through. Each
+    consecutive-pair hull is lofted between two different cross-section
+    sizes ``(sizes[i], sizes[i+1])``.
+
     Args:
         chain (FeatureChain): the chain (already classified — non-flat).
         vertices (np.ndarray): host mesh ``(N, 3)`` vertex array.
         triangles (np.ndarray): host mesh ``(M, 3)`` triangle vertex indices.
         face_id (np.ndarray): host mesh ``(M,)`` seeded face id per triangle.
         tri_normals (np.ndarray): host mesh ``(M, 3)`` per-triangle normals.
-        size (float): chamfer leg length.
+        sizes (np.ndarray): per-vertex chamfer leg length, length
+            ``len(chain.verts)``, every entry > 0.
         endpoint_overshoots (tuple[float, float] | None): per-endpoint
             overshoot for an open chain. A *negative* value setbacks the
             frame *into* the chain by that magnitude (the A3c corner setback
@@ -392,7 +633,7 @@ def _build_chain_chamfer_tool(
     n_a_per_vertex, n_b_per_vertex = _per_vertex_face_normals(
         chain, triangles, face_id, tri_normals
     )
-    open_overshoot = max(_OPEN_OVERSHOOT * size, _MIN_PRISM_THICKNESS)
+    open_overshoot = max(_OPEN_OVERSHOOT * _chain_max_size(sizes), _MIN_PRISM_THICKNESS)
     frames = _vertex_frames(
         chain,
         vertices,
@@ -407,7 +648,12 @@ def _build_chain_chamfer_tool(
     last = n_frames if is_loop else n_frames - 1
     for index in range(last):
         next_index = (index + 1) % n_frames
-        segment = _chamfer_segment_hull(frames[index], frames[next_index], size)
+        segment = _chamfer_segment_hull(
+            frames[index],
+            frames[next_index],
+            float(sizes[index]),
+            float(sizes[next_index]),
+        )
         if segment is not None:
             segments.append(segment)
     if not segments:
@@ -427,13 +673,14 @@ def _half_thickness_feasibility(
     vertices: np.ndarray,
     n_a_per_vertex: list[np.ndarray],
     n_b_per_vertex: list[np.ndarray],
-    size: float,
-) -> Optional[float]:
-    """Constraint A — half-thickness rule.
+    sizes: np.ndarray,
+) -> Optional[tuple[int, float, float]]:
+    """Constraint A — half-thickness rule (per-vertex, A4-compatible).
 
     At every chain vertex ``v`` the *opposing-face distance* must be greater
-    than ``2 · size``; otherwise the swept tool would slice through the body
-    (design §5.1).
+    than ``2 · sizes[i]``; otherwise the swept tool would slice through the
+    body (design §5.1). For A4 every vertex is checked against *its own*
+    requested size — the strictest threshold wins.
 
     We use a simpler / robust proxy than the design's full ``min_gap`` query:
     the *minimum host-vertex distance along the inward bisector*. For each
@@ -447,17 +694,19 @@ def _half_thickness_feasibility(
         vertices (np.ndarray): host mesh vertices.
         n_a_per_vertex (list[np.ndarray]): per-vertex face-A normal.
         n_b_per_vertex (list[np.ndarray]): per-vertex face-B normal.
-        size (float): the requested chamfer leg length.
+        sizes (np.ndarray): per-vertex requested chamfer leg / fillet radius.
 
     Returns:
-        float | None: the offending measured distance if the constraint fails,
-        otherwise ``None``.
+        tuple[int, float, float] | None: ``(host_vertex_index, requested_size,
+        measured_thickness)`` for the first failing vertex, or ``None`` if
+        every vertex passes.
     """
     bbox_min, bbox_max = vertices.min(axis=0), vertices.max(axis=0)
     bbox_diag = float(np.linalg.norm(bbox_max - bbox_min))
-    threshold = 2.0 * size
 
     for index, v_index in enumerate(chain.verts):
+        size_i = float(sizes[index])
+        threshold = 2.0 * size_i
         p_i = vertices[v_index]
         inward = _unit(-(n_a_per_vertex[index] + n_b_per_vertex[index]))
         if float(np.linalg.norm(inward)) < 1e-9:
@@ -471,15 +720,17 @@ def _half_thickness_feasibility(
         ahead = (depths > 1e-6) & (depths < bbox_diag * 2.0)
         if not ahead.any():
             continue
-        # Reject points far off-axis (we want roughly axial hits)
+        # Reject points far off-axis (we want roughly axial hits). The radial
+        # tolerance scales with the per-vertex size (the swept tool's lateral
+        # footprint is ``size`` at this vertex).
         axial = offsets - depths[:, None] * inward
         radial = np.linalg.norm(axial, axis=1)
-        on_axis = ahead & (radial < size * 1.5 + 1e-3)
+        on_axis = ahead & (radial < size_i * 1.5 + 1e-3)
         if not on_axis.any():
             continue
         nearest_depth = float(depths[on_axis].min())
         if nearest_depth < threshold:
-            return nearest_depth
+            return int(v_index), size_i, nearest_depth
     return None
 
 
@@ -488,54 +739,57 @@ def _check_feasibility(
     vertices: np.ndarray,
     n_a_per_vertex: list[np.ndarray],
     n_b_per_vertex: list[np.ndarray],
-    size: float,
+    sizes: np.ndarray,
 ) -> None:
     """Run per-chain feasibility checks, raise :exc:`MeshFilletInfeasible` on failure.
 
-    Two checks (design §5.1): half-thickness and chain-length. The
-    cross-chain corner-sharing case is *not* checked here — A3a chamfer
-    handles a single chain whose endpoints sit on a multi-chain corner
-    natively (design §9: planar wedges bevel into a corner bit-exactly).
+    Two checks (design §5.1): half-thickness (per-vertex under A4) and
+    chain-length (against the maximum per-vertex size — the strictest
+    threshold). The cross-chain corner-sharing case is *not* checked here —
+    chamfer handles a single chain whose endpoints sit on a multi-chain
+    corner natively (design §9: planar wedges bevel into a corner bit-exactly).
 
     Args:
         chain (FeatureChain): the chain to test.
         vertices (np.ndarray): host mesh vertices.
         n_a_per_vertex (list[np.ndarray]): per-vertex face-A normal.
         n_b_per_vertex (list[np.ndarray]): per-vertex face-B normal.
-        size (float): the requested chamfer leg length.
+        sizes (np.ndarray): per-vertex requested chamfer leg / fillet radius.
 
     Raises:
         MeshFilletInfeasible: with ``constraint`` set to the failing check.
     """
-    # Constraint A — half-thickness
-    measured = _half_thickness_feasibility(
-        chain, vertices, n_a_per_vertex, n_b_per_vertex, size
+    # Constraint A — half-thickness, per vertex (A4)
+    failure = _half_thickness_feasibility(
+        chain, vertices, n_a_per_vertex, n_b_per_vertex, sizes
     )
-    if measured is not None:
+    if failure is not None:
+        v_idx, requested, measured = failure
         raise MeshFilletInfeasible(
-            f"chamfer size {size:g} exceeds half the local feature thickness "
-            f"{measured:g} on chain pair {chain.pair}; the swept tool would "
-            "slice through the body. Reduce the size or exclude the offending "
-            "chain from the selection.",
+            f"size {requested:g} exceeds half the local feature thickness "
+            f"{measured:g} on chain pair {chain.pair} at host vertex {v_idx}; "
+            "the swept tool would slice through the body. Reduce the size or "
+            "exclude the offending chain from the selection.",
             chains=[chain],
             constraint="half-thickness",
-            requested=size,
+            requested=requested,
             measured=measured,
         )
 
-    # Constraint B — chain length
+    # Constraint B — chain length (against the strictest per-vertex size).
     chain_length = 0.0
     for edge in chain.edges:
         chain_length += float(np.linalg.norm(vertices[edge.v1] - vertices[edge.v0]))
-    if not chain.is_loop and chain_length < 2.0 * size + 1e-9:
+    max_size = _chain_max_size(sizes)
+    if not chain.is_loop and chain_length < 2.0 * max_size + 1e-9:
         raise MeshFilletInfeasible(
-            f"chamfer size {size:g} exceeds half the chain arc length "
+            f"size {max_size:g} exceeds half the chain arc length "
             f"{chain_length:g} on chain pair {chain.pair}; the swept tool's "
             "cross-section frame would fold. Reduce the size or pick a longer "
             "chain.",
             chains=[chain],
             constraint="chain-length",
-            requested=size,
+            requested=max_size,
             measured=chain_length,
         )
 
@@ -543,6 +797,49 @@ def _check_feasibility(
 # ---------------------------------------------------------------------------
 # corner pre-flight (Phase A3c — design §4.5 / §4.6)
 # ---------------------------------------------------------------------------
+
+
+def _classify_corner_problem(
+    corner: Corner, size: float
+) -> Optional[tuple[str, str, list[FeatureChain]]]:
+    """Return ``(constraint, message, chains)`` if ``corner`` cannot be blended.
+
+    Pure classification — no raise. Used by both the raise- and skip-mode
+    dispatchers; the raise-mode wrapper :func:`_check_corner_feasibility`
+    promotes any returned tuple into a :class:`MeshFilletInfeasible`.
+
+    Args:
+        corner: the corner to classify.
+        size: the requested fillet radius / chamfer size (only embedded in
+            the diagnostic message — the failure mode itself is geometric).
+
+    Returns:
+        tuple[str, str, list[FeatureChain]] | None: ``(constraint_tag,
+        human_message, incident_chains)`` or ``None`` if the corner is fine.
+    """
+    if corner.kind == "mixed":
+        chains = [ep.chain for ep in corner.chain_endpoints]
+        return (
+            "mixed-corner",
+            f"corner at vertex {corner.vertex} has both convex and concave "
+            "chains incident; mesh-fillet's setback + vertex-patch construction "
+            "(design §4.5) requires a uniform-sign corner. Fillet the convex "
+            "and concave chains in separate calls so each call's corners are "
+            "consistent.",
+            chains,
+        )
+    if corner.kind == "degenerate":
+        chains = [ep.chain for ep in corner.chain_endpoints]
+        return (
+            "k>6-corner",
+            f"corner at vertex {corner.vertex} has {corner.k} incident chains "
+            f"(> {MAX_CORNER_CHAINS}); mesh-fillet supports up to "
+            f"{MAX_CORNER_CHAINS}-edge corners (design §4.6). Reduce the "
+            "corner's edge count or split the selection.",
+            chains,
+        )
+    _ = size  # size carried by callers — only used for the report payload
+    return None
 
 
 def _check_corner_feasibility(
@@ -569,29 +866,61 @@ def _check_corner_feasibility(
             the offending corner.
     """
     for corner in corners.values():
-        if corner.kind == "mixed":
-            chains = [ep.chain for ep in corner.chain_endpoints]
-            raise MeshFilletInfeasible(
-                f"corner at vertex {corner.vertex} has both convex and concave "
-                "chains incident; mesh-fillet's setback + vertex-patch construction "
-                "(design §4.5) requires a uniform-sign corner. Fillet the convex "
-                "and concave chains in separate calls so each call's corners are "
-                "consistent.",
-                chains=chains,
-                constraint="mixed-corner",
+        problem = _classify_corner_problem(corner, size)
+        if problem is None:
+            continue
+        constraint, message, chains = problem
+        raise MeshFilletInfeasible(
+            message,
+            chains=chains,
+            constraint=constraint,
+            requested=size,
+        )
+
+
+def _filter_corners_for_skip(
+    corners: dict[int, Corner],
+    size: float,
+    report: "FilletReport",
+) -> dict[int, Corner]:
+    """Skip-mode counterpart of :func:`_check_corner_feasibility`.
+
+    Walks every corner; for the bad ones, appends a :class:`SkippedItem` to
+    ``report.skipped_corners`` and drops the corner from the returned dict.
+    The remaining corners are safe to feed into the patch builders.
+
+    Args:
+        corners: input corner records by vertex index.
+        size: requested fillet radius / chamfer size (used as the
+            ``SkippedItem.requested`` payload).
+        report: the report to append to (mutated in place).
+
+    Returns:
+        dict[int, Corner]: only the corners that passed classification.
+    """
+    keep: dict[int, Corner] = {}
+    for vertex_index, corner in corners.items():
+        problem = _classify_corner_problem(corner, size)
+        if problem is None:
+            keep[vertex_index] = corner
+            continue
+        constraint, message, chains = problem
+        report.skipped_corners.append(
+            SkippedItem(
+                chains=list(chains),
+                constraint=constraint,
                 requested=size,
+                measured=0.0,
+                vertex=int(vertex_index),
+                message=message,
             )
-        if corner.kind == "degenerate":
-            chains = [ep.chain for ep in corner.chain_endpoints]
-            raise MeshFilletInfeasible(
-                f"corner at vertex {corner.vertex} has {corner.k} incident chains "
-                f"(> {MAX_CORNER_CHAINS}); mesh-fillet supports up to "
-                f"{MAX_CORNER_CHAINS}-edge corners (design §4.6). Reduce the "
-                "corner's edge count or split the selection.",
-                chains=chains,
-                constraint="k>6-corner",
-                requested=size,
-            )
+        )
+        _LOG.warning(
+            "mesh-fillet skip: corner at vertex %d (constraint=%s)",
+            int(vertex_index),
+            constraint,
+        )
+    return keep
 
 
 # ---------------------------------------------------------------------------
@@ -660,17 +989,26 @@ def _selection_chains(
 def mesh_chamfer(
     meshpart: "MeshPart",
     edges: SelectionInput,
-    size: float,
+    size: RadiusInput,
     *,
-    on_infeasible: Literal["raise"] = "raise",
+    on_infeasible: Literal["raise", "skip"] = "raise",
 ) -> "MeshPart":
-    """Apply a faceted chamfer of ``size`` to ``edges`` (Phase A3a).
+    """Apply a faceted chamfer to ``edges``.
 
     Free-function counterpart of :meth:`MeshPart.chamfer`. Implements the
     per-chain swept-tool construction from the mesh-fillet engineering design
-    (§3 — A3a profile is a flat triangular wedge, the chamfer leg length is
+    (§3 — the profile is a flat triangular wedge, the chamfer leg length is
     ``size``). The pre-flight (§5) raises :exc:`MeshFilletInfeasible` on
-    over-size requests or multi-chain corners; A3a never clamps.
+    over-size requests, mixed corners, or k>6 corners by default;
+    ``on_infeasible="skip"`` drops the offending item and continues.
+
+    A4: ``size`` may be a scalar ``float`` (uniform — bit-identical to the
+    A3a path) **or** a callable ``(chain, vertex_index) -> float`` evaluated
+    at every chain vertex. Per-vertex sizes are validated positive; the
+    feasibility pre-flight evaluates the half-thickness rule with each
+    vertex's local size and refuses the chain if any vertex fails. The
+    ribbon-mesh loft naturally interpolates between adjacent rings of
+    different sizes.
 
     Args:
         meshpart (MeshPart): the mesh body to chamfer.
@@ -678,35 +1016,61 @@ def mesh_chamfer(
             :class:`FeatureChainSelection`, a single :class:`FeatureChain`, or
             any iterable of :class:`FeatureChain`. Chains must belong to
             ``meshpart``'s own chain graph.
-        size (float): chamfer leg length (positive).
-        on_infeasible (Literal["raise"]): A3a only supports ``"raise"`` (the
-            ``"skip"`` and ``"clamp"`` modes ship in A4). Default ``"raise"``.
+        size: chamfer leg length — a positive ``float`` or a callable
+            ``(chain, vertex_index) -> float`` returning a positive size at
+            every chain vertex.
+        on_infeasible (Literal["raise", "skip"]): default ``"raise"`` —
+            never silently mis-answer (P3). ``"skip"`` drops the offending
+            chain/corner and continues; dropped items are attached to the
+            returned :class:`MeshPart`'s
+            :attr:`~build123d.mesh.MeshPart.last_fillet_report`.
 
     Returns:
-        MeshPart: the chamfered mesh body, carrying the merged side-map.
+        MeshPart: the chamfered mesh body, carrying the merged side-map. The
+        ``last_fillet_report`` attribute is set when ``on_infeasible="skip"``
+        dropped any chain/corner; ``None`` otherwise.
 
     Raises:
-        ValueError: if ``size`` is not strictly positive or ``meshpart`` is
-            empty.
-        MeshFilletInfeasible: if any feasibility constraint fails — see
-            :class:`MeshFilletInfeasible`.
-        TypeError: if ``edges`` is none of the accepted shapes.
+        ValueError: if ``size`` is not strictly positive (scalar) or returns
+            a non-positive value (callable), ``meshpart`` is empty, or
+            ``on_infeasible`` is not one of ``"raise"`` / ``"skip"``.
+        MeshFilletInfeasible: if any feasibility constraint fails and
+            ``on_infeasible="raise"``.
+        TypeError: if ``edges`` is none of the accepted shapes or ``size`` is
+            neither a number nor a callable.
     """
-    # pylint: disable=import-outside-toplevel
+    return _mesh_chamfer_or_fillet(
+        meshpart, edges, size, operation="chamfer", on_infeasible=on_infeasible
+    )
+
+
+def _mesh_chamfer_impl(
+    meshpart: "MeshPart",
+    edges: SelectionInput,
+    size: RadiusInput,
+    *,
+    on_infeasible: Literal["raise", "skip"],
+) -> "MeshPart":
+    """Internal chamfer driver (called by :func:`_mesh_chamfer_or_fillet`).
+
+    This is the body of :func:`mesh_chamfer` with the dispatch wrapper
+    stripped, so :func:`mesh_fillet` can share the same outer-shell
+    validation without recursing through itself.
+
+    Args:
+        meshpart: the mesh body to chamfer.
+        edges: the selection input.
+        size: scalar float or per-vertex callable.
+        on_infeasible: ``"raise"`` or ``"skip"``.
+
+    Returns:
+        MeshPart: the chamfered mesh body.
+    """
+    # pylint: disable=import-outside-toplevel,too-many-branches,too-many-locals
+    # pylint: disable=too-many-statements
     from .mesh_part import MeshPart
 
-    if not isinstance(meshpart, MeshPart):
-        raise TypeError(f"mesh_chamfer expects a MeshPart, got {type(meshpart)!r}")
-    if size <= 0.0:
-        raise ValueError(f"chamfer size must be > 0, got {size!r}")
-    if on_infeasible != "raise":
-        raise ValueError(
-            f"on_infeasible={on_infeasible!r} is not supported in A3a (only "
-            "'raise' ships in this phase; 'skip' lands in A4)."
-        )
-    if meshpart.manifold.is_empty():
-        raise ValueError("Cannot chamfer an empty MeshPart")
-
+    scalar, per_vertex_fn = _normalise_radius(size, "chamfer")
     selection = meshpart.feature_edges()
     chains = _selection_chains(edges, selection)
     if not chains:
@@ -717,56 +1081,121 @@ def mesh_chamfer(
     face_id = selection.face_id
     tri_normals = triangle_normals(vertices, triangles)
 
-    # Detect multi-chain corners (design §4) and pre-flight mixed / k>6 cases
-    # before building any tool. A3c upgrade: the chain swept tools get a
-    # per-endpoint setback at each corner and the corner gets a flat-polyhedron
-    # vertex patch (cut for convex, add for concave).
-    corners = detect_corners(chains, vertices, triangles, face_id, tri_normals)
-    _check_corner_feasibility(corners, size)
+    report = FilletReport(operation="chamfer", requested=scalar)
+    skipped_chain_ids: set[int] = set()
 
-    # Pre-flight every chain *before* building any tool — fail fast.
-    per_chain_normals: list[tuple[list[np.ndarray], list[np.ndarray]]] = []
+    # Detect multi-chain corners (design §4) and pre-flight mixed / k>6 cases
+    # before building any tool. The chain swept tools get a per-endpoint
+    # setback at each corner and the corner gets a flat-polyhedron vertex
+    # patch (cut for convex, add for concave).
+    corners = detect_corners(chains, vertices, triangles, face_id, tri_normals)
+    # A representative scalar for the corner-feasibility payload — the
+    # callable's max sample is the strictest constraint and the most useful
+    # number on the report.
+    representative_size = (
+        scalar if scalar is not None else _representative_size(chains, per_vertex_fn)
+    )
+    if on_infeasible == "raise":
+        _check_corner_feasibility(corners, representative_size)
+        active_corners = corners
+    else:
+        active_corners = _filter_corners_for_skip(corners, representative_size, report)
+
+    # Pre-flight every chain *before* building any tool — fail fast on raise,
+    # collect on skip.
+    per_chain_normals: dict[int, tuple[list[np.ndarray], list[np.ndarray]]] = {}
+    per_chain_sizes: dict[int, np.ndarray] = {}
     for chain in chains:
         if chain.convexity_class == "flat":
-            per_chain_normals.append(([], []))
             continue
         if chain.convexity_class == "mixed":
-            # A3a defers mixed-convexity chains — they need per-edge sign
-            # splitting that lands with the fillet profile work in A3b.
-            raise MeshFilletInfeasible(
+            msg = (
                 f"chain pair {chain.pair} is mixed convex/concave; chamfer "
                 "operates on chains with a single convexity sign. Split the "
-                "selection so each chain is uniformly convex or concave.",
-                chains=[chain],
-                constraint="mixed-convexity",
-                requested=size,
+                "selection so each chain is uniformly convex or concave."
             )
+            if on_infeasible == "raise":
+                raise MeshFilletInfeasible(
+                    msg,
+                    chains=[chain],
+                    constraint="mixed-convexity",
+                    requested=representative_size,
+                )
+            report.skipped_chains.append(
+                SkippedItem(
+                    chains=[chain],
+                    constraint="mixed-convexity",
+                    requested=representative_size,
+                    measured=0.0,
+                    vertex=None,
+                    message=msg,
+                )
+            )
+            _LOG.warning(
+                "mesh-chamfer skip: chain pair %s (constraint=mixed-convexity)",
+                chain.pair,
+            )
+            skipped_chain_ids.add(id(chain))
+            continue
+        # Per-vertex callable returning non-positive at any vertex always
+        # raises (it's a caller bug, never a geometry constraint — skip mode
+        # does NOT swallow these).
+        sizes = _chain_radius_samples(chain, per_vertex_fn)
         n_a_per_vertex, n_b_per_vertex = _per_vertex_face_normals(
             chain, triangles, face_id, tri_normals
         )
-        _check_feasibility(
-            chain,
-            vertices,
-            n_a_per_vertex,
-            n_b_per_vertex,
-            size,
-        )
-        per_chain_normals.append((n_a_per_vertex, n_b_per_vertex))
+        try:
+            _check_feasibility(
+                chain,
+                vertices,
+                n_a_per_vertex,
+                n_b_per_vertex,
+                sizes,
+            )
+        except MeshFilletInfeasible as exc:
+            if on_infeasible == "raise":
+                raise
+            report.skipped_chains.append(
+                SkippedItem(
+                    chains=list(exc.chains),
+                    constraint=exc.constraint,
+                    requested=exc.requested,
+                    measured=exc.measured,
+                    vertex=None,
+                    message=str(exc),
+                )
+            )
+            _LOG.warning(
+                "mesh-chamfer skip: chain pair %s (constraint=%s requested=%g "
+                "measured=%g)",
+                chain.pair,
+                exc.constraint,
+                exc.requested,
+                exc.measured,
+            )
+            skipped_chain_ids.add(id(chain))
+            continue
+        per_chain_normals[id(chain)] = (n_a_per_vertex, n_b_per_vertex)
+        per_chain_sizes[id(chain)] = sizes
 
     # Build per-chain tools; collect into cut (convex) and add (concave) batches.
     cut_tools: list[m3d.Manifold] = []
     add_tools: list[m3d.Manifold] = []
-    for chain, _normals in zip(chains, per_chain_normals):
+    for chain in chains:
         if chain.convexity_class == "flat":
             continue
-        # A3c corner setback: shorten the chain tool at any corner endpoint by
+        if id(chain) in skipped_chain_ids:
+            continue
+        sizes = per_chain_sizes[id(chain)]
+        chain_max = _chain_max_size(sizes)
+        # Corner setback: shorten the chain tool at any corner endpoint by
         # the corner's setback distance (a negative overshoot in the frame
         # helper's convention). Non-corner endpoints keep the standard
         # open-chain overshoot.
-        start_s, end_s = per_chain_setback(corners, chain, size, vertices)
+        start_s, end_s = per_chain_setback(active_corners, chain, chain_max, vertices)
         overshoots: Optional[tuple[float, float]] = None
         if (start_s > 0.0 or end_s > 0.0) and not chain.is_loop:
-            open_ov = max(_OPEN_OVERSHOOT * size, _MIN_PRISM_THICKNESS)
+            open_ov = max(_OPEN_OVERSHOOT * chain_max, _MIN_PRISM_THICKNESS)
             ov_start = -start_s if start_s > 0.0 else open_ov
             ov_end = -end_s if end_s > 0.0 else open_ov
             overshoots = (ov_start, ov_end)
@@ -776,10 +1205,29 @@ def mesh_chamfer(
             triangles,
             face_id,
             tri_normals,
-            size,
+            sizes,
             endpoint_overshoots=overshoots,
         )
         if tool is None:
+            if on_infeasible == "skip":
+                report.skipped_chains.append(
+                    SkippedItem(
+                        chains=[chain],
+                        constraint="degenerate-tool",
+                        requested=chain_max,
+                        measured=0.0,
+                        vertex=None,
+                        message=(
+                            f"swept chamfer tool returned no manifold for "
+                            f"chain pair {chain.pair} — likely geometrically "
+                            "degenerate input."
+                        ),
+                    )
+                )
+                _LOG.warning(
+                    "mesh-chamfer skip: chain pair %s (constraint=degenerate-tool)",
+                    chain.pair,
+                )
             continue
         if chain.convexity_class == "convex":
             cut_tools.append(tool)
@@ -789,11 +1237,22 @@ def mesh_chamfer(
     # Build per-corner chamfer patches (design §4.3 step 5) and merge into the
     # appropriate cut / add batches. A convex corner contributes a flat
     # polyhedron to the cut tool; a concave corner contributes one to the add
-    # tool. Mixed / degenerate corners were rejected by the pre-flight above.
-    for corner in corners.values():
+    # tool. Mixed / degenerate corners were rejected by the pre-flight above
+    # (raise) or filtered out (skip).
+    #
+    # Per-corner size: pick the strictest size across each corner's surviving
+    # incident chains. If every incident chain was skipped, drop the corner
+    # patch entirely — otherwise a freestanding pyramid would sit at the
+    # corner with no chain tubes terminating into it.
+    for corner in active_corners.values():
         if corner.kind not in ("convex", "concave"):
             continue
-        patch = build_corner_chamfer_patch(corner, size, vertices)
+        size_for_corner = _corner_size(
+            corner, per_chain_sizes, fallback=representative_size
+        )
+        if size_for_corner is None:
+            continue
+        patch = build_corner_chamfer_patch(corner, size_for_corner, vertices)
         if patch is None:
             continue
         if corner.kind == "convex":
@@ -824,7 +1283,134 @@ def mesh_chamfer(
         )
 
     result = _drop_zero_volume_artifacts(result)
-    return MeshPart(result, _carry_side_map(meshpart.side_map))
+    out = MeshPart(result, _carry_side_map(meshpart.side_map))
+    # pylint: disable=protected-access
+    out._last_fillet_report = report if report else None
+    # pylint: enable=protected-access
+    return out
+
+
+def _representative_size(
+    chains: Sequence[FeatureChain], per_vertex_fn: RadiusFunc
+) -> float:
+    """Pick a single representative size for callable-radius inputs.
+
+    Used in diagnostic messages where the original scalar-radius code
+    expected a single number. We take the maximum sample over every
+    selected non-flat chain vertex — the strictest feasibility threshold
+    and the most informative single number to surface on the report.
+
+    Note this is NOT used to size corner patches under variable radius —
+    those use a per-corner radius via :func:`_corner_size`, otherwise an
+    oversize-but-skipped chain would still inflate every corner patch.
+
+    Args:
+        chains: the selection (the chains we'll evaluate).
+        per_vertex_fn: the resolved per-vertex callable.
+
+    Returns:
+        float: the representative size (always > 0 because every per-vertex
+        call has already been validated to return > 0 — but the empty case
+        falls back to ``1.0`` as a defensive sentinel; the caller never
+        actually uses it when there are no chains).
+    """
+    max_size = 0.0
+    for chain in chains:
+        if chain.convexity_class == "flat":
+            continue
+        for index in range(len(chain.verts)):
+            try:
+                value = float(per_vertex_fn(chain, index))
+            except (TypeError, ValueError):
+                # The proper validation happens in _chain_radius_samples;
+                # here we just want a representative number.
+                continue
+            max_size = max(max_size, value)
+    return max_size if max_size > 0.0 else 1.0
+
+
+def _corner_size(
+    corner: Corner,
+    per_chain_sizes: dict[int, np.ndarray],
+    fallback: float,
+) -> Optional[float]:
+    """Pick the patch radius for one corner from its incident chains' per-vertex sizes.
+
+    For each chain endpoint at the corner, look up that endpoint's local
+    per-vertex size from the chain's resampled radii. The patch radius is
+    the **maximum** across those endpoint samples (the strictest setback the
+    incident chains need, design §4.3 step 2's ``s = r`` generalisation).
+
+    Args:
+        corner: the corner to size.
+        per_chain_sizes: ``id(chain) -> per-vertex sizes`` for every chain
+            that passed the pre-flight. Chains that were skipped or filtered
+            do not appear in this map.
+        fallback: the scalar input (or ``_representative_size`` value for a
+            callable) used when *no* incident chain survived. Returning the
+            fallback in this case is harmless because the caller will see
+            no surviving chain tubes touching this corner and the patch by
+            itself just adds/cuts a faceted ball — but in practice we
+            **return None** to drop the corner entirely (the patch with no
+            corresponding chain tubes leaves a freestanding sphere bump).
+
+    Returns:
+        float | None: the per-corner radius, or ``None`` if every incident
+        chain was skipped — in which case the caller drops the corner.
+    """
+    samples: list[float] = []
+    for endpoint in corner.chain_endpoints:
+        chain = endpoint.chain
+        chain_sizes = per_chain_sizes.get(id(chain))
+        if chain_sizes is None:
+            # This chain was skipped — its tube doesn't reach the corner.
+            continue
+        v_index = 0 if endpoint.side == "start" else len(chain.verts) - 1
+        samples.append(float(chain_sizes[v_index]))
+    if not samples:
+        return None
+    _ = fallback  # signature parity for documentation
+    return max(samples)
+
+
+def _mesh_chamfer_or_fillet(
+    meshpart: "MeshPart",
+    edges: SelectionInput,
+    size: RadiusInput,
+    *,
+    operation: Literal["chamfer", "fillet"],
+    on_infeasible: Literal["raise", "skip"],
+    segments: int = _DEFAULT_FILLET_SEGMENTS,
+) -> "MeshPart":
+    """Shared outer-shell validation for :func:`mesh_chamfer` / :func:`mesh_fillet`.
+
+    Performs argument-type validation, empty-mesh rejection, and
+    ``on_infeasible`` validation; then dispatches to the operation-specific
+    impl. The split keeps each public entry point's argument handling
+    declarative while the geometry pipeline lives in one place per operation.
+    """
+    # pylint: disable=import-outside-toplevel
+    from .mesh_part import MeshPart
+
+    if not isinstance(meshpart, MeshPart):
+        raise TypeError(f"mesh_{operation} expects a MeshPart, got {type(meshpart)!r}")
+    if on_infeasible not in ("raise", "skip"):
+        raise ValueError(
+            f"on_infeasible={on_infeasible!r} is not supported; expected "
+            f"'raise' (default — P3 contract) or 'skip' (A4)."
+        )
+    if meshpart.manifold.is_empty():
+        raise ValueError(f"Cannot {operation} an empty MeshPart")
+
+    if operation == "chamfer":
+        return _mesh_chamfer_impl(meshpart, edges, size, on_infeasible=on_infeasible)
+    return _mesh_fillet_impl(
+        meshpart,
+        edges,
+        size,
+        segments=segments,
+        on_infeasible=on_infeasible,
+    )
 
 
 def _drop_zero_volume_artifacts(
@@ -1020,6 +1606,44 @@ def _build_swept_from_profile(
     return _ribbon_mesh_from_rings(lifted, is_loop)
 
 
+def _build_swept_from_per_vertex_profile(
+    frames: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]],
+    profiles_2d: list[np.ndarray],
+    is_loop: bool,
+) -> Optional[m3d.Manifold]:
+    """A4 variant of :func:`_build_swept_from_profile` with per-vertex profiles.
+
+    Every frame gets its own 2-D profile (lifted into 3-D at that frame),
+    rather than one shared profile lifted at every frame. Every profile must
+    have the same number of points ``k`` so the ribbon mesh's quad stitching
+    lines up frame-to-frame. The scalar path is a thin wrapper that broadcasts
+    its single profile to every frame.
+
+    Args:
+        frames: the per-vertex frames.
+        profiles_2d: a list, one ``(K, 2)`` profile per frame. ``len(profiles_2d)``
+            must equal ``len(frames)`` and every profile must have the same
+            ``K``.
+        is_loop: True if the sub-run closes on itself.
+
+    Returns:
+        manifold3d.Manifold | None: the swept solid, or ``None`` if the input
+        is geometrically degenerate.
+    """
+    if len(profiles_2d) != len(frames):
+        return None
+    if not profiles_2d:
+        return None
+    k = profiles_2d[0].shape[0]
+    if any(prof.shape[0] != k for prof in profiles_2d):
+        return None
+    lifted = [
+        _lift_profile_to_3d(frame, profile)
+        for frame, profile in zip(frames, profiles_2d)
+    ]
+    return _ribbon_mesh_from_rings(lifted, is_loop)
+
+
 def _ribbon_mesh_from_rings(
     rings: list[np.ndarray],
     is_loop: bool,
@@ -1202,7 +1826,7 @@ def _build_swept_arc_tool(
     triangles: np.ndarray,
     face_id: np.ndarray,
     tri_normals: np.ndarray,
-    radius: float,
+    radii: np.ndarray,
     segments: int,
     endpoint_overshoots: Optional[tuple[float, float]] = None,
     *,
@@ -1236,6 +1860,11 @@ def _build_swept_arc_tool(
     edge tangent to cleanly cross any chain boundary the sub-run ends on
     (design §3.6).
 
+    A4: ``radii`` is a per-sub-run-vertex array of rolling-ball radii. Each
+    frame gets its own profile sized at its local radius; the ribbon-mesh
+    loft interpolates between adjacent rings. A constant ``radii`` array is
+    the scalar / A3b path, bit-identical to the pre-A4 code.
+
     Args:
         sub_run_verts (Sequence[int]): the ordered vertex indices for this
             sub-run (must have ``len >= 2``).
@@ -1248,13 +1877,16 @@ def _build_swept_arc_tool(
         triangles (np.ndarray): host triangle array.
         face_id (np.ndarray): host per-triangle faceID.
         tri_normals (np.ndarray): host per-triangle normals.
-        radius (float): the fillet radius.
+        radii (np.ndarray): per-sub-run-vertex rolling-ball radii, length
+            ``len(sub_run_verts)``, every entry > 0.
         segments (int): arc facet count.
 
     Returns:
         manifold3d.Manifold | None: the combined swept tool, or ``None`` if
         every loft hull failed (degenerate input).
     """
+    if len(radii) != len(sub_run_verts):
+        return None
     # Build a virtual chain-like vertex list view for the frame helpers; we
     # reuse _per_vertex_face_normals and _vertex_frames by constructing a
     # transient FeatureChain over the sub-run vertices and the parent's pair.
@@ -1267,7 +1899,7 @@ def _build_swept_arc_tool(
     n_a_per_vertex, n_b_per_vertex = _per_vertex_face_normals(
         transient, triangles, face_id, tri_normals
     )
-    open_overshoot = max(_OPEN_OVERSHOOT * radius, _MIN_PRISM_THICKNESS)
+    open_overshoot = max(_OPEN_OVERSHOOT * _chain_max_size(radii), _MIN_PRISM_THICKNESS)
     frames = _vertex_frames(
         transient,
         vertices,
@@ -1277,19 +1909,29 @@ def _build_swept_arc_tool(
         endpoint_overshoots,
     )
 
-    wedge_profile = _wedge_profile_points(radius)
-    ball_profile = _ball_profile_points(radius, segments)
-    if sign == "concave":
-        # For concave fillets the wedge sits on the *outside* of the corner —
-        # design §3.4: "the same triangle but on the outside, translated by
-        # (-d, -d) along (-u, -w)". Mirror the profile in (u, w) so the
-        # lifted tool fills the empty channel rather than re-cutting the
-        # already-solid region.
-        wedge_profile = -wedge_profile
-        ball_profile = -ball_profile
+    wedge_profiles: list[np.ndarray] = []
+    ball_profiles: list[np.ndarray] = []
+    for index in range(len(frames)):
+        r = float(radii[index])
+        wedge = _wedge_profile_points(r)
+        ball = _ball_profile_points(r, segments)
+        if sign == "concave":
+            # For concave fillets the wedge sits on the *outside* of the corner
+            # — design §3.4: "the same triangle but on the outside, translated
+            # by (-d, -d) along (-u, -w)". Mirror the profile in (u, w) so the
+            # lifted tool fills the empty channel rather than re-cutting the
+            # already-solid region.
+            wedge = -wedge
+            ball = -ball
+        wedge_profiles.append(wedge)
+        ball_profiles.append(ball)
 
-    wedge_tool = _build_swept_from_profile(frames, wedge_profile, is_loop_subrun)
-    ball_tool = _build_swept_from_profile(frames, ball_profile, is_loop_subrun)
+    wedge_tool = _build_swept_from_per_vertex_profile(
+        frames, wedge_profiles, is_loop_subrun
+    )
+    ball_tool = _build_swept_from_per_vertex_profile(
+        frames, ball_profiles, is_loop_subrun
+    )
     if wedge_tool is None:
         return None
     if ball_tool is None:
@@ -1309,14 +1951,14 @@ def _check_fillet_feasibility(
     triangles: np.ndarray,
     face_id: np.ndarray,
     tri_normals: np.ndarray,
-    radius: float,
+    radii: np.ndarray,
 ) -> None:
     """Run the fillet feasibility checks for one chain (design §5.1).
 
     Mirrors A3a's chamfer pre-flight (half-thickness, chain-length) but with
-    the fillet radius substituted for the chamfer size. Mixed-convexity is
-    **not** a constraint for fillet — A3b splits mixed chains at the sign
-    flip and builds per-sub-run tools (design §3.4 / §8.3).
+    the fillet per-vertex radii substituted for the chamfer size.
+    Mixed-convexity is **not** a constraint for fillet — A3b splits mixed
+    chains at the sign flip and builds per-sub-run tools (design §3.4 / §8.3).
 
     Args:
         chain (FeatureChain): the chain to test.
@@ -1324,7 +1966,7 @@ def _check_fillet_feasibility(
         triangles (np.ndarray): host triangle array.
         face_id (np.ndarray): host per-triangle faceID.
         tri_normals (np.ndarray): host per-triangle normals.
-        radius (float): the requested fillet radius.
+        radii (np.ndarray): per-vertex requested fillet radius.
 
     Raises:
         MeshFilletInfeasible: with ``constraint`` set to the failing check.
@@ -1332,7 +1974,7 @@ def _check_fillet_feasibility(
     n_a_per_vertex, n_b_per_vertex = _per_vertex_face_normals(
         chain, triangles, face_id, tri_normals
     )
-    _check_feasibility(chain, vertices, n_a_per_vertex, n_b_per_vertex, radius)
+    _check_feasibility(chain, vertices, n_a_per_vertex, n_b_per_vertex, radii)
 
 
 # ---------------------------------------------------------------------------
@@ -1343,18 +1985,28 @@ def _check_fillet_feasibility(
 def mesh_fillet(
     meshpart: "MeshPart",
     edges: SelectionInput,
-    radius: float,
+    radius: RadiusInput,
     *,
     segments: int = _DEFAULT_FILLET_SEGMENTS,
-    on_infeasible: Literal["raise"] = "raise",
+    on_infeasible: Literal["raise", "skip"] = "raise",
 ) -> "MeshPart":
-    """Apply a faceted fillet of ``radius`` to ``edges`` (Phase A3b).
+    """Apply a faceted fillet to ``edges``.
 
     Free-function counterpart of :meth:`MeshPart.fillet`. Implements the
     per-chain swept-arc-tool construction from the mesh-fillet engineering
-    design (§3, §8.1 — A3b profile is a ``segments``-faceted quarter-disc
+    design (§3, §8.1 — the profile is a ``segments``-faceted quarter-disc
     cross-section, the rolling-ball radius is ``radius``). The pre-flight (§5)
-    raises :exc:`MeshFilletInfeasible` on over-size requests; A3b never clamps.
+    raises :exc:`MeshFilletInfeasible` on over-size requests, mixed corners,
+    and k>6 corners by default; ``on_infeasible="skip"`` drops the offending
+    item and continues.
+
+    A4: ``radius`` may be a scalar ``float`` (uniform — bit-identical to the
+    A3b path) **or** a callable ``(chain, vertex_index) -> float`` evaluated
+    at every chain vertex. Each frame's profile is sized at its local radius;
+    the ribbon-mesh loft naturally interpolates between adjacent rings. The
+    feasibility pre-flight is per-vertex: any vertex that fails the
+    half-thickness rule against *its own* radius triggers the chain-level
+    raise (or skip).
 
     Mixed convex/concave chains are handled by **per-edge sign splitting**
     (design §3.4 / §8.3): the chain is broken at every sign flip into
@@ -1362,11 +2014,9 @@ def mesh_fillet(
     sub-runs) are batched together, then the adds (concave sub-runs) — cut
     first, then add (design §3.7).
 
-    Multi-chain corner blends ship in A3c; for A3b, chains that run into a
-    shared corner vertex still produce a valid swept tool — the corner is
-    handled by the simplest stub the design specifies (the chain tool's
-    endpoint overshoot crosses the corner cleanly; the resulting body is
-    valid but the corner is a thin patch rather than a real ball).
+    Multi-chain corner blends are A3c's setback + faceted-sphere recipe;
+    every chain that runs into a corner is setback by the corner's setback
+    distance, and the corner is filled with a sphere patch.
 
     Args:
         meshpart (MeshPart): the mesh body to fillet.
@@ -1374,39 +2024,73 @@ def mesh_fillet(
             :class:`FeatureChainSelection`, a single :class:`FeatureChain`, or
             any iterable of :class:`FeatureChain`. Chains must belong to
             ``meshpart``'s own chain graph.
-        radius (float): rolling-ball radius (positive).
+        radius: rolling-ball radius — a positive ``float`` or a callable
+            ``(chain, vertex_index) -> float`` returning a positive radius at
+            every chain vertex.
         segments (int): arc facet count for the cross-section. Default
             ``8`` matches design §8.1's recommended ``n_seg``.
-        on_infeasible (Literal["raise"]): A3b only supports ``"raise"`` (the
-            ``"skip"`` mode ships in A4). Default ``"raise"``.
+        on_infeasible (Literal["raise", "skip"]): default ``"raise"`` —
+            never silently mis-answer (P3). ``"skip"`` drops the offending
+            chain/corner and continues; dropped items are attached to the
+            returned :class:`MeshPart`'s
+            :attr:`~build123d.mesh.MeshPart.last_fillet_report`.
 
     Returns:
-        MeshPart: the filleted mesh body, carrying the merged side-map.
+        MeshPart: the filleted mesh body, carrying the merged side-map. The
+        ``last_fillet_report`` attribute is set when ``on_infeasible="skip"``
+        dropped any chain/corner; ``None`` otherwise.
 
     Raises:
-        ValueError: if ``radius`` is not strictly positive, ``segments < 1``,
-            ``meshpart`` is empty, or ``on_infeasible`` is unsupported.
-        MeshFilletInfeasible: if any feasibility constraint fails — see
-            :class:`MeshFilletInfeasible`.
-        TypeError: if ``edges`` is none of the accepted shapes.
+        ValueError: if ``radius`` is not strictly positive (scalar) or
+            returns a non-positive value (callable), ``segments < 1``,
+            ``meshpart`` is empty, or ``on_infeasible`` is not one of
+            ``"raise"`` / ``"skip"``.
+        MeshFilletInfeasible: if any feasibility constraint fails and
+            ``on_infeasible="raise"``.
+        TypeError: if ``edges`` is none of the accepted shapes or ``radius``
+            is neither a number nor a callable.
     """
-    # pylint: disable=import-outside-toplevel
-    from .mesh_part import MeshPart
-
-    if not isinstance(meshpart, MeshPart):
-        raise TypeError(f"mesh_fillet expects a MeshPart, got {type(meshpart)!r}")
-    if radius <= 0.0:
-        raise ValueError(f"fillet radius must be > 0, got {radius!r}")
     if segments < 1:
         raise ValueError(f"fillet segments must be >= 1, got {segments!r}")
-    if on_infeasible != "raise":
-        raise ValueError(
-            f"on_infeasible={on_infeasible!r} is not supported in A3b (only "
-            "'raise' ships in this phase; 'skip' lands in A4)."
-        )
-    if meshpart.manifold.is_empty():
-        raise ValueError("Cannot fillet an empty MeshPart")
+    return _mesh_chamfer_or_fillet(
+        meshpart,
+        edges,
+        radius,
+        operation="fillet",
+        on_infeasible=on_infeasible,
+        segments=segments,
+    )
 
+
+def _mesh_fillet_impl(
+    meshpart: "MeshPart",
+    edges: SelectionInput,
+    radius: RadiusInput,
+    *,
+    segments: int,
+    on_infeasible: Literal["raise", "skip"],
+) -> "MeshPart":
+    """Internal fillet driver (called by :func:`_mesh_chamfer_or_fillet`).
+
+    The fillet pipeline mirrors :func:`_mesh_chamfer_impl` but with sign
+    splitting per chain (a mixed chain becomes one tool per convex / concave
+    sub-run) and the rolling-ball cross-section.
+
+    Args:
+        meshpart: the mesh body to fillet.
+        edges: the selection input.
+        radius: scalar float or per-vertex callable.
+        segments: arc facet count.
+        on_infeasible: ``"raise"`` or ``"skip"``.
+
+    Returns:
+        MeshPart: the filleted mesh body.
+    """
+    # pylint: disable=import-outside-toplevel,too-many-branches,too-many-locals
+    # pylint: disable=too-many-statements,too-many-nested-blocks
+    from .mesh_part import MeshPart
+
+    scalar, per_vertex_fn = _normalise_radius(radius, "fillet")
     selection = meshpart.feature_edges()
     chains = _selection_chains(edges, selection)
     if not chains:
@@ -1417,61 +2101,97 @@ def mesh_fillet(
     face_id = selection.face_id
     tri_normals = triangle_normals(vertices, triangles)
 
-    # Detect multi-chain corners (design §4) and pre-flight mixed / k>6 cases
-    # before building any tool. A3c upgrade: chains terminating at a corner
-    # get a setback at that endpoint, and a faceted sphere fills the corner.
-    corners = detect_corners(chains, vertices, triangles, face_id, tri_normals)
-    _check_corner_feasibility(corners, radius)
+    report = FilletReport(operation="fillet", requested=scalar)
+    skipped_chain_ids: set[int] = set()
 
-    # Pre-flight every chain *before* building any tool — fail fast.
+    # Detect multi-chain corners (design §4) and pre-flight mixed / k>6 cases
+    # before building any tool. A3c: chains terminating at a corner get a
+    # setback at that endpoint, and a faceted sphere fills the corner.
+    corners = detect_corners(chains, vertices, triangles, face_id, tri_normals)
+    representative_size = (
+        scalar if scalar is not None else _representative_size(chains, per_vertex_fn)
+    )
+    if on_infeasible == "raise":
+        _check_corner_feasibility(corners, representative_size)
+        active_corners = corners
+    else:
+        active_corners = _filter_corners_for_skip(corners, representative_size, report)
+
+    # Pre-flight every chain — sample radii, then run the half-thickness /
+    # chain-length checks. Per-vertex sample arrays are cached for tool build.
+    per_chain_radii: dict[int, np.ndarray] = {}
     for chain in chains:
         if chain.convexity_class == "flat":
             continue
-        _check_fillet_feasibility(
-            chain, vertices, triangles, face_id, tri_normals, radius
-        )
+        # Non-positive per-vertex callable return — always raises (caller bug,
+        # not a geometry constraint; skip mode does NOT swallow these).
+        radii = _chain_radius_samples(chain, per_vertex_fn)
+        try:
+            _check_fillet_feasibility(
+                chain, vertices, triangles, face_id, tri_normals, radii
+            )
+        except MeshFilletInfeasible as exc:
+            if on_infeasible == "raise":
+                raise
+            report.skipped_chains.append(
+                SkippedItem(
+                    chains=list(exc.chains),
+                    constraint=exc.constraint,
+                    requested=exc.requested,
+                    measured=exc.measured,
+                    vertex=None,
+                    message=str(exc),
+                )
+            )
+            _LOG.warning(
+                "mesh-fillet skip: chain pair %s (constraint=%s requested=%g "
+                "measured=%g)",
+                chain.pair,
+                exc.constraint,
+                exc.requested,
+                exc.measured,
+            )
+            skipped_chain_ids.add(id(chain))
+            continue
+        per_chain_radii[id(chain)] = radii
 
     cut_tools: list[m3d.Manifold] = []
     add_tools: list[m3d.Manifold] = []
-    open_overshoot = max(_OPEN_OVERSHOOT * radius, _MIN_PRISM_THICKNESS)
-    # Vertex_kinds is keyed on the parent chain's index, but a sub-run starts
-    # mid-chain — translate sub-run start/end vertices to parent chain indices
-    # to read the kind tag.
     for chain in chains:
         if chain.convexity_class == "flat":
             continue
+        if id(chain) in skipped_chain_ids:
+            continue
+        radii = per_chain_radii[id(chain)]
+        chain_max = _chain_max_size(radii)
+        open_overshoot = max(_OPEN_OVERSHOOT * chain_max, _MIN_PRISM_THICKNESS)
         kind_for: dict[int, str] = dict(zip(chain.verts, chain.vertex_kinds))
         sub_runs = _split_chain_by_sign(chain, vertices)
-        # Per-chain corner setback (design §4.3 step 3): if either endpoint of
-        # the *parent chain* sits on a multi-chain corner, the sub-run that
-        # touches that endpoint is shortened by the setback distance. Sub-runs
-        # that don't touch a chain endpoint keep the standard overshoot.
         chain_start_v = chain.verts[0]
         chain_end_v = chain.verts[-1]
-        start_setback, end_setback = per_chain_setback(corners, chain, radius, vertices)
+        start_setback, end_setback = per_chain_setback(
+            active_corners, chain, chain_max, vertices
+        )
+        # Per-vertex radii indexed by host-mesh vertex index for the sub-run
+        # lookups below — each sub-run uses a subset of the parent chain's
+        # vertices, and we resample at exactly those positions.
+        radii_by_host_vertex: dict[int, float] = {
+            int(chain.verts[i]): float(radii[i]) for i in range(len(chain.verts))
+        }
         for sub_verts, sign in sub_runs:
-            # A sub-run inherits the parent's loop flag only if it covers the
-            # whole loop (uniform-sign loop — see _split_chain_by_sign).
             is_loop_sub = chain.is_loop and len(sub_verts) == len(chain.verts)
             endpoint_overshoots: Optional[tuple[float, float]] = None
             if not is_loop_sub:
-                # A sub-run boundary touching the parent chain's start/end
-                # vertex inherits that endpoint's corner setback. Mid-chain
-                # boundaries (where the sub-run was split at a sign flip) get
-                # zero overshoot — the two adjacent sub-runs share that vertex
-                # and their tools meet there exactly.
+                # See A3b commentary: corner setback at chain endpoints; zero
+                # overshoot at mid-chain sign-flip boundaries.
                 if sub_verts[0] == chain_start_v and start_setback > 0.0:
                     ov_start = -start_setback
                 elif sub_verts[0] == chain_start_v:
-                    # Non-corner chain start: standard overshoot for convex
-                    # (cut into empty space is harmless); zero for concave
-                    # (the add-tool tip would otherwise float outside).
                     ov_start = open_overshoot if sign == "convex" else 0.0
                     kind = kind_for.get(sub_verts[0])
                     if sign == "concave" and kind == "corner":
                         ov_start = 0.0
                 else:
-                    # Mid-chain (sign flip): two sub-runs meet, no overshoot.
                     ov_start = 0.0
                 if sub_verts[-1] == chain_end_v and end_setback > 0.0:
                     ov_end = -end_setback
@@ -1483,6 +2203,10 @@ def mesh_fillet(
                 else:
                     ov_end = 0.0
                 endpoint_overshoots = (ov_start, ov_end)
+            sub_radii = np.array(
+                [radii_by_host_vertex[int(v)] for v in sub_verts],
+                dtype=np.float64,
+            )
             tool = _build_swept_arc_tool(
                 sub_verts,
                 chain,
@@ -1491,12 +2215,33 @@ def mesh_fillet(
                 triangles,
                 face_id,
                 tri_normals,
-                radius,
+                sub_radii,
                 segments,
                 endpoint_overshoots,
                 sign=sign,
             )
             if tool is None:
+                if on_infeasible == "skip":
+                    report.skipped_chains.append(
+                        SkippedItem(
+                            chains=[chain],
+                            constraint="degenerate-tool",
+                            requested=chain_max,
+                            measured=0.0,
+                            vertex=None,
+                            message=(
+                                f"swept fillet tool returned no manifold for "
+                                f"chain pair {chain.pair} sub-run ({sign}) — "
+                                "likely geometrically degenerate input."
+                            ),
+                        )
+                    )
+                    _LOG.warning(
+                        "mesh-fillet skip: chain pair %s sub-run %s "
+                        "(constraint=degenerate-tool)",
+                        chain.pair,
+                        sign,
+                    )
                 continue
             if sign == "convex":
                 cut_tools.append(tool)
@@ -1507,11 +2252,21 @@ def mesh_fillet(
     # into the appropriate cut / add batches. A convex corner contributes a
     # sphere to the cut tool (subtracted, rounding the corner); a concave
     # corner contributes one to the add tool. Mixed / degenerate corners were
-    # rejected by the pre-flight above.
-    for corner in corners.values():
+    # rejected (raise) or filtered (skip).
+    #
+    # Per-corner radius: the maximum sample across the corner's surviving
+    # incident chains. If every incident chain was skipped, drop the corner
+    # patch — a freestanding sphere with no chain tubes converging into it
+    # is geometrically meaningless and would punch a spurious hole / bump.
+    for corner in active_corners.values():
         if corner.kind not in ("convex", "concave"):
             continue
-        patch = build_corner_fillet_patch(corner, radius, segments)
+        radius_for_corner = _corner_size(
+            corner, per_chain_radii, fallback=representative_size
+        )
+        if radius_for_corner is None:
+            continue
+        patch = build_corner_fillet_patch(corner, radius_for_corner, segments)
         if patch is None:
             continue
         if corner.kind == "convex":
@@ -1540,11 +2295,17 @@ def mesh_fillet(
         raise ValueError(f"mesh fillet produced an invalid manifold: {result.status()}")
 
     result = _drop_zero_volume_artifacts(result)
-    return MeshPart(result, _carry_side_map(meshpart.side_map))
+    out = MeshPart(result, _carry_side_map(meshpart.side_map))
+    # pylint: disable=protected-access
+    out._last_fillet_report = report if report else None
+    # pylint: enable=protected-access
+    return out
 
 
 __all__ = [
+    "FilletReport",
     "MeshFilletInfeasible",
+    "SkippedItem",
     "mesh_chamfer",
     "mesh_fillet",
 ]

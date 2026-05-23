@@ -1494,11 +1494,18 @@ def test_mesh_chamfer_free_function_matches_method():
 
 
 def test_mesh_chamfer_rejects_unsupported_on_infeasible_mode():
-    """A3a only supports 'raise'; 'skip' / 'clamp' raise ValueError."""
+    """A4 ships ``raise`` and ``skip``; any other value raises ValueError.
+
+    Notably ``clamp`` is *not* shipped (design §5.4 forbids it in A3 / A4 —
+    a clamp would silently degrade the answer, exactly the P3 failure the
+    mode is designed to prevent).
+    """
     box = MeshPart.from_part(Box(10, 10, 10))
     chain = box.feature_edges()[0]
-    with pytest.raises(ValueError, match="A3a"):
-        box.chamfer(chain, size=1.0, on_infeasible="skip")
+    with pytest.raises(ValueError, match="on_infeasible"):
+        box.chamfer(chain, size=1.0, on_infeasible="clamp")
+    with pytest.raises(ValueError, match="on_infeasible"):
+        box.chamfer(chain, size=1.0, on_infeasible="bogus")
 
 
 def test_mesh_chamfer_rejects_foreign_chain():
@@ -1789,11 +1796,17 @@ def test_mesh_fillet_free_function_matches_method():
 
 
 def test_mesh_fillet_rejects_unsupported_on_infeasible_mode():
-    """A3b only supports 'raise'; 'skip' / 'clamp' raise ValueError."""
+    """A4 ships ``raise`` and ``skip``; any other value raises ValueError.
+
+    ``clamp`` is *not* shipped (design §5.4) — silently degrading the radius
+    would violate P3.
+    """
     box = MeshPart.from_part(Box(10, 10, 10))
     chain = box.feature_edges()[0]
-    with pytest.raises(ValueError, match="A3b"):
-        box.fillet(chain, radius=1.0, on_infeasible="skip")
+    with pytest.raises(ValueError, match="on_infeasible"):
+        box.fillet(chain, radius=1.0, on_infeasible="clamp")
+    with pytest.raises(ValueError, match="on_infeasible"):
+        box.fillet(chain, radius=1.0, on_infeasible="bogus")
 
 
 def test_mesh_fillet_rejects_foreign_chain():
@@ -2042,3 +2055,295 @@ def test_mesh_fillet_l_shape_mixed_corner_raise_lists_offenders():
     classes = {c.convexity_class for c in err.chains}
     assert "convex" in classes
     assert "concave" in classes
+
+
+# --------------------------------------------------------------------------
+# Phase A4 — variable radius + on_infeasible="skip"
+# --------------------------------------------------------------------------
+
+
+def test_mesh_fillet_variable_radius_scalar_callable_matches_scalar():
+    """A4 regression: a constant-returning callable is bit-identical to scalar.
+
+    The variable-radius code path must specialise to the scalar path when
+    the callable returns the same value at every vertex — otherwise we'd
+    risk regressing every A3a/A3b/A3c test that asserts scalar volumes.
+    """
+    box = MeshPart.from_part(Box(20, 20, 20))
+    chain = box.feature_edges()[0]
+    scalar = box.fillet(chain, radius=1.0, segments=8)
+    constant = box.fillet(chain, radius=lambda _c, _i: 1.0, segments=8)
+    assert scalar.is_valid and constant.is_valid
+    assert constant.volume == pytest.approx(scalar.volume, abs=1e-9)
+    assert constant.last_fillet_report is None
+    assert scalar.last_fillet_report is None
+
+
+def test_mesh_chamfer_variable_size_scalar_callable_matches_scalar():
+    """Same regression for chamfer: constant callable matches scalar."""
+    box = MeshPart.from_part(Box(20, 20, 20))
+    chain = box.feature_edges()[0]
+    scalar = box.chamfer(chain, size=2.0)
+    constant = box.chamfer(chain, size=lambda _c, _i: 2.0)
+    assert scalar.is_valid and constant.is_valid
+    assert constant.volume == pytest.approx(scalar.volume, abs=1e-9)
+
+
+def test_mesh_fillet_variable_radius_linear_along_single_chain():
+    """Linearly varying radius 1→2 along one box edge produces a tapered fillet.
+
+    Volume sits *strictly* between the constant-r=1 and constant-r=2 results
+    (the tapered fillet removes more material than r=1 and less than r=2 —
+    a sanity check that the per-vertex profile is actually varying).
+    """
+    box = MeshPart.from_part(Box(20, 20, 20))
+    chain = box.feature_edges()[0]
+
+    def linear_radius(c: FeatureChain, index: int) -> float:
+        # Map vertex_index ∈ [0, len(verts) - 1] → radius ∈ [1.0, 2.0]
+        n = len(c.verts)
+        if n <= 1:
+            return 1.0
+        t = index / (n - 1)
+        return 1.0 + t
+
+    tapered = box.fillet(chain, radius=linear_radius, segments=8)
+    assert tapered.is_valid
+    assert len(tapered.manifold.decompose()) == 1
+    # The tapered fillet sits between r=1 and r=2 in removed-material terms.
+    fillet_small = box.fillet(chain, radius=1.0, segments=8)
+    fillet_big = box.fillet(chain, radius=2.0, segments=8)
+    # Removed material is box.volume - filleted.volume; tapered removes more
+    # than small (extra material at the r→2 end) and less than big (less
+    # material at the r→1 end).
+    removed_small = 8000.0 - fillet_small.volume
+    removed_big = 8000.0 - fillet_big.volume
+    removed_tapered = 8000.0 - tapered.volume
+    assert removed_small < removed_tapered < removed_big
+    assert tapered.last_fillet_report is None
+
+
+def test_mesh_fillet_variable_radius_box_two_edges_per_vertex_callable():
+    """A bigger test: a U-shaped multi-chain selection with a per-vertex schedule.
+
+    Pick two coplanar convex edges of a box (forming a U-shape with the
+    intermediate chain implicit through the corner). Per the design's A4
+    intent, the per-vertex callable lets each chain receive its own
+    schedule; we use ``chain.pair`` to dispatch a per-chain radius that
+    increases along each vertex.
+    """
+    box = MeshPart.from_part(Box(40, 40, 40))
+    chains = list(box.feature_edges())
+    # Two convex chains; both are feasible at r=1.0 anywhere.
+    two = chains[:2]
+    pair_schedule = {chains[0].pair: 0.8, chains[1].pair: 1.2}
+
+    def per_chain_radius(c: FeatureChain, index: int) -> float:
+        base = pair_schedule[c.pair]
+        # Small linear ramp so different vertices visibly vary too.
+        n = len(c.verts)
+        t = 0.0 if n <= 1 else index / (n - 1)
+        return base + 0.3 * t  # ∈ [0.8, 1.1] for chain 0 and [1.2, 1.5] for chain 1
+
+    filleted = box.fillet(two, radius=per_chain_radius, segments=8)
+    assert filleted.is_valid
+    # The result is in one piece (corner share is handled by the
+    # setback + sphere blend at the shared cube corner).
+    real_bodies = [b for b in filleted.manifold.decompose() if abs(b.volume()) > 1e-3]
+    assert len(real_bodies) == 1
+    # No infeasibility — the schedule fits within half the 40 mm thickness.
+    assert filleted.last_fillet_report is None
+    # Volume strictly less than the box (material was removed).
+    assert filleted.volume < 64000.0
+
+
+def test_mesh_fillet_variable_radius_infeasible_vertex_raises_with_name():
+    """A per-vertex callable whose value exceeds half-thickness at one vertex raises.
+
+    On a 6 mm plate the half-thickness is 6 mm; requesting r=8 at any vertex
+    must raise ``MeshFilletInfeasible(constraint="half-thickness")`` and
+    name the offending chain.
+    """
+    plate = MeshPart.from_part(Box(40, 40, 6))
+    chain = plate.feature_edges()[0]
+
+    # Constant 8.0 — every vertex fails.
+    with pytest.raises(MeshFilletInfeasible) as exc_info:
+        plate.fillet(chain, radius=lambda _c, _i: 8.0)
+    err = exc_info.value
+    assert err.constraint == "half-thickness"
+    assert err.requested == pytest.approx(8.0)
+    assert err.measured > 0.0
+    # The offending chain is named on the exception.
+    assert chain in err.chains
+
+
+def test_mesh_fillet_variable_radius_one_bad_vertex_only():
+    """Spike one vertex to an infeasible radius; the rest are fine.
+
+    The pre-flight evaluates per vertex against per-vertex radius; the
+    spike at one vertex still triggers the raise (the design's P3 contract).
+    """
+    plate = MeshPart.from_part(Box(40, 40, 6))
+    chain = plate.feature_edges()[0]
+
+    def spike(c: FeatureChain, index: int) -> float:
+        if index == 0:
+            return 8.0  # over half the 6 mm plate thickness
+        return 1.0
+
+    with pytest.raises(MeshFilletInfeasible) as exc_info:
+        plate.fillet(chain, radius=spike)
+    assert exc_info.value.constraint == "half-thickness"
+    # measured stays positive (the half-thickness is ~6 mm).
+    assert exc_info.value.measured > 0.0
+    # The offending vertex's requested radius is the 8.0 spike, not the 1.0.
+    assert exc_info.value.requested == pytest.approx(8.0)
+
+
+def test_mesh_fillet_skip_drops_oversize_chain_and_returns_report():
+    """The headline skip-mode test (design T14): infeasible chain is dropped.
+
+    A 6 mm plate cannot host a fillet of r=8. With ``on_infeasible="skip"``
+    the chain is dropped, a :class:`FilletReport` is attached, and a real
+    :class:`MeshPart` is returned — equal in volume to the input (no chain
+    actually filleted).
+    """
+    plate = MeshPart.from_part(Box(40, 40, 6))
+    chain = plate.feature_edges()[0]
+
+    result = plate.fillet(chain, radius=8.0, on_infeasible="skip")
+    assert isinstance(result, MeshPart)
+    assert result.is_valid
+    # No fillet was applied — every chain was infeasible.
+    assert result.volume == pytest.approx(plate.volume, rel=1e-9)
+    # The report names the dropped chain and the failing constraint.
+    report = result.last_fillet_report
+    assert report is not None
+    assert report.operation == "fillet"
+    assert len(report.skipped_chains) == 1
+    skipped = report.skipped_chains[0]
+    assert skipped.constraint == "half-thickness"
+    assert skipped.requested == pytest.approx(8.0)
+    assert skipped.measured > 0.0
+    assert chain in skipped.chains
+
+
+def test_mesh_fillet_skip_mode_mixes_feasible_and_infeasible_chains():
+    """Skip drops only the bad chains; feasible chains in the same selection get filleted.
+
+    A box has 12 feature edges; only one chain receives an oversize radius
+    via the callable. With ``on_infeasible="skip"`` the oversize chain is
+    dropped and the other 11 are filleted as normal.
+    """
+    box = MeshPart.from_part(Box(20, 20, 20))
+    chains = list(box.feature_edges())
+    bad_chain = chains[0]
+
+    def per_chain_radius(c: FeatureChain, _index: int) -> float:
+        # Spike *just* the first chain to an infeasible radius (the box's
+        # half-thickness is 10 mm; r=12 trips half-thickness).
+        if c.pair == bad_chain.pair:
+            return 12.0
+        return 1.0
+
+    result = box.fillet(chains, radius=per_chain_radius, on_infeasible="skip")
+    assert result.is_valid
+    assert len(result.manifold.decompose()) >= 1
+    report = result.last_fillet_report
+    assert report is not None
+    # Exactly the bad chain was dropped.
+    assert len(report.skipped_chains) == 1
+    assert bad_chain in report.skipped_chains[0].chains
+    # The other 11 chains were filleted — the result's volume is lower than
+    # the box, but greater than a full all-12-chain fillet would produce.
+    full = box.fillet(chains, radius=1.0)
+    assert result.volume > full.volume
+    assert result.volume < box.volume
+
+
+def test_mesh_fillet_skip_mixed_corner_drops_the_corner_only():
+    """The L-shape mixed-corner raise becomes a skip drop with the same payload."""
+    l_shape = mesh_cut(Box(30, 30, 12), Pos(10, 10, 0) * Box(16, 16, 16))
+    selection = l_shape.feature_edges()
+
+    result = l_shape.fillet(selection, radius=0.5, on_infeasible="skip")
+    assert result.is_valid
+    report = result.last_fillet_report
+    assert report is not None
+    # At least one mixed-corner skip is reported.
+    assert any(item.constraint == "mixed-corner" for item in report.skipped_corners)
+    # The dropped corner's chains include at least one convex and one concave.
+    drop = next(
+        item for item in report.skipped_corners if item.constraint == "mixed-corner"
+    )
+    classes = {c.convexity_class for c in drop.chains}
+    assert "convex" in classes and "concave" in classes
+    # The corner vertex index is reported.
+    assert drop.vertex is not None
+
+
+def test_mesh_fillet_skip_with_all_feasible_inputs_attaches_no_report():
+    """Skip mode with no infeasibility ⇒ ``last_fillet_report is None``.
+
+    The empty-report case is normalised to ``None`` so callers can compare
+    to ``None`` without inspecting list lengths (FilletReport's ``__bool__``
+    is False on empty, which the dispatcher uses to set the attribute to
+    ``None``).
+    """
+    box = MeshPart.from_part(Box(20, 20, 20))
+    chain = box.feature_edges()[0]
+    result = box.fillet(chain, radius=1.0, on_infeasible="skip")
+    assert result.is_valid
+    assert result.last_fillet_report is None
+
+
+def test_mesh_chamfer_skip_drops_oversize_chain():
+    """Chamfer skip-mode mirrors fillet skip-mode."""
+    plate = MeshPart.from_part(Box(40, 40, 6))
+    chain = plate.feature_edges()[0]
+    result = plate.chamfer(chain, size=8.0, on_infeasible="skip")
+    assert result.is_valid
+    assert result.volume == pytest.approx(plate.volume, rel=1e-9)
+    report = result.last_fillet_report
+    assert report is not None
+    assert report.operation == "chamfer"
+    assert len(report.skipped_chains) == 1
+    assert report.skipped_chains[0].constraint == "half-thickness"
+
+
+def test_mesh_fillet_per_vertex_callable_returning_non_positive_raises_valueerror():
+    """A callable that returns 0 or negative is a caller bug; always raise.
+
+    Skip mode still raises ``ValueError`` here — the design only mentions
+    skipping *geometric* infeasibility (P3), not bad inputs.
+    """
+    box = MeshPart.from_part(Box(20, 20, 20))
+    chain = box.feature_edges()[0]
+    with pytest.raises(ValueError, match="non-positive"):
+        box.fillet(chain, radius=lambda _c, _i: -1.0)
+    with pytest.raises(ValueError, match="non-positive"):
+        box.fillet(chain, radius=lambda _c, _i: 0.0, on_infeasible="skip")
+
+
+def test_mesh_fillet_radius_invalid_type_raises_typeerror():
+    """A non-number, non-callable radius raises TypeError."""
+    box = MeshPart.from_part(Box(20, 20, 20))
+    chain = box.feature_edges()[0]
+    with pytest.raises(TypeError, match="must be a positive number or a callable"):
+        box.fillet(chain, radius="bogus")
+
+
+def test_mesh_fillet_report_exports_and_is_iterable():
+    """``FilletReport`` exports cleanly from build123d.mesh."""
+    from build123d.mesh import FilletReport, SkippedItem  # noqa: F401
+
+    plate = MeshPart.from_part(Box(40, 40, 6))
+    chain = plate.feature_edges()[0]
+    result = plate.fillet(chain, radius=8.0, on_infeasible="skip")
+    report = result.last_fillet_report
+    assert isinstance(report, FilletReport)
+    assert isinstance(report.skipped_chains[0], SkippedItem)
+    # Empty report would be falsy; a populated one is truthy.
+    assert bool(report) is True
+    assert report.total_skipped == 1

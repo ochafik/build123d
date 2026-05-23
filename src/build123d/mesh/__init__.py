@@ -82,7 +82,13 @@ from .feature_edges import (
     FeatureChainSelection,
     FeatureEdge,
 )
-from .fillet import MeshFilletInfeasible, mesh_chamfer, mesh_fillet
+from .fillet import (
+    FilletReport,
+    MeshFilletInfeasible,
+    SkippedItem,
+    mesh_chamfer,
+    mesh_fillet,
+)
 from .mesh_part import MeshPart, mesh_cut, mesh_fuse, mesh_intersect
 from .ops import (
     mesh_extrude,
@@ -101,12 +107,14 @@ __all__ = [
     "FeatureChain",
     "FeatureChainSelection",
     "FeatureEdge",
+    "FilletReport",
     "MeshFilletInfeasible",
     "MeshPart",
     "RecoveredFace",
     "RecoveryResult",
     "ResultMesh",
     "SideMap",
+    "SkippedItem",
     "is_available",
     "mesh_chamfer",
     "mesh_cut",
