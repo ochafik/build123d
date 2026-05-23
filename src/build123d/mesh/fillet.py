@@ -71,6 +71,14 @@ import numpy as np
 import manifold3d as m3d  # type: ignore[import-not-found]
 
 from .bridge import SideMap
+from .corners import (
+    Corner,
+    MAX_CORNER_CHAINS,
+    build_corner_chamfer_patch,
+    build_corner_fillet_patch,
+    detect_corners,
+    per_chain_setback,
+)
 from .feature_edges import (
     FeatureChain,
     FeatureChainSelection,
@@ -349,6 +357,7 @@ def _build_chain_chamfer_tool(
     face_id: np.ndarray,
     tri_normals: np.ndarray,
     size: float,
+    endpoint_overshoots: Optional[tuple[float, float]] = None,
 ) -> Optional[m3d.Manifold]:
     """Build the swept chamfer tool for one chain (a single manifold body).
 
@@ -357,6 +366,12 @@ def _build_chain_chamfer_tool(
     loop the segments wrap (``n_loop`` segments); for an open chain there are
     ``n_loop - 1`` segments and the terminal frames are overshot per §3.6.
 
+    A negative endpoint overshoot **sets the chain tool back** from the
+    endpoint by that magnitude (design §4 — corner setback). The corner
+    blend dispatcher uses this to terminate the chain tool on a "setback
+    ring" some distance from the corner vertex, where the vertex patch
+    (sphere / polyhedron) picks up.
+
     Args:
         chain (FeatureChain): the chain (already classified — non-flat).
         vertices (np.ndarray): host mesh ``(N, 3)`` vertex array.
@@ -364,6 +379,11 @@ def _build_chain_chamfer_tool(
         face_id (np.ndarray): host mesh ``(M,)`` seeded face id per triangle.
         tri_normals (np.ndarray): host mesh ``(M, 3)`` per-triangle normals.
         size (float): chamfer leg length.
+        endpoint_overshoots (tuple[float, float] | None): per-endpoint
+            overshoot for an open chain. A *negative* value setbacks the
+            frame *into* the chain by that magnitude (the A3c corner setback
+            recipe). ``None`` (default) keeps the standard open-chain
+            overshoot.
 
     Returns:
         manifold3d.Manifold | None: the combined swept tool, or ``None`` if
@@ -374,7 +394,12 @@ def _build_chain_chamfer_tool(
     )
     open_overshoot = max(_OPEN_OVERSHOOT * size, _MIN_PRISM_THICKNESS)
     frames = _vertex_frames(
-        chain, vertices, n_a_per_vertex, n_b_per_vertex, open_overshoot
+        chain,
+        vertices,
+        n_a_per_vertex,
+        n_b_per_vertex,
+        open_overshoot,
+        endpoint_overshoots,
     )
     n_frames = len(frames)
     is_loop = chain.is_loop
@@ -516,6 +541,60 @@ def _check_feasibility(
 
 
 # ---------------------------------------------------------------------------
+# corner pre-flight (Phase A3c — design §4.5 / §4.6)
+# ---------------------------------------------------------------------------
+
+
+def _check_corner_feasibility(
+    corners: dict[int, Corner],
+    size: float,
+) -> None:
+    """Pre-flight every multi-chain corner — raise on mixed / k > 6.
+
+    Implements the design's NG_F4 (mixed convex/concave corners) and NG_F5
+    (k > 6 corners) non-goals. Both cases require analytic tooling we do not
+    have on a faceted mesh; the design specifies a clean raise with a
+    one-line workaround in the message ("fillet convex and concave subsets
+    in separate calls" for mixed; "split the corner" for k>6).
+
+    Args:
+        corners: ``vertex_index → Corner`` from
+            :func:`build123d.mesh.corners.detect_corners`.
+        size: the requested fillet radius / chamfer size (carried on the
+            raised exception).
+
+    Raises:
+        MeshFilletInfeasible: with ``constraint`` ``"mixed-corner"`` or
+            ``"k>6-corner"`` and ``chains`` listing every chain incident to
+            the offending corner.
+    """
+    for corner in corners.values():
+        if corner.kind == "mixed":
+            chains = [ep.chain for ep in corner.chain_endpoints]
+            raise MeshFilletInfeasible(
+                f"corner at vertex {corner.vertex} has both convex and concave "
+                "chains incident; mesh-fillet's setback + vertex-patch construction "
+                "(design §4.5) requires a uniform-sign corner. Fillet the convex "
+                "and concave chains in separate calls so each call's corners are "
+                "consistent.",
+                chains=chains,
+                constraint="mixed-corner",
+                requested=size,
+            )
+        if corner.kind == "degenerate":
+            chains = [ep.chain for ep in corner.chain_endpoints]
+            raise MeshFilletInfeasible(
+                f"corner at vertex {corner.vertex} has {corner.k} incident chains "
+                f"(> {MAX_CORNER_CHAINS}); mesh-fillet supports up to "
+                f"{MAX_CORNER_CHAINS}-edge corners (design §4.6). Reduce the "
+                "corner's edge count or split the selection.",
+                chains=chains,
+                constraint="k>6-corner",
+                requested=size,
+            )
+
+
+# ---------------------------------------------------------------------------
 # selection coercion
 # ---------------------------------------------------------------------------
 
@@ -638,10 +717,12 @@ def mesh_chamfer(
     face_id = selection.face_id
     tri_normals = triangle_normals(vertices, triangles)
 
-    # Note: cross-chain corner sharing is *allowed* for A3a chamfer (design §9):
-    # chamfer corners are planar intersections of half-spaces, which manifold3d
-    # handles bit-exactly — the per-chain swept wedges naturally bevel into each
-    # other at a shared corner. The aspirational corner-blend ships in A3c.
+    # Detect multi-chain corners (design §4) and pre-flight mixed / k>6 cases
+    # before building any tool. A3c upgrade: the chain swept tools get a
+    # per-endpoint setback at each corner and the corner gets a flat-polyhedron
+    # vertex patch (cut for convex, add for concave).
+    corners = detect_corners(chains, vertices, triangles, face_id, tri_normals)
+    _check_corner_feasibility(corners, size)
 
     # Pre-flight every chain *before* building any tool — fail fast.
     per_chain_normals: list[tuple[list[np.ndarray], list[np.ndarray]]] = []
@@ -653,7 +734,7 @@ def mesh_chamfer(
             # A3a defers mixed-convexity chains — they need per-edge sign
             # splitting that lands with the fillet profile work in A3b.
             raise MeshFilletInfeasible(
-                f"chain pair {chain.pair} is mixed convex/concave; A3a chamfer "
+                f"chain pair {chain.pair} is mixed convex/concave; chamfer "
                 "operates on chains with a single convexity sign. Split the "
                 "selection so each chain is uniformly convex or concave.",
                 chains=[chain],
@@ -678,8 +759,25 @@ def mesh_chamfer(
     for chain, _normals in zip(chains, per_chain_normals):
         if chain.convexity_class == "flat":
             continue
+        # A3c corner setback: shorten the chain tool at any corner endpoint by
+        # the corner's setback distance (a negative overshoot in the frame
+        # helper's convention). Non-corner endpoints keep the standard
+        # open-chain overshoot.
+        start_s, end_s = per_chain_setback(corners, chain, size, vertices)
+        overshoots: Optional[tuple[float, float]] = None
+        if (start_s > 0.0 or end_s > 0.0) and not chain.is_loop:
+            open_ov = max(_OPEN_OVERSHOOT * size, _MIN_PRISM_THICKNESS)
+            ov_start = -start_s if start_s > 0.0 else open_ov
+            ov_end = -end_s if end_s > 0.0 else open_ov
+            overshoots = (ov_start, ov_end)
         tool = _build_chain_chamfer_tool(
-            chain, vertices, triangles, face_id, tri_normals, size
+            chain,
+            vertices,
+            triangles,
+            face_id,
+            tri_normals,
+            size,
+            endpoint_overshoots=overshoots,
         )
         if tool is None:
             continue
@@ -687,6 +785,21 @@ def mesh_chamfer(
             cut_tools.append(tool)
         else:
             add_tools.append(tool)
+
+    # Build per-corner chamfer patches (design §4.3 step 5) and merge into the
+    # appropriate cut / add batches. A convex corner contributes a flat
+    # polyhedron to the cut tool; a concave corner contributes one to the add
+    # tool. Mixed / degenerate corners were rejected by the pre-flight above.
+    for corner in corners.values():
+        if corner.kind not in ("convex", "concave"):
+            continue
+        patch = build_corner_chamfer_patch(corner, size, vertices)
+        if patch is None:
+            continue
+        if corner.kind == "convex":
+            cut_tools.append(patch)
+        else:
+            add_tools.append(patch)
 
     # Apply cut first, then add (design §3.7 — p10 fix #3 carried forward).
     result = meshpart.manifold
@@ -710,7 +823,46 @@ def mesh_chamfer(
             f"mesh chamfer produced an invalid manifold: {result.status()}"
         )
 
+    result = _drop_zero_volume_artifacts(result)
     return MeshPart(result, _carry_side_map(meshpart.side_map))
+
+
+def _drop_zero_volume_artifacts(
+    manifold: m3d.Manifold, threshold: float = 1e-6
+) -> m3d.Manifold:
+    """Drop near-zero-volume components from a manifold.
+
+    A3c's corner-blend tools occasionally leave tiny zero-volume surface
+    fragments after the batched boolean (sphere-vs-tube precision pinch
+    points). These are not geometrically meaningful — every component with
+    ``|volume| > threshold`` is the real body — but they make
+    ``manifold.decompose()`` over-count. We recompose just the substantial
+    components so callers see one body when there is one body.
+
+    Args:
+        manifold: the manifold to clean.
+        threshold: components with ``|volume| ≤ threshold`` are dropped.
+
+    Returns:
+        manifold3d.Manifold: the cleaned manifold, or the input unchanged if
+        every component is below the threshold (caller decides what to do
+        with an empty result).
+    """
+    if manifold.is_empty():
+        return manifold
+    components = manifold.decompose()
+    if len(components) <= 1:
+        return manifold
+    real_components = [
+        component for component in components if abs(component.volume()) > threshold
+    ]
+    if not real_components:
+        return manifold
+    if len(real_components) == len(components):
+        return manifold
+    if len(real_components) == 1:
+        return real_components[0]
+    return m3d.Manifold.batch_boolean(real_components, m3d.OpType.Add)
 
 
 def _carry_side_map(side_map: SideMap) -> SideMap:
@@ -1265,6 +1417,12 @@ def mesh_fillet(
     face_id = selection.face_id
     tri_normals = triangle_normals(vertices, triangles)
 
+    # Detect multi-chain corners (design §4) and pre-flight mixed / k>6 cases
+    # before building any tool. A3c upgrade: chains terminating at a corner
+    # get a setback at that endpoint, and a faceted sphere fills the corner.
+    corners = detect_corners(chains, vertices, triangles, face_id, tri_normals)
+    _check_corner_feasibility(corners, radius)
+
     # Pre-flight every chain *before* building any tool — fail fast.
     for chain in chains:
         if chain.convexity_class == "flat":
@@ -1284,28 +1442,47 @@ def mesh_fillet(
             continue
         kind_for: dict[int, str] = dict(zip(chain.verts, chain.vertex_kinds))
         sub_runs = _split_chain_by_sign(chain, vertices)
+        # Per-chain corner setback (design §4.3 step 3): if either endpoint of
+        # the *parent chain* sits on a multi-chain corner, the sub-run that
+        # touches that endpoint is shortened by the setback distance. Sub-runs
+        # that don't touch a chain endpoint keep the standard overshoot.
+        chain_start_v = chain.verts[0]
+        chain_end_v = chain.verts[-1]
+        start_setback, end_setback = per_chain_setback(corners, chain, radius, vertices)
         for sub_verts, sign in sub_runs:
             # A sub-run inherits the parent's loop flag only if it covers the
             # whole loop (uniform-sign loop — see _split_chain_by_sign).
             is_loop_sub = chain.is_loop and len(sub_verts) == len(chain.verts)
             endpoint_overshoots: Optional[tuple[float, float]] = None
             if not is_loop_sub:
-                # For *concave* (add) sub-runs we must NOT overshoot at a
-                # multi-chain corner endpoint — the overshot tip of the add
-                # tool would lie in empty space outside the body and union as
-                # a disconnected floating piece (the L-shape concave-chain
-                # symptom). The full corner blend lands in A3c; for A3b the
-                # stub is "clamp the add overshoot to zero at corner vertices".
-                # Convex (cut) sub-runs keep the overshoot — a cut into empty
-                # space is harmless and helps the tool cleanly cross the
-                # adjacent face boundary.
-                if sign == "concave":
-                    start_corner = kind_for.get(sub_verts[0]) == "corner"
-                    end_corner = kind_for.get(sub_verts[-1]) == "corner"
-                    endpoint_overshoots = (
-                        0.0 if start_corner else open_overshoot,
-                        0.0 if end_corner else open_overshoot,
-                    )
+                # A sub-run boundary touching the parent chain's start/end
+                # vertex inherits that endpoint's corner setback. Mid-chain
+                # boundaries (where the sub-run was split at a sign flip) get
+                # zero overshoot — the two adjacent sub-runs share that vertex
+                # and their tools meet there exactly.
+                if sub_verts[0] == chain_start_v and start_setback > 0.0:
+                    ov_start = -start_setback
+                elif sub_verts[0] == chain_start_v:
+                    # Non-corner chain start: standard overshoot for convex
+                    # (cut into empty space is harmless); zero for concave
+                    # (the add-tool tip would otherwise float outside).
+                    ov_start = open_overshoot if sign == "convex" else 0.0
+                    kind = kind_for.get(sub_verts[0])
+                    if sign == "concave" and kind == "corner":
+                        ov_start = 0.0
+                else:
+                    # Mid-chain (sign flip): two sub-runs meet, no overshoot.
+                    ov_start = 0.0
+                if sub_verts[-1] == chain_end_v and end_setback > 0.0:
+                    ov_end = -end_setback
+                elif sub_verts[-1] == chain_end_v:
+                    ov_end = open_overshoot if sign == "convex" else 0.0
+                    kind = kind_for.get(sub_verts[-1])
+                    if sign == "concave" and kind == "corner":
+                        ov_end = 0.0
+                else:
+                    ov_end = 0.0
+                endpoint_overshoots = (ov_start, ov_end)
             tool = _build_swept_arc_tool(
                 sub_verts,
                 chain,
@@ -1325,6 +1502,22 @@ def mesh_fillet(
                 cut_tools.append(tool)
             else:
                 add_tools.append(tool)
+
+    # Build per-corner faceted-sphere patches (design §4.3 step 5) and merge
+    # into the appropriate cut / add batches. A convex corner contributes a
+    # sphere to the cut tool (subtracted, rounding the corner); a concave
+    # corner contributes one to the add tool. Mixed / degenerate corners were
+    # rejected by the pre-flight above.
+    for corner in corners.values():
+        if corner.kind not in ("convex", "concave"):
+            continue
+        patch = build_corner_fillet_patch(corner, radius, segments)
+        if patch is None:
+            continue
+        if corner.kind == "convex":
+            cut_tools.append(patch)
+        else:
+            add_tools.append(patch)
 
     # Apply cut first, then add (design §3.7 — p10 fix #3 carried forward).
     result = meshpart.manifold
@@ -1346,6 +1539,7 @@ def mesh_fillet(
     if result.status() != m3d.Error.NoError:
         raise ValueError(f"mesh fillet produced an invalid manifold: {result.status()}")
 
+    result = _drop_zero_volume_artifacts(result)
     return MeshPart(result, _carry_side_map(meshpart.side_map))
 
 

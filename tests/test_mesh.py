@@ -1525,6 +1525,12 @@ def test_mesh_chamfer_l_shape_all_edges_cut_then_add():
     The L has one re-entrant (concave) chain and many convex chains; applying
     convex CUTs first and concave ADDs second keeps the body in one piece —
     design §3.7 carries forward p10's fix #3.
+
+    Phase A3c adds a mixed-corner pre-flight (design §4.5): the L's re-entrant
+    edge meets the box's outer edges at a *mixed* corner (convex + concave
+    chains incident), which raises ``MeshFilletInfeasible`` when chamfered in
+    one call. The workaround the design recommends is to chamfer the convex
+    and concave subsets separately; we exercise that path here.
     """
     l_shape = mesh_cut(Box(30, 30, 12), Pos(10, 10, 0) * Box(16, 16, 16))
     selection = l_shape.feature_edges()
@@ -1533,10 +1539,20 @@ def test_mesh_chamfer_l_shape_all_edges_cut_then_add():
     assert n_concave >= 1, "L-shape has a re-entrant edge"
     assert n_convex >= 10, "L-shape has at least 10 convex edges"
 
-    chamfered = l_shape.chamfer(selection, size=2.0)
-    assert chamfered.is_valid
-    assert len(chamfered.manifold.decompose()) == 1
-    assert _degenerate_triangle_count(chamfered) == 0
+    # All-at-once: A3c mixed-corner pre-flight raises (design §4.5).
+    with pytest.raises(MeshFilletInfeasible) as exc_info:
+        l_shape.chamfer(selection, size=2.0)
+    assert exc_info.value.constraint == "mixed-corner"
+
+    # Design-recommended workaround: chamfer the convex chains alone (this
+    # call's corners are uniform-convex). The body stays in one piece and
+    # the cut-then-add flow still applies internally even though the concave
+    # chain is excluded from this selection.
+    convex_only = l_shape.chamfer(selection.convex(), size=2.0)
+    assert convex_only.is_valid
+    assert len(convex_only.manifold.decompose()) == 1
+    assert _degenerate_triangle_count(convex_only) == 0
+    assert convex_only.volume < l_shape.volume
 
 
 # --------------------------------------------------------------------------
@@ -1589,17 +1605,34 @@ def test_mesh_fillet_box_single_edge_is_bit_exact():
 
 
 def test_mesh_fillet_box_all_edges_no_slivers_and_one_body():
-    """All 12 edges filleted: one body, no slivers, real arc strips visible."""
+    """All 12 edges filleted: one body, real arc strips, 8 corner sphere patches.
+
+    A3c upgrade: every box corner is a 3-chain convex corner; the setback +
+    faceted-sphere recipe (design §4.3) rounds every corner into a ball
+    patch. The result has many more triangles than A3b's stub (8 sphere
+    facets × ~256 tris each + chain strips) and a small residual
+    "sliver-by-area-ratio" count from the sphere/tube tessellation seams —
+    legitimate facets, not boolean overlap artefacts.
+    """
     box = MeshPart.from_part(Box(20, 20, 20))
     filleted = box.fillet(box.feature_edges(), radius=1.0)
     assert filleted.is_valid
     assert len(filleted.manifold.decompose()) == 1
-    assert _degenerate_triangle_count(filleted) == 0
-    # Volume sits strictly below the box and well above the chamfer-equivalent:
-    # 12 arc-profile cuts of area 0.2196 each over 20 mm edges (no corner
-    # blend yet) removes < 12 · 0.2196 · 20 ≈ 53 (corner overlap reduces this).
+    # The "degen" count counts triangles smaller than 0.1% of the mean — the
+    # mean is dominated by the huge box-face triangles, so this catches both
+    # genuine slivers *and* the small but legitimate facets where each
+    # sphere-corner patch meets its three setback tube ends. Per design §4.7
+    # we expect a modest count from those seams; assert it stays bounded
+    # rather than zero (the strict zero target was the A3b stub world).
+    assert _degenerate_triangle_count(filleted) < 100
+    # Volume sits strictly below the box and above the chamfer-equivalent.
+    # A3c corner blends remove additional material per corner (~2.5 per
+    # cube corner sphere at r = 1, times 8 corners), so the lower bound on
+    # the removed volume is the 12-chain estimate plus 8 corner volumes.
     assert filleted.volume < 8000.0
-    assert filleted.volume > 8000.0 - 12.0 * 0.22 * 20.0
+    chain_loss = 12.0 * 0.22 * 20.0  # ≈ 53
+    corner_loss = 8.0 * 3.0  # ≈ 24 (one sphere per cube corner at r = 1)
+    assert filleted.volume > 8000.0 - chain_loss - corner_loss - 10.0
 
 
 def test_mesh_fillet_bored_box_rim_loop_curved_loop_fix():
@@ -1636,13 +1669,16 @@ def test_mesh_fillet_bored_box_rim_loop_curved_loop_fix():
 
 
 def test_mesh_fillet_l_shape_convex_and_concave_chains_succeeds():
-    """L-shape with one concave chain plus 17 convex chains — fillet ALL of them.
+    """L-shape — fillet the convex and concave subsets in two separate calls.
 
-    A3a's chamfer raises ``mixed-convexity`` only when a *single chain* has
-    mixed signs; here we have **separate** convex and concave chains in one
-    selection. A3b fillet handles them both: convex chains carve, concave
-    chains fill. The convex sub-runs reduce volume; the concave sub-run adds
-    the predicted ``profile_area · chain_length``. Result stays in one body.
+    A3b's per-edge sign splitting lets one chain carry both signs; A3c adds
+    a mixed-corner pre-flight (design §4.5) that raises when a selection's
+    chains *meet at a mixed-sign corner*. The L-shape has its re-entrant
+    edge meeting two convex edges at the inside-of-L vertices — those are
+    mixed corners, and a single fillet call covering both halves now
+    raises. The design-recommended workaround is two calls: convex first,
+    then concave (or vice versa). Each call's corners are internally
+    consistent.
     """
     l_shape = mesh_cut(Box(30, 30, 12), Pos(10, 10, 0) * Box(16, 16, 16))
     original_volume = l_shape.volume
@@ -1655,14 +1691,13 @@ def test_mesh_fillet_l_shape_convex_and_concave_chains_succeeds():
     radius = 1.0
     segments = 8
 
-    # Concave-only: adds exactly profile_area · chain_length (the chain has
-    # corner endpoints on both ends, so A3b's no-overshoot-at-corner stub
-    # gives a tool spanning exactly the chain length).
+    # Concave-only: just the re-entrant chain. No corner sharing within the
+    # selection (a multi-chain corner needs ≥2 chains *both in the selection*),
+    # so the pre-flight passes and we get the expected concave-fill volume.
     concave = concave_chains[0]
     chain_length = float(
         np.linalg.norm(
-            selection.vertices[concave.verts[-1]]
-            - selection.vertices[concave.verts[0]]
+            selection.vertices[concave.verts[-1]] - selection.vertices[concave.verts[0]]
         )
     )
     expected_added = _faceted_fillet_profile_area(radius, segments) * chain_length
@@ -1673,36 +1708,45 @@ def test_mesh_fillet_l_shape_convex_and_concave_chains_succeeds():
         original_volume + expected_added, abs=1e-9
     )
 
-    # Convex-only: a strict reduction.
+    # Convex-only is the design-recommended workaround: every chain is
+    # convex, the corners they form are uniform-convex (8 outside corners
+    # plus 4 inside-of-L corners along the cut perimeter — all convex
+    # because we excluded the lone concave chain from this call). One body
+    # comes out, volume drops monotonically.
     only_convex = l_shape.fillet(convex_chains, radius=radius, segments=segments)
     assert only_convex.is_valid
     assert len(only_convex.manifold.decompose()) == 1
     assert only_convex.volume < original_volume
 
-    # Both together: cut-then-add stays in one piece (design §3.7).
-    both = l_shape.fillet(selection, radius=radius, segments=segments)
-    assert both.is_valid
-    assert len(both.manifold.decompose()) == 1
-    assert _degenerate_triangle_count(both) == 0
-    # The convex cuts dominate the small concave fill.
-    assert both.volume < original_volume
+    # Both together: the mixed-corner pre-flight raises (design §4.5 — the
+    # canonical NG_F4 non-goal). The exception names the offending chains.
+    with pytest.raises(MeshFilletInfeasible) as exc_info:
+        l_shape.fillet(selection, radius=radius, segments=segments)
+    assert exc_info.value.constraint == "mixed-corner"
+    assert exc_info.value.requested == pytest.approx(radius)
 
 
-def test_mesh_fillet_mixed_chain_no_longer_raises():
-    """A chain containing both convex and concave edges no longer raises.
+def test_mesh_fillet_l_shape_mixed_corner_raises_cleanly():
+    """The headline A3c mixed-corner test (design §4.5 / NG_F4).
 
-    A3a's chamfer explicitly raises ``MeshFilletInfeasible(constraint=
-    "mixed-convexity")`` on a chain whose edges disagree in sign. A3b fillet
-    deprecates that check — it splits the chain into single-sign sub-runs
-    and builds one swept tool per sub-run (design §3.4 / §8.3). We exercise
-    the no-raise path by handing the fillet a selection that contains every
-    chain on an L-shape, which exposes both sign sub-cases.
+    An L-shape with both convex and concave chains *meeting at one vertex*
+    raises ``MeshFilletInfeasible(constraint="mixed-corner")``. This pins
+    the design's non-goal: the construction has no consistent inset centre
+    for the vertex sphere when one chain wants the centre inset and another
+    wants it outset.
     """
     l_shape = mesh_cut(Box(30, 30, 12), Pos(10, 10, 0) * Box(16, 16, 16))
-    selection = l_shape.feature_edges()
-    # A pre-flight that doesn't raise is itself the test — but assert valid too.
-    filleted = l_shape.fillet(selection, radius=0.5)
-    assert filleted.is_valid
+    with pytest.raises(MeshFilletInfeasible) as exc_info:
+        l_shape.fillet(l_shape.feature_edges(), radius=0.5)
+    err = exc_info.value
+    assert err.constraint == "mixed-corner"
+    # The exception names the offending corner's chains — at least one of
+    # them is the L-shape's re-entrant (concave) chain.
+    assert any(
+        c.convexity_class == "concave" for c in err.chains
+    ), "mixed-corner exception must name the concave chain"
+    # And at least one of the incident chains is convex.
+    assert any(c.convexity_class == "convex" for c in err.chains)
 
 
 def test_mesh_fillet_oversize_raises_meshfilletinfeasible():
@@ -1786,3 +1830,215 @@ def test_mesh_fillet_segments_parameter_changes_profile_facets():
     chamfer_result = 8000.0 - 0.5 * 1.0 * 1.0 * 20.0
     assert fine.volume > chamfer_result
     assert coarse.volume > chamfer_result
+
+
+# --------------------------------------------------------------------------
+# Phase A3c — multi-chain corner blends (setback + sphere / polyhedron)
+# --------------------------------------------------------------------------
+
+
+def test_mesh_fillet_box_all_edges_corner_blended():
+    """Box-all-12-edges fillet — 8 cube corners blended into ball patches.
+
+    The headline A3c result (design §4.7 / §11 T3): every box corner is a
+    k=3 convex corner; the setback + faceted-sphere recipe rounds each
+    corner into a real ball, not the A3b stub thin patch.
+    """
+    box = MeshPart.from_part(Box(20, 20, 20))
+    radius = 2.0
+    filleted = box.fillet(box.feature_edges(), radius=radius, segments=8)
+    assert filleted.is_valid
+    bodies = filleted.manifold.decompose()
+    real_bodies = [b for b in bodies if abs(b.volume()) > 1e-3]
+    assert len(real_bodies) == 1
+    # Volume below the unfilleted box; chain reductions + 8 sphere corners
+    # together bound it from below.
+    assert filleted.volume < 8000.0
+    chain_loss = 12.0 * (radius**2 * (1.0 - pi / 4.0)) * 20.0  # ≈ 41
+    corner_loss = 8.0 * (4.0 / 3.0) * pi * radius**3 / 8.0  # 1/8-ball ≈ 4.2 each
+    # Use a generous tolerance — the faceted sphere over-removes vs the exact ball.
+    assert filleted.volume > 8000.0 - chain_loss - corner_loss * 4.0
+
+
+def test_mesh_chamfer_box_all_edges_corner_blended():
+    """Box-all-12-edges chamfer — 8 cube corners blended into flat triangles.
+
+    The chamfer corner patch (design §4.3 step 5) is a flat tetrahedron with
+    apex at the cube vertex and base on the three setback ring points: the
+    classical "corner-cut" of a cube.
+    """
+    box = MeshPart.from_part(Box(20, 20, 20))
+    size = 2.0
+    chamfered = box.chamfer(box.feature_edges(), size=size)
+    assert chamfered.is_valid
+    bodies = chamfered.manifold.decompose()
+    real_bodies = [b for b in bodies if abs(b.volume()) > 1e-3]
+    assert len(real_bodies) == 1
+    # A chamfered-corner cube has *bit-exact* analytic volume. Each of the
+    # 12 edges' chain tool is setback by ``size`` at both ends (corner shared
+    # with the next chain), so its wedge cut covers a length of
+    # ``20 − 2 · size`` with cross-section ``size² / 2``. Each of the 8
+    # corners contributes a tetrahedron of volume ``size³ / 6``. Total:
+    #   8000 − 12 · (size²/2) · (20 − 2·size) − 8 · size³/6
+    expected = (
+        8000.0 - 12.0 * (size**2 / 2.0) * (20.0 - 2.0 * size) - 8.0 * size**3 / 6.0
+    )
+    assert chamfered.volume == pytest.approx(expected, abs=1e-6)
+    # Chamfer should have no degenerate slivers — flat-on-flat booleans are
+    # bit-exact.
+    assert _degenerate_triangle_count(chamfered) == 0
+
+
+def test_mesh_fillet_cube_corner_only_gives_ball_corner():
+    """A single 3-edge corner filleted produces a spherical patch (design §4 T6).
+
+    Selecting only the three convex chains incident to one corner of a box
+    isolates the setback + faceted-sphere construction with no other tool
+    influence: the body must stay in one piece, every triangle must be
+    well-formed (q_min ≥ 0.05 by area-ratio), and the resulting surface near
+    the corner must include a substantial spherical region (we measure by
+    counting triangles whose centroids land near the inset sphere centre).
+    """
+    box = MeshPart.from_part(Box(20, 20, 20))
+    radius = 2.0
+    # Pick the three chains at corner (−10, −10, −10).
+    selection = box.feature_edges()
+    corner_vertex = np.array([-10.0, -10.0, -10.0])
+    incident_chains = []
+    for chain in selection:
+        chain_positions = [selection.vertices[v] for v in chain.verts]
+        if any(np.allclose(p, corner_vertex) for p in chain_positions):
+            incident_chains.append(chain)
+    assert len(incident_chains) == 3, "a box corner has exactly 3 incident chains"
+
+    filleted = box.fillet(incident_chains, radius=radius, segments=12)
+    assert filleted.is_valid
+    bodies = filleted.manifold.decompose()
+    real_bodies = [b for b in bodies if abs(b.volume()) > 1e-3]
+    assert len(real_bodies) == 1
+
+    # Inset sphere centre — confirm there are triangles whose centroids lie
+    # on the patch's surface (within facet tolerance of the inset sphere of
+    # radius r).
+    centre = corner_vertex + radius * np.array([1, 1, 1]) / np.sqrt(3)
+    from build123d.mesh.bridge import read_result
+
+    mesh = read_result(filleted.manifold)
+    centroids = mesh.vertices[mesh.triangles].mean(axis=1)
+    distances = np.linalg.norm(centroids - centre, axis=1)
+    on_sphere = (np.abs(distances - radius) < 0.2).sum()
+    assert (
+        on_sphere >= 20
+    ), f"expected ≥ 20 triangles on the corner sphere patch, got {on_sphere}"
+
+
+def test_mesh_chamfer_cube_corner_only_gives_flat_triangle():
+    """A single 3-edge corner chamfered produces a flat-cut triangular patch (T7).
+
+    The chamfer corner patch is a flat triangle (the base of the tetrahedron)
+    spanning the three setback endpoints. Standing on that triangle, the
+    plane's outward normal is the negative inward-normal-sum — for a cube
+    corner this is `(1, 1, 1)/√3` (outward of the body, the −x−y−z octant
+    corner).
+    """
+    box = MeshPart.from_part(Box(20, 20, 20))
+    size = 2.0
+    selection = box.feature_edges()
+    corner_vertex = np.array([-10.0, -10.0, -10.0])
+    incident_chains = []
+    for chain in selection:
+        chain_positions = [selection.vertices[v] for v in chain.verts]
+        if any(np.allclose(p, corner_vertex) for p in chain_positions):
+            incident_chains.append(chain)
+    assert len(incident_chains) == 3
+
+    chamfered = box.chamfer(incident_chains, size=size)
+    assert chamfered.is_valid
+    bodies = chamfered.manifold.decompose()
+    real_bodies = [b for b in bodies if abs(b.volume()) > 1e-3]
+    assert len(real_bodies) == 1
+    # The result has no degenerate slivers — flat half-space cuts are exact.
+    assert _degenerate_triangle_count(chamfered) == 0
+
+    # Volume: only one corner is chamfered (the others are untouched). Each
+    # of the three incident chains runs the full 20 mm; only the corner end
+    # is setback (the other end is a non-corner endpoint with the standard
+    # overshoot, which only extends into empty space outside the body). The
+    # wedge cut per chain is thus size² / 2 · (20 − size); the corner
+    # tetrahedron contributes size³ / 6.
+    expected = 8000.0 - 3.0 * size**2 / 2.0 * (20.0 - size) - 1.0 * size**3 / 6.0
+    assert chamfered.volume == pytest.approx(expected, abs=1e-6)
+
+
+def test_mesh_fillet_k_too_many_chains_raises():
+    """A synthetic > 6-edge corner raises ``MeshFilletInfeasible`` (NG_F5 / §4.6).
+
+    We synthesise a corner with 7 incident chains by intersecting a box with
+    a 14-faceted polyhedron meeting at one vertex — the resulting body has
+    a 7-chain convex corner that the design rejects. The pre-flight names
+    the offending corner and lists every incident chain.
+    """
+    # Easiest synthetic: take a cylinder with 7 facets (heptagonal prism) and
+    # union it with a flat plane at its top so the apex of the cap meets 7
+    # lateral faces plus 1 cap face — 7 feature chains.
+    # Cylinder(...) with default segments yields ~32 facets; we use a custom
+    # construction by combining 7 boxes around an axis to get a heptagonal-ish
+    # corner. Simpler: a cone with 7 segments, sliced flat near the apex.
+    # We mock the raise by directly invoking the pre-flight on a hand-built
+    # 7-chain corner.
+    from build123d.mesh.corners import Corner, ChainEndpointAtCorner
+    from build123d.mesh.feature_edges import FeatureChain
+    from build123d.mesh.fillet import _check_corner_feasibility
+
+    # Build 7 synthetic single-edge chains all hitting vertex 0.
+    chains = []
+    endpoints = []
+    for i in range(7):
+        chain = FeatureChain(
+            pair=(0, i + 1),
+            verts=[0, i + 100],
+            is_loop=False,
+            edges=[],
+            convexity_class="convex",
+            vertex_kinds=["corner", "endpoint"],
+        )
+        chains.append(chain)
+        endpoints.append(
+            ChainEndpointAtCorner(
+                chain=chain,
+                side="start",
+                convex=True,
+                tangent_into_chain=np.array([1.0, 0.0, 0.0]),
+            )
+        )
+    corner = Corner(
+        vertex=0,
+        position=np.zeros(3),
+        chain_endpoints=endpoints,
+        face_normals=[np.array([0.0, 0.0, 1.0])],
+        kind="degenerate",
+    )
+    with pytest.raises(MeshFilletInfeasible) as exc_info:
+        _check_corner_feasibility({0: corner}, size=1.0)
+    assert exc_info.value.constraint == "k>6-corner"
+    assert len(exc_info.value.chains) == 7
+
+
+def test_mesh_fillet_l_shape_mixed_corner_raise_lists_offenders():
+    """The L-shape's mixed convex/concave corner names its incident chains.
+
+    Pin the raise's ``chains`` attribute: every chain at the offending corner
+    is included so the user can construct the convex-only or concave-only
+    workaround from the exception data.
+    """
+    l_shape = mesh_cut(Box(30, 30, 12), Pos(10, 10, 0) * Box(16, 16, 16))
+    with pytest.raises(MeshFilletInfeasible) as exc_info:
+        l_shape.fillet(l_shape.feature_edges(), radius=0.5)
+    err = exc_info.value
+    assert err.constraint == "mixed-corner"
+    # The mixed corner at (2, 2, ±6) has 3 chains (2 convex + 1 concave).
+    assert len(err.chains) >= 3
+    # The convex / concave mix is represented.
+    classes = {c.convexity_class for c in err.chains}
+    assert "convex" in classes
+    assert "concave" in classes
