@@ -1,5 +1,7 @@
 # 09 — CadQuery ddocs ↔ build123d ddocs Cross-Comparison
 
+> **Note (2026-05-23):** This is the *pre-implementation* cross-comparison. See `13-cadquery-implementation-comparison.md` for the implementation-stage comparison once both efforts shipped backends.
+
 > Cross-comparison doc. A **parallel research effort** analyzed the same two goals
 > for **CadQuery** that this corpus analyzed for **build123d**. This document
 > ingests the CadQuery corpus (`/Users/ochafik/github/cadquery/ddocs/`), maps it
