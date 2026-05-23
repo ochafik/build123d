@@ -689,12 +689,23 @@ class MeshPart:
         if reconstruct and self._side_map:
             result_mesh = read_result(self._manifold)
             recovered = recover_brep(result_mesh, self._side_map)
-            if recovered.solid is not None and isinstance(
-                recovered.solid, (Solid, Compound)
+            if (
+                recovered.solid is not None
+                and isinstance(recovered.solid, (Solid, Compound))
+                and recovered.is_valid
             ):
                 return recovered.solid
-            # Recovery failed to produce a closed solid; fall through to the
-            # faceted bake rather than returning a bare Shell.
+            # Recovery did not yield a valid closed solid. Two common reasons:
+            #   * the result type was a bare Shell (no closed solid built); or
+            #   * mixed-provenance (``n_unseeded_faceted > 0``) — exact-planar
+            #     faces and faceted-unseeded patches don't share TopoDS edges
+            #     at the seam, so the sewn solid fails ``BRepCheck`` even
+            #     though every face is present and the volume is approximately
+            #     correct.
+            # Either way, falling through to the faceted bake gives the caller
+            # a guaranteed-valid Solid. Callers that want the partially-exact
+            # recovered body can invoke ``recover_brep()`` directly and inspect
+            # the ``RecoveryResult``.
 
         vertices, triangles = self.to_arrays()
         solid = Solid.from_mesh(vertices, triangles, fix=False)
