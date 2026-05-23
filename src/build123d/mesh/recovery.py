@@ -252,9 +252,16 @@ class RecoveryResult:
             :class:`~build123d.Solid` for a single body, a
             :class:`~build123d.Compound` for several disjoint bodies, a
             :class:`~build123d.Shell` if no closed solid could be made.
-        recovered_faces (list[RecoveredFace]): one record per seeded id.
+        recovered_faces (list[RecoveredFace]): one record per face_id in the
+            result mesh (seeded *or* unseeded).
         n_exact_planar (int): number of exact planar faces built.
-        n_faceted_curved (int): number of curved ids kept faceted.
+        n_faceted_curved (int): number of curved seeded ids kept faceted.
+        n_unseeded_faceted (int): number of result face_ids that had no
+            side-map entry — recovered as anonymous faceted patches (one flat
+            ``TopoDS_Face`` per triangle). Non-zero when the input MeshPart
+            mixed seeded operands with hull / Minkowski / level_set /
+            ``from_mesh`` / imported-STL geometry that synthesised new shell
+            facets without analytic provenance.
         is_valid (bool): whether the recovered solid passes ``is_valid``.
         volume (float): the recovered body's volume.
     """
@@ -263,6 +270,7 @@ class RecoveryResult:
     recovered_faces: list[RecoveredFace] = field(default_factory=list)
     n_exact_planar: int = 0
     n_faceted_curved: int = 0
+    n_unseeded_faceted: int = 0
     is_valid: bool = False
     volume: float = 0.0
 
@@ -427,13 +435,29 @@ def _faceted_patch(result: ResultMesh, face_id: int) -> list[Face]:
 def recover_brep(result: ResultMesh, side_map: SideMap) -> RecoveryResult:
     """Rebuild a build123d body from a seeded boolean result and its side-map.
 
-    Planar seeded ids become exact analytic faces on the known ``Geom_Plane``;
-    curved ids are kept faceted (identity preserved, geometry approximate). The
-    faces are sewn into a :class:`~build123d.Solid`, or a
+    Three handlings, one per result face_id:
+
+    * **planar seeded ids** become exact analytic faces on the known
+      ``Geom_Plane`` (the §16.8 payoff — bit-exact, filletable);
+    * **curved seeded ids** are kept faceted (identity preserved, geometry
+      approximate — Tier C re-trim is not yet implemented);
+    * **unseeded ids** (face_ids present in the result but missing from
+      ``side_map`` — produced when the input MeshPart mixes seeded operands
+      with ``hull`` / ``minkowski`` / ``level_set`` / ``from_mesh`` /
+      imported-STL geometry that synthesises new shell facets without
+      analytic provenance) are rendered as **anonymous faceted patches** —
+      one flat ``TopoDS_Face`` per triangle, no surface claim. Without this,
+      these ids would be silently dropped and the result would be missing
+      whole regions of the input mesh.
+
+    The faces are sewn into a :class:`~build123d.Solid`, or a
     :class:`~build123d.Compound` when the result is several disjoint bodies.
 
     For an all-planar CSG result this is exact: bit-exact volume, analytic
     planar faces, and a ``fillet()`` / ``chamfer()`` works on the result.
+    For a mixed seeded+unseeded result the seeded portion is still exact;
+    the unseeded portion is faceted but present (see
+    :attr:`RecoveryResult.n_unseeded_faceted` to detect this).
 
     Args:
         result (ResultMesh): the boolean result mesh, with seeded ``face_id``.
@@ -455,11 +479,32 @@ def recover_brep(result: ResultMesh, side_map: SideMap) -> RecoveryResult:
     sewing = BRepBuilderAPI_Sewing(_SEW_TOLERANCE)
     n_exact_planar = 0
     n_faceted_curved = 0
+    n_unseeded_faceted = 0
 
     for face_id in result.distinct_ids:
         if face_id not in side_map:
-            # A correctly-seeded boolean creates no genuinely new ids; guard
-            # anyway against any stray triangle without provenance.
+            # Unseeded id — from hull / Minkowski / level_set / from_mesh /
+            # imported-STL operands mixed into the boolean result, or any
+            # constructive op that synthesises new shell facets without
+            # analytic provenance. No known surface to claim, so render as
+            # an anonymous faceted patch (one flat ``TopoDS_Face`` per
+            # triangle) — same shape as a curved-residue group, just without
+            # a ``surface_kind``. Preserves the full geometry of the result
+            # instead of silently dropping it.
+            patch = _faceted_patch(result, face_id)
+            for face in patch:
+                sewing.Add(face.wrapped)
+            n_unseeded_faceted += 1
+            recovered_faces.append(
+                RecoveredFace(
+                    face_id,
+                    "UNSEEDED-faceted",
+                    patch,
+                    False,
+                    f"faceted: {len(patch)} triangles, no provenance "
+                    "(hull / Minkowski / level_set / from_mesh)",
+                )
+            )
             continue
         record = side_map[face_id]
         if record.is_planar:
@@ -543,6 +588,7 @@ def recover_brep(result: ResultMesh, side_map: SideMap) -> RecoveryResult:
         recovered_faces=recovered_faces,
         n_exact_planar=n_exact_planar,
         n_faceted_curved=n_faceted_curved,
+        n_unseeded_faceted=n_unseeded_faceted,
         is_valid=is_valid,
         volume=volume,
     )

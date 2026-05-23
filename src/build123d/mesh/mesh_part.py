@@ -656,9 +656,15 @@ class MeshPart:
 
         * **faceID-grouped reconstruction** (the default, when a non-empty
           side-map is present): output triangles are grouped by their seeded
-          ``face_id``; planar groups rebuild **exact analytic faces** on the
-          known ``Geom_Plane``; curved groups are recovered faceted. For an
-          all-planar CSG result this yields a bit-exact, *filletable* B-rep.
+          ``face_id``; planar seeded groups rebuild **exact analytic faces**
+          on the known ``Geom_Plane``; curved seeded groups are recovered
+          faceted; **unseeded** ids (from ``hull`` / ``minkowski`` /
+          ``level_set`` / ``from_mesh`` operands mixed in) are recovered as
+          anonymous faceted patches. For an all-planar CSG result this
+          yields a bit-exact, *filletable* B-rep; for a mixed-provenance
+          result the seeded portion stays exact and the unseeded portion is
+          faceted but present (see
+          :attr:`~build123d.mesh.recovery.RecoveryResult.n_unseeded_faceted`).
         * **faceted bake** (the fallback, or when ``reconstruct=False``): direct
           shell assembly — one planar face per triangle, no analytic surfaces.
 
