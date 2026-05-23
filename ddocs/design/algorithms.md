@@ -111,6 +111,16 @@ The deliverable touches three areas:
 47. `_check_corner_feasibility` — mixed/k>6 raise (P3)
 48. `_drop_zero_volume_artifacts` — precision-pinch post-pass
 
+### J. A4 — Variable radius and skip mode
+
+49. `RadiusInput` / `_normalise_radius` — scalar/callable unification
+50. `_chain_radius_samples` / `_chain_max_size` — per-vertex sampling
+51. `SkippedItem` / `FilletReport` — skip-mode return shape
+52. `_classify_corner_problem` — raise-free corner classifier
+53. `_filter_corners_for_skip` — skip-mode corner filter
+54. `_corner_size` — per-corner radius for variable-radius corners
+55. `MeshPart.last_fillet_report` and the `on_infeasible` modes
+
 ---
 
 ## A. Core additions to build123d
@@ -2344,6 +2354,165 @@ return m3d.Manifold.batch_boolean(real_components, m3d.OpType.Add)
 (`test_mesh_fillet_box_all_edges_corner_blended`, etc.) — they assert the
 output is a single body, which is only true if the precision-pinch
 artefacts are dropped.
+
+---
+
+## J. A4 — Variable radius and skip mode
+
+A4 polishes the mesh-fillet pipeline along two orthogonal axes — radius can
+vary along a chain, and infeasible chains/corners can be dropped instead of
+raising — without changing the geometry A3a/A3b/A3c build. The scalar-radius
+and `on_infeasible="raise"` paths are kept as default *specialisations* of
+the general machinery: a scalar radius is wrapped in a constant function so
+every per-vertex profile query goes through the same code, and `"raise"`
+reuses the same classifier the skip path consumes.
+
+### J.49 — `RadiusInput` and `_normalise_radius`
+
+`fillet.py:301`
+
+The public `radius` (fillet) / `size` (chamfer) argument is
+
+```python
+RadiusInput = Union[float, int, RadiusFunc]
+RadiusFunc  = Callable[["FeatureChain", int], float]
+```
+
+— a positive scalar **or** a callable that, given a chain and the
+vertex-index-into-`chain.verts`, returns the size at that vertex.
+`_normalise_radius` collapses both into the same internal pair
+`(scalar_or_none, per_vertex_fn)`: for a scalar input it returns
+`(scalar, λ chain index: scalar)` (a constant function); for a callable it
+returns `(None, λ wrapped)` (no single representative; the wrapper coerces
+to `float`). Every downstream profile query goes through the function, so
+the scalar path is a *constant-function specialisation* of the variable
+path — one code path, two input shapes.
+
+The scalar input is validated `> 0` immediately; callables are validated
+*per vertex* in §J.50. Bad type → `TypeError`; the operation name is
+embedded in both errors for clarity.
+
+### J.50 — `_chain_radius_samples` / `_chain_max_size`
+
+`fillet.py:351`, `:384`
+
+`_chain_radius_samples(chain, per_vertex_fn)` calls the per-vertex function
+at every vertex of the chain, validates each sample `> 0` (a non-positive
+return raises immediately — P3, never silently mis-answer), and returns an
+`np.ndarray((len(chain.verts),), float64)`. Downstream profile builders
+(`_vertex_frames`, prism / arc constructors) index this array by
+chain-local vertex index — the same index the user's callable received —
+so the size that shapes the swept tool at vertex `i` is the size the
+callable declared at `i`.
+
+`_chain_max_size` is the conservative chain-wide threshold: every
+feasibility check (half-thickness, chain-length, corner setback) measures
+against the chain's *largest* sample so that any vertex's actual radius is
+always within the checked envelope.
+
+### J.51 — `SkippedItem` and `FilletReport`
+
+`fillet.py:218`, `:254`
+
+The skip-mode return shape:
+
+```python
+@dataclass
+class SkippedItem:
+    chains:     list[FeatureChain]   # the dropped chains
+    constraint: str                  # "half-thickness" | "chain-length" |
+                                     # "mixed-convexity" | "mixed-corner" |
+                                     # "k>6-corner" | "degenerate-tool"
+    requested:  float                # at the failing vertex for variable radius
+    measured:   float = 0.0          # 0.0 when the constraint has no number
+    vertex:     Optional[int] = None # host-mesh vertex for chain-level half-thickness
+    message:    str = ""             # same diagnostic a raise would have carried
+
+@dataclass
+class FilletReport:
+    operation:       str                              # "fillet" | "chamfer"
+    requested:       Optional[float] = None           # None for callable input
+    skipped_chains:  list[SkippedItem] = ...
+    skipped_corners: list[SkippedItem] = ...
+    def __bool__(self):  return bool(self.skipped_chains or self.skipped_corners)
+    @property
+    def total_skipped(self) -> int: ...
+```
+
+`FilletReport.__bool__` returns `False` for an empty report. The dispatcher
+uses that to collapse "no skips" to `None` when attaching the report to the
+result `MeshPart`, so end-user code can `if result.last_fillet_report:` and
+inspect a populated report only when something was actually dropped.
+
+Each `SkippedItem.message` is the same human diagnostic a
+`MeshFilletInfeasible` would have carried — same template, same numbers —
+so a user reading a skip-mode log sees exactly the message that a raise
+would have produced.
+
+### J.52 — `_classify_corner_problem` — the raise/skip-shared classifier
+
+`fillet.py:802`
+
+Pure classifier, no raise: returns `(constraint, message, chains)` or
+`None`. The A4 refactor: A3c's `_check_corner_feasibility` is now a thin
+loop over `_classify_corner_problem` raising on each non-`None`; the
+skip-mode counterpart loops the same predicate and appends a `SkippedItem`.
+One predicate, two reactions — `raise` and `skip` are guaranteed to agree
+on *what* is infeasible, only differing on what to do about it. Classifies
+`mixed-corner`, `k>6-corner`; everything else passes.
+
+### J.53 — `_filter_corners_for_skip`
+
+`fillet.py:881`
+
+The skip-mode corner pre-flight. Walks every corner, runs
+`_classify_corner_problem`, and for each bad corner: appends a
+`SkippedItem` to `report.skipped_corners` (with `vertex` set to the
+corner's host index and `chains` listing every incident chain), logs a
+warning, and drops the corner from the returned dict. The surviving
+corners feed the patch builders unchanged.
+
+### J.54 — `_corner_size`
+
+`fillet.py:1332`
+
+For variable-radius corners, picks the patch radius from the incident
+chains' per-vertex sizes. For each chain endpoint at the corner, looks up
+that endpoint's local size from the chain's resampled radii (skipped
+chains are absent — they were filtered earlier). The patch radius is the
+**max** across the endpoint samples (the strictest setback the incident
+chains need — design §4.3 step 2's `s = r` generalised to per-corner).
+
+When *every* incident chain was skipped, returns `None` and the caller
+drops the corner: building a sphere/pyramid patch with no chain tubes
+touching it would leave a freestanding bump unioned into the body. This is
+the variable-radius / skip-mode interlock the design's §4.3 implicitly
+assumes.
+
+### J.55 — `MeshPart.last_fillet_report` and the `on_infeasible` modes
+
+`mesh_part.py` slot `_last_fillet_report`; property `last_fillet_report`.
+
+The result `MeshPart` of every `.fillet()` / `.chamfer()` call carries
+`last_fillet_report` — a populated `FilletReport` when skip-mode dropped
+anything, `None` otherwise. The two `on_infeasible` modes:
+
+- `"raise"` (default, P3): any chain/corner that fails the pre-flight
+  raises `MeshFilletInfeasible` immediately; the result `MeshPart` is
+  never built.
+- `"skip"`: every failing chain/corner is recorded on the report and
+  dropped from the geometry pipeline; the result is the operation applied
+  to the surviving subset. If everything fails, the result equals the
+  input — a no-op carrying a populated report.
+
+`"clamp"` is **rejected** at the dispatcher with `ValueError` — silently
+shrinking the radius to fit would be a P3-class silent wrong answer. The
+two surfaces (method and free function) return the same `MeshPart` shape
+with the report attached to the result, so call sites are interchangeable.
+
+**Tests.** `test_mesh_fillet_variable_radius_*`, `test_mesh_chamfer_skip_*`,
+`test_mesh_fillet_skip_*`, `test_mesh_*_clamp_mode_rejected`,
+`test_fillet_report_*` in `tests/test_mesh.py`.
 
 ---
 
