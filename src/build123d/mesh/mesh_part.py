@@ -76,6 +76,8 @@ from .recovery import recover_brep
 if TYPE_CHECKING:  # pragma: no cover
     from os import PathLike
 
+    from .feature_edges import FeatureChainSelection
+
 # A free-function / operator operand: either a build123d shape or a MeshPart.
 MeshOperand = Union[Shape, "MeshPart"]
 
@@ -97,7 +99,7 @@ class MeshPart:
     carries an empty side-map and bakes to a faceted solid.
     """
 
-    __slots__ = ("_manifold", "_side_map")
+    __slots__ = ("_manifold", "_side_map", "_feature_edges_cache")
 
     # ---- Constructors ----
 
@@ -122,6 +124,7 @@ class MeshPart:
             )
         self._manifold = manifold
         self._side_map = side_map if side_map is not None else SideMap()
+        self._feature_edges_cache: Optional["FeatureChainSelection"] = None
 
     @classmethod
     def from_part(
@@ -777,6 +780,104 @@ class MeshPart:
         for recovered in recovery.recovered_faces:
             faces.extend(recovered.faces)
         return ShapeList(faces)
+
+    # ---- Feature-edge chain selection (Phase A3a) ----
+
+    def feature_edges(self) -> "FeatureChainSelection":
+        """Return this mesh body's full faceID feature-chain graph.
+
+        Builds the feature-edge graph from this mesh's seeded ``face_id``s and
+        groups feature edges into ordered chains/loops keyed by their
+        ``(lo, hi)`` faceID pair (design §1.3). The returned
+        :class:`~build123d.mesh.FeatureChainSelection` is the selection unit
+        consumed by :meth:`chamfer` (and, in later phases, ``.fillet``); its
+        chainable filters (``.convex()``, ``.between(source_a, source_b)``,
+        ``.closed()``, …) let users name edges without seeing a triangle index.
+
+        Every chain carries its ``convexity_class`` and per-vertex
+        ``vertex_kinds`` tags so the chamfer pre-flight can refuse infeasible
+        configurations loudly (P3 — see
+        :class:`~build123d.mesh.MeshFilletInfeasible`).
+
+        Returns:
+            FeatureChainSelection: a fluent collection of every feature chain
+            on this mesh.
+
+        Raises:
+            ValueError: if this MeshPart is empty.
+        """
+        # pylint: disable=import-outside-toplevel
+        from .feature_edges import FeatureChainSelection, build_feature_graph
+
+        if self._manifold.is_empty():
+            raise ValueError("Cannot extract feature edges from an empty MeshPart")
+        if self._feature_edges_cache is not None:
+            return self._feature_edges_cache
+        result_mesh = read_result(self._manifold)
+        chains = build_feature_graph(
+            result_mesh.vertices, result_mesh.triangles, result_mesh.face_id
+        )
+        selection = FeatureChainSelection(
+            chains,
+            result_mesh.vertices,
+            result_mesh.triangles,
+            result_mesh.face_id,
+            self._side_map,
+        )
+        self._feature_edges_cache = selection
+        return selection
+
+    def chamfer(
+        self,
+        edges: object,
+        size: float,
+        *,
+        on_infeasible: str = "raise",
+    ) -> "MeshPart":
+        """Apply a faceted chamfer of ``size`` to ``edges`` (Phase A3a).
+
+        Method form of :func:`build123d.mesh.mesh_chamfer`. The selection
+        argument follows design §8.1: a :class:`FeatureChainSelection` (from
+        :meth:`feature_edges`), a single :class:`FeatureChain`, or any iterable
+        of :class:`FeatureChain`.
+
+        A3a's profile is a flat triangular wedge with both legs of length
+        ``size``; ``size`` is the chamfer leg length on each adjacent face
+        (matching native :meth:`Part.chamfer`'s ``length`` semantics). The
+        construction is one **swept tool per chain** (design §3) — convex
+        chains have their wedge subtracted, concave chains have it added; both
+        directions are batched into a single ``manifold3d`` boolean. Multi-chain
+        corner vertices and over-size requests **raise**
+        :class:`~build123d.mesh.MeshFilletInfeasible` (P3 — never silently
+        clamp).
+
+        Args:
+            edges: chains to chamfer — a
+                :class:`~build123d.mesh.FeatureChainSelection`, a single
+                :class:`~build123d.mesh.FeatureChain`, or any iterable of
+                :class:`~build123d.mesh.FeatureChain`. Chains must originate
+                from this mesh's own chain graph.
+            size (float): chamfer leg length (> 0).
+            on_infeasible (str): A3a only supports ``"raise"`` (the default).
+                Other modes (``"skip"``) land in A4.
+
+        Returns:
+            MeshPart: the chamfered mesh body.
+
+        Raises:
+            ValueError: if ``size <= 0`` or this MeshPart is empty.
+            MeshFilletInfeasible: if any feasibility constraint fails — see
+                :class:`~build123d.mesh.MeshFilletInfeasible`.
+            TypeError: if ``edges`` is none of the accepted shapes.
+        """
+        # pylint: disable=import-outside-toplevel
+        from .fillet import mesh_chamfer
+
+        return mesh_chamfer(
+            self, edges, size, on_infeasible=on_infeasible  # type: ignore[arg-type]
+        )
+
+    # ---- Source-filtered selection ----
 
     def faces_from(self, source: str) -> ShapeList[Face]:
         """Return the recovered faces that originate from input shape ``source``.

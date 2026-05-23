@@ -77,6 +77,12 @@ except ImportError as exc:  # pragma: no cover - exercised only without the extr
 # that a missing extra raises the actionable ImportError before these run.
 # pylint: disable=wrong-import-position
 from .bridge import FaceRecord, ResultMesh, SideMap, read_result, shape_to_manifold
+from .feature_edges import (
+    FeatureChain,
+    FeatureChainSelection,
+    FeatureEdge,
+)
+from .fillet import MeshFilletInfeasible, mesh_chamfer
 from .mesh_part import MeshPart, mesh_cut, mesh_fuse, mesh_intersect
 from .ops import (
     mesh_extrude,
@@ -92,12 +98,17 @@ from .sketch2d import to_cross_section
 
 __all__ = [
     "FaceRecord",
+    "FeatureChain",
+    "FeatureChainSelection",
+    "FeatureEdge",
+    "MeshFilletInfeasible",
     "MeshPart",
     "RecoveredFace",
     "RecoveryResult",
     "ResultMesh",
     "SideMap",
     "is_available",
+    "mesh_chamfer",
     "mesh_cut",
     "mesh_extrude",
     "mesh_fuse",

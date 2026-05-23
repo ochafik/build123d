@@ -62,9 +62,13 @@ manifold3d = pytest.importorskip("manifold3d")
 
 # pylint: disable=wrong-import-position
 from build123d.mesh import (  # noqa: E402
+    FeatureChain,
+    FeatureChainSelection,
+    MeshFilletInfeasible,
     MeshPart,
     SideMap,
     is_available,
+    mesh_chamfer,
     mesh_cut,
     mesh_extrude,
     mesh_fuse,
@@ -1317,3 +1321,218 @@ def test_mesh_shell_inward_collapse_raises_clearly():
     base = MeshPart.box(2.0, 2.0, 2.0)
     with pytest.raises(ValueError, match="empty manifold|invalid manifold"):
         mesh_shell(base, 5.0, sphere_segments=12)
+
+
+# --------------------------------------------------------------------------
+# Phase A3a — feature-edge selection
+# --------------------------------------------------------------------------
+
+
+def _triangle_areas(mesh_part: MeshPart) -> np.ndarray:
+    """Return the per-triangle areas of a MeshPart's manifold."""
+    vertices, triangles = mesh_part.to_arrays()
+    corners = vertices[triangles]
+    cross = np.cross(corners[:, 1] - corners[:, 0], corners[:, 2] - corners[:, 0])
+    return 0.5 * np.linalg.norm(cross, axis=1)
+
+
+def _degenerate_triangle_count(mesh_part: MeshPart) -> int:
+    """Count near-zero-area sliver triangles (p10's definition: < 0.1 % of mean)."""
+    areas = _triangle_areas(mesh_part)
+    if len(areas) == 0:
+        return 0
+    threshold = max(float(areas.mean()) * 1e-3, 1e-12)
+    return int((areas < threshold).sum())
+
+
+def test_feature_edges_box_has_12_chains():
+    """A box: 12 feature edges, 12 distinct faceID-pair chains, all convex."""
+    box = MeshPart.from_part(Box(20, 20, 20))
+    selection = box.feature_edges()
+    assert isinstance(selection, FeatureChainSelection)
+    assert len(selection) == 12
+    for chain in selection:
+        assert isinstance(chain, FeatureChain)
+        assert chain.convexity_class == "convex"
+        assert len(chain.edges) == 1
+        # Box edges have their endpoints at the 8 corner vertices, each shared
+        # by 3 chains of different (lo, hi) pairs — every endpoint is a corner.
+        assert all(kind == "corner" for kind in chain.vertex_kinds)
+    convex_only = selection.convex()
+    assert len(convex_only) == 12
+    assert len(selection.concave()) == 0
+
+
+def test_feature_edges_bored_box_has_two_closed_loops():
+    """A box with a cylindrical bore yields two ~63-edge closed loops."""
+    bored = mesh_cut(Box(40, 40, 10), Cylinder(8, 14))
+    selection = bored.feature_edges()
+    loops = list(selection.closed())
+    # 2 bore-rim loops + 4 outer-box loops would be the upper bound; we expect
+    # at least the two bore rims (≥ 63 verts each).
+    big_loops = [c for c in loops if len(c.verts) >= 20]
+    assert len(big_loops) == 2
+    for loop in big_loops:
+        assert loop.is_loop
+        assert loop.convexity_class == "convex"
+
+
+def test_feature_edges_caches_per_meshpart():
+    """Repeated MeshPart.feature_edges() returns the same selection."""
+    box = MeshPart.from_part(Box(10, 10, 10))
+    first = box.feature_edges()
+    second = box.feature_edges()
+    assert first is second
+
+
+# --------------------------------------------------------------------------
+# Phase A3a — chamfer correctness
+# --------------------------------------------------------------------------
+
+
+def test_mesh_chamfer_box_single_edge_is_bit_exact():
+    """Chamfering ONE box edge removes exactly one triangular prism."""
+    box = MeshPart.from_part(Box(20, 20, 20))
+    chain = box.feature_edges()[0]
+    chamfered = box.chamfer(chain, size=4.0)
+    assert chamfered.is_valid
+    # 4 mm right-triangle chamfer over a 20 mm edge removes 0.5 * 4 * 4 * 20 = 160
+    assert chamfered.volume == pytest.approx(8000.0 - 160.0, abs=1e-6)
+    # One body, no slivers
+    assert len(chamfered.manifold.decompose()) == 1
+    assert _degenerate_triangle_count(chamfered) == 0
+
+
+def test_mesh_chamfer_volume_between_native_and_original():
+    """A box chamfer's mesh-volume sits between original and native-trimmed."""
+    side = 20.0
+    size = 2.0
+    box = MeshPart.from_part(Box(side, side, side))
+    chamfered = box.chamfer(box.feature_edges(), size=size)
+    native_box = Box(side, side, side)
+    native = native_box.chamfer(size, None, native_box.edges())
+    # A3a chamfer does not trim corner pyramids (that lands in A3c), so the
+    # mesh volume sits ABOVE the native volume and BELOW the original.
+    assert chamfered.is_valid
+    assert chamfered.volume < side**3
+    assert chamfered.volume > native.volume
+    assert len(chamfered.manifold.decompose()) == 1
+
+
+def test_mesh_chamfer_box_all_edges_no_slivers_and_one_body():
+    """All-12-edges chamfer (p10's degen=0 target) — valid, single body, no slivers."""
+    box = MeshPart.from_part(Box(20, 20, 20))
+    chamfered = box.chamfer(box.feature_edges(), size=2.0)
+    assert chamfered.is_valid
+    assert len(chamfered.manifold.decompose()) == 1
+    assert _degenerate_triangle_count(chamfered) == 0
+
+
+def test_mesh_chamfer_bored_box_rim_loop():
+    """The headline A3a fix: a curved-loop chamfer with far fewer slivers than p10.
+
+    p10's per-segment chamfer on the same input emits ~1000 sliver triangles
+    on the curved 63-edge bore rim; A3a's per-chain swept tool drops that
+    sliver count by an order of magnitude (still > 0 because the cylindrical
+    bore's own facets get split, but no longer the per-segment overlap tail).
+    """
+    bored = mesh_cut(Box(40, 40, 10), Cylinder(8, 14))
+    # Pick the top bore rim (the loop with the higher mean z)
+    selection = bored.feature_edges()
+    loops = list(selection.closed())
+    big_loops = [c for c in loops if len(c.verts) >= 20]
+
+    def mean_z(chain: FeatureChain) -> float:
+        return float(np.mean([selection.vertices[v][2] for v in chain.verts]))
+
+    top_rim = max(big_loops, key=mean_z)
+    assert top_rim.convexity_class == "convex"
+
+    chamfered = bored.chamfer(top_rim, size=1.5)
+    assert chamfered.is_valid
+    assert len(chamfered.manifold.decompose()) == 1
+    # p10 baseline on this case: 1052 slivers. A3a target: an order-of-magnitude
+    # reduction. The exact count is faceting-dependent; assert << p10.
+    assert _degenerate_triangle_count(chamfered) < 400, (
+        "A3a per-chain swept chamfer regressed beyond the p10 baseline "
+        f"(slivers={_degenerate_triangle_count(chamfered)})"
+    )
+    # The chamfer removes material on a convex bore rim.
+    assert chamfered.volume < bored.volume
+
+
+def test_mesh_chamfer_oversize_raises_meshfilletinfeasible():
+    """A chamfer size > half the local feature thickness raises (P3 — never clamp)."""
+    plate = MeshPart.from_part(Box(40, 40, 6))
+    chain = plate.feature_edges()[0]
+    with pytest.raises(MeshFilletInfeasible) as exc_info:
+        plate.chamfer(chain, size=8.0)
+    assert exc_info.value.constraint == "half-thickness"
+    assert exc_info.value.requested == pytest.approx(8.0)
+    assert exc_info.value.measured > 0.0
+    assert "exceeds half the local feature thickness" in str(exc_info.value)
+
+
+def test_mesh_chamfer_rejects_non_positive_size():
+    """size must be strictly positive."""
+    box = MeshPart.from_part(Box(10, 10, 10))
+    chain = box.feature_edges()[0]
+    with pytest.raises(ValueError, match="must be > 0"):
+        box.chamfer(chain, size=0.0)
+    with pytest.raises(ValueError, match="must be > 0"):
+        box.chamfer(chain, size=-1.0)
+
+
+def test_mesh_chamfer_free_function_matches_method():
+    """The free function mesh_chamfer matches MeshPart.chamfer."""
+    box = MeshPart.from_part(Box(15, 15, 15))
+    chain = box.feature_edges()[0]
+    method = box.chamfer(chain, size=2.0)
+    free = mesh_chamfer(box, chain, size=2.0)
+    assert method.volume == pytest.approx(free.volume, rel=1e-9)
+
+
+def test_mesh_chamfer_rejects_unsupported_on_infeasible_mode():
+    """A3a only supports 'raise'; 'skip' / 'clamp' raise ValueError."""
+    box = MeshPart.from_part(Box(10, 10, 10))
+    chain = box.feature_edges()[0]
+    with pytest.raises(ValueError, match="A3a"):
+        box.chamfer(chain, size=1.0, on_infeasible="skip")
+
+
+def test_mesh_chamfer_rejects_foreign_chain():
+    """A chain from a *different* MeshPart's feature graph is rejected."""
+    box_a = MeshPart.from_part(Box(10, 10, 10))
+    box_b = MeshPart.from_part(Box(10, 10, 10))
+    chain_b = box_b.feature_edges()[0]
+    with pytest.raises(ValueError, match="not part of this mesh"):
+        box_a.chamfer(chain_b, size=1.0)
+
+
+def test_mesh_chamfer_iterable_of_chains_accepted():
+    """edges may be any iterable of FeatureChain (matches design §8.1)."""
+    box = MeshPart.from_part(Box(20, 20, 20))
+    chains = list(box.feature_edges())[:2]
+    chamfered = box.chamfer(chains, size=1.5)
+    assert chamfered.is_valid
+    assert len(chamfered.manifold.decompose()) == 1
+
+
+def test_mesh_chamfer_l_shape_all_edges_cut_then_add():
+    """L-shape chamfer-all (p10 Case 2): the concave chain adds, the rest cut.
+
+    The L has one re-entrant (concave) chain and many convex chains; applying
+    convex CUTs first and concave ADDs second keeps the body in one piece —
+    design §3.7 carries forward p10's fix #3.
+    """
+    l_shape = mesh_cut(Box(30, 30, 12), Pos(10, 10, 0) * Box(16, 16, 16))
+    selection = l_shape.feature_edges()
+    n_convex = len(selection.convex())
+    n_concave = len(selection.concave())
+    assert n_concave >= 1, "L-shape has a re-entrant edge"
+    assert n_convex >= 10, "L-shape has at least 10 convex edges"
+
+    chamfered = l_shape.chamfer(selection, size=2.0)
+    assert chamfered.is_valid
+    assert len(chamfered.manifold.decompose()) == 1
+    assert _degenerate_triangle_count(chamfered) == 0
