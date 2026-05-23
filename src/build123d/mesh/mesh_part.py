@@ -484,6 +484,54 @@ class MeshPart:
 
         return mesh_minkowski_difference(self, other)
 
+    def offset(self, amount: float, *, sphere_segments: int = 32) -> MeshPart:
+        """3-D offset by ``amount`` — Minkowski with a faceted sphere.
+
+        Outward (``amount > 0``) inflates this body by ``amount``, rounding
+        every sharp edge with a sphere of that radius. Inward
+        (``amount < 0``) erodes the body by ``|amount|``. Outward is robust;
+        inward is **fragile** on a faceted sphere tool — see
+        :func:`build123d.mesh.mesh_offset` for the honest-limits caveat.
+
+        The result is synthesised geometry: the returned :class:`MeshPart`
+        carries an empty side-map.
+
+        Args:
+            amount (float): the offset distance. Positive grows outward,
+                negative erodes inward, zero returns a copy of this body.
+            sphere_segments (int): segment count for the sphere tool. Higher
+                is smoother but slower. Defaults to 32.
+
+        Returns:
+            MeshPart: the offset body, with no provenance.
+        """
+        # pylint: disable=import-outside-toplevel
+        from .ops import mesh_offset
+
+        return mesh_offset(self, amount, sphere_segments=sphere_segments)
+
+    def shell(self, thickness: float, *, sphere_segments: int = 32) -> MeshPart:
+        """Hollow this body to a wall of ``thickness`` — ``self − offset(−thickness)``.
+
+        Inward-offsets this body by ``thickness`` and subtracts the eroded
+        body, leaving a hollow shell. Inherits :meth:`offset`'s honest limit
+        on inward erosion: if ``thickness`` exceeds the body's thinnest
+        half-feature the inward offset can collapse and this raises. See
+        :func:`build123d.mesh.mesh_shell`.
+
+        Args:
+            thickness (float): wall thickness. Must be strictly positive.
+            sphere_segments (int): segment count for the sphere tool used by
+                the inward offset. Defaults to 32.
+
+        Returns:
+            MeshPart: the hollow shell, with no provenance.
+        """
+        # pylint: disable=import-outside-toplevel
+        from .ops import mesh_shell
+
+        return mesh_shell(self, thickness, sphere_segments=sphere_segments)
+
     # ---- Transforms ----
 
     def translate(self, offset: Sequence[float]) -> MeshPart:

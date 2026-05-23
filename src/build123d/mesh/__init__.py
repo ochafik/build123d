@@ -79,11 +79,16 @@ except ImportError as exc:  # pragma: no cover - exercised only without the extr
 from .bridge import FaceRecord, ResultMesh, SideMap, read_result, shape_to_manifold
 from .mesh_part import MeshPart, mesh_cut, mesh_fuse, mesh_intersect
 from .ops import (
+    mesh_extrude,
     mesh_hull,
     mesh_minkowski,
     mesh_minkowski_difference,
+    mesh_offset,
+    mesh_revolve,
+    mesh_shell,
 )
 from .recovery import RecoveredFace, RecoveryResult, recover_brep
+from .sketch2d import to_cross_section
 
 __all__ = [
     "FaceRecord",
@@ -94,12 +99,17 @@ __all__ = [
     "SideMap",
     "is_available",
     "mesh_cut",
+    "mesh_extrude",
     "mesh_fuse",
     "mesh_hull",
     "mesh_intersect",
     "mesh_minkowski",
     "mesh_minkowski_difference",
+    "mesh_offset",
+    "mesh_revolve",
+    "mesh_shell",
     "read_result",
     "recover_brep",
     "shape_to_manifold",
+    "to_cross_section",
 ]

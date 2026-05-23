@@ -38,6 +38,7 @@ import pytest
 from build123d import (
     Axis,
     Box,
+    Circle,
     Compound,
     Cone,
     Cylinder,
@@ -47,6 +48,7 @@ from build123d import (
     Part,
     Plane,
     Pos,
+    Rectangle,
     ShapeList,
     Solid,
     SortBy,
@@ -64,12 +66,17 @@ from build123d.mesh import (  # noqa: E402
     SideMap,
     is_available,
     mesh_cut,
+    mesh_extrude,
     mesh_fuse,
     mesh_hull,
     mesh_intersect,
     mesh_minkowski,
     mesh_minkowski_difference,
+    mesh_offset,
+    mesh_revolve,
+    mesh_shell,
     recover_brep,
+    to_cross_section,
 )
 from build123d.mesh.bridge import read_result, shape_to_manifold  # noqa: E402
 
@@ -1067,3 +1074,246 @@ def test_faces_from_unknown_source_is_empty():
     nothing = drilled.faces_from("does-not-exist")
     assert isinstance(nothing, ShapeList)
     assert len(nothing) == 0
+
+
+# --------------------------------------------------------------------------
+# 2-D profile bridge -- to_cross_section
+# --------------------------------------------------------------------------
+
+
+def test_to_cross_section_from_rectangle_has_expected_area():
+    """A build123d Rectangle round-trips through the bridge with exact area."""
+    cs = to_cross_section(Rectangle(2, 4))
+    assert cs.area() == pytest.approx(8.0, abs=1e-9)
+    assert cs.num_contour() == 1
+
+
+def test_to_cross_section_from_face_with_hole_has_two_contours():
+    """A face with a hole produces an outer + inner contour pair.
+
+    The bridge polygonises both wires; the Clipper2-backed CrossSection
+    keeps them as two contours so the hole is preserved through extrude.
+    """
+    plate = Rectangle(10, 10) - Circle(2)
+    cs = to_cross_section(plate, tolerance=0.05)
+    assert cs.num_contour() == 2
+    # Area is plate minus disc; loose tolerance because the circle is
+    # polygonised at deflection 0.05.
+    assert cs.area() == pytest.approx(100.0 - 3.14159265 * 4.0, rel=2e-2)
+
+
+def test_to_cross_section_from_point_list():
+    """A plain (x, y) point list is taken as a single closed polygon."""
+    cs = to_cross_section([(0, 0), (3, 0), (3, 2), (0, 2)])
+    assert cs.area() == pytest.approx(6.0, abs=1e-9)
+
+
+def test_to_cross_section_rejects_unsupported_type():
+    """A profile that is neither Shape, Compound, nor an iterable raises."""
+    with pytest.raises(TypeError, match="unsupported profile type"):
+        to_cross_section(42)  # type: ignore[arg-type]
+
+
+def test_to_cross_section_rejects_short_polygon():
+    """A point list with fewer than three vertices produces no contours."""
+    with pytest.raises(ValueError, match="no closed contours"):
+        to_cross_section([(0.0, 0.0), (1.0, 0.0)])
+
+
+# --------------------------------------------------------------------------
+# mesh_extrude -- 2D -> 3D linear extrusion
+# --------------------------------------------------------------------------
+
+
+def test_mesh_extrude_square_volume_is_exact():
+    """Extruding a 2x4 rectangle by height 3 yields a body of volume 24."""
+    mp = mesh_extrude(Rectangle(2, 4), height=3.0)
+    assert isinstance(mp, MeshPart)
+    assert mp.volume == pytest.approx(24.0, abs=1e-9)
+    # Plain prism: 12 triangles (6 quad faces -> 12 tris), 8 vertices.
+    bbox = mp.bounding_box()
+    assert bbox.min.Z == pytest.approx(0.0, abs=1e-9)
+    assert bbox.max.Z == pytest.approx(3.0, abs=1e-9)
+
+
+def test_mesh_extrude_accepts_point_list():
+    """A bare point list extrudes to the same volume as the equivalent Face."""
+    mp = mesh_extrude([(0, 0), (2, 0), (2, 4), (0, 4)], height=3.0)
+    assert mp.volume == pytest.approx(24.0, abs=1e-9)
+
+
+def test_mesh_extrude_with_top_scale_zero_is_a_pyramid():
+    """scale=0 collapses the top into a point -> a pyramid of V = base*h/3."""
+    mp = mesh_extrude(Rectangle(2, 2), height=3.0, scale=0.0)
+    # 4-sided pyramid: V = (1/3) * base_area * height = (1/3) * 4 * 3 = 4.
+    assert mp.volume == pytest.approx(4.0, abs=1e-6)
+
+
+def test_mesh_extrude_with_hole_subtracts_volume():
+    """A 10x10 plate with a hole of radius 2 extruded by h=2 has the right vol.
+
+    Pappus / prism: (100 - pi*4) * 2 ~= 174.86. Allow a few percent for the
+    polygonisation of the circular hole.
+    """
+    plate = Rectangle(10, 10) - Circle(2)
+    mp = mesh_extrude(plate, height=2.0, tolerance=0.05)
+    expected = (100.0 - 3.14159265 * 4.0) * 2.0
+    assert mp.volume == pytest.approx(expected, rel=2e-2)
+
+
+def test_mesh_extrude_carries_no_provenance():
+    """An extruded body is synthesised -- the side-map is empty."""
+    mp = mesh_extrude(Rectangle(2, 2), height=2.0)
+    assert len(mp.side_map) == 0
+
+
+def test_mesh_extrude_rejects_non_positive_height():
+    """height <= 0 raises rather than silently producing junk."""
+    with pytest.raises(ValueError, match="positive height"):
+        mesh_extrude(Rectangle(2, 2), height=0.0)
+
+
+# --------------------------------------------------------------------------
+# mesh_revolve -- 2D -> 3D revolution
+# --------------------------------------------------------------------------
+
+
+def test_mesh_revolve_disc_to_torus_volume():
+    """Revolving a 1x2 rect offset to centre x=2 about Y -> torus, Pappus.
+
+    Pappus' theorem: V = A * 2 * pi * centroid_x = 2 * 2 * pi * 2 = 8 * pi.
+    Allow a few percent for circular_segments tessellation.
+    """
+    profile = Pos(2, 0, 0) * Rectangle(1, 2)
+    mp = mesh_revolve(profile, angle=360.0, circular_segments=64)
+    expected = 2.0 * 2.0 * 3.14159265 * 2.0
+    assert mp.volume == pytest.approx(expected, rel=2e-2)
+
+
+def test_mesh_revolve_partial_angle_scales_volume():
+    """A 180-degree revolve has half the volume of a full 360-degree one."""
+    profile = Pos(2, 0, 0) * Rectangle(1, 2)
+    full = mesh_revolve(profile, angle=360.0, circular_segments=64).volume
+    half = mesh_revolve(profile, angle=180.0, circular_segments=64).volume
+    assert half == pytest.approx(full / 2.0, rel=5e-2)
+
+
+def test_mesh_revolve_carries_no_provenance():
+    """A revolved body is synthesised -- the side-map is empty."""
+    profile = Pos(2, 0, 0) * Rectangle(1, 2)
+    mp = mesh_revolve(profile, circular_segments=24)
+    assert len(mp.side_map) == 0
+
+
+def test_mesh_revolve_rejects_non_positive_angle():
+    """angle <= 0 raises rather than silently producing junk."""
+    profile = Pos(2, 0, 0) * Rectangle(1, 2)
+    with pytest.raises(ValueError, match="positive angle"):
+        mesh_revolve(profile, angle=0.0)
+
+
+# --------------------------------------------------------------------------
+# mesh_offset -- 3D offset / inflate
+# --------------------------------------------------------------------------
+
+
+def test_mesh_offset_outward_grows_volume_sensibly():
+    """An outward offset of a box rounds its corners and grows the volume.
+
+    A 4x4x4 box (V=64) offset by 0.5 has volume slightly less than (5x5x5=125)
+    -- the corners and edges are rounded, not extended squarely -- but much
+    larger than the original. The exact value depends on the sphere
+    tessellation, so the test bounds it.
+    """
+    base = MeshPart.box(4.0, 4.0, 4.0)
+    grown = mesh_offset(base, 0.5, sphere_segments=24)
+    assert grown.volume > base.volume
+    # Upper bound: the body fits inside a (4 + 2*0.5)**3 = 125 box.
+    assert grown.volume < 125.0 + 1e-6
+    # Lower bound: the offset is at least the union of the box and a 0.5 slab
+    # on every face: 64 + 6 * (4*4) * 0.5 = 112.
+    assert grown.volume > 100.0
+
+
+def test_mesh_offset_inward_shrinks_volume():
+    """An inward offset shrinks the body's volume."""
+    base = MeshPart.box(8.0, 8.0, 8.0)
+    eroded = mesh_offset(base, -0.5, sphere_segments=24)
+    assert eroded.volume < base.volume
+    # The eroded body fits inside a (8 - 2*0.5)**3 = 343 box (and rounds in,
+    # so the real volume is somewhat less). Lower bound: 8*8*8 - margin.
+    assert 200.0 < eroded.volume < base.volume
+
+
+def test_mesh_offset_zero_is_a_noop():
+    """offset(0) returns the input body unchanged in volume."""
+    base = MeshPart.box(4.0, 4.0, 4.0)
+    same = mesh_offset(base, 0.0)
+    assert same.volume == pytest.approx(base.volume, abs=1e-9)
+
+
+def test_mesh_offset_method_on_mesh_part():
+    """MeshPart.offset matches the free-function mesh_offset."""
+    base = MeshPart.box(4.0, 4.0, 4.0)
+    method = base.offset(0.5, sphere_segments=24).volume
+    free = mesh_offset(base, 0.5, sphere_segments=24).volume
+    assert method == pytest.approx(free, abs=1e-9)
+
+
+def test_mesh_offset_inward_too_large_collapses_with_clear_error():
+    """An inward offset larger than the body's half-feature raises clearly.
+
+    Honest-limits note: inward offset on a faceted sphere tool collapses when
+    the eroding radius is large compared to the body's thinnest dimension.
+    """
+    base = MeshPart.box(2.0, 2.0, 2.0)
+    # Erode a 2x2x2 box by a 5-radius sphere -> empty body.
+    with pytest.raises(ValueError, match="empty manifold|invalid manifold"):
+        mesh_offset(base, -5.0, sphere_segments=12)
+
+
+# --------------------------------------------------------------------------
+# mesh_shell -- 3D hollow / wall thickness
+# --------------------------------------------------------------------------
+
+
+def test_mesh_shell_volume_is_close_to_surface_times_thickness():
+    """A thin shell on a box has volume ~ surface_area * thickness.
+
+    For an 8x8x8 box (S=384) and t=0.5 the first-order estimate is 192;
+    the real value is somewhat less because the corners are rounded inward.
+    Bound it loosely.
+    """
+    base = MeshPart.box(8.0, 8.0, 8.0)
+    walls = mesh_shell(base, 0.5, sphere_segments=24)
+    assert 0.0 < walls.volume < base.volume
+    # Coarse sanity: first-order shell volume is S*t = 384 * 0.5 = 192;
+    # accept anywhere in the order-of-magnitude band.
+    assert 100.0 < walls.volume < 250.0
+
+
+def test_mesh_shell_method_on_mesh_part():
+    """MeshPart.shell matches the free-function mesh_shell."""
+    base = MeshPart.box(6.0, 6.0, 6.0)
+    method = base.shell(0.4, sphere_segments=24).volume
+    free = mesh_shell(base, 0.4, sphere_segments=24).volume
+    assert method == pytest.approx(free, abs=1e-9)
+
+
+def test_mesh_shell_rejects_non_positive_thickness():
+    """thickness <= 0 raises rather than silently producing junk."""
+    base = MeshPart.box(4.0, 4.0, 4.0)
+    with pytest.raises(ValueError, match="positive thickness"):
+        mesh_shell(base, 0.0)
+
+
+def test_mesh_shell_inward_collapse_raises_clearly():
+    """A too-thick wall on a thin body raises with a clear error.
+
+    The honest limit: the shell op subtracts an inward offset, and an
+    inward offset by half the body's thinnest dimension collapses on a
+    faceted sphere tool.
+    """
+    base = MeshPart.box(2.0, 2.0, 2.0)
+    with pytest.raises(ValueError, match="empty manifold|invalid manifold"):
+        mesh_shell(base, 5.0, sphere_segments=12)

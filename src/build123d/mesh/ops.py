@@ -70,6 +70,7 @@ import manifold3d as m3d  # type: ignore[import-not-found]
 
 if TYPE_CHECKING:  # pragma: no cover
     from .mesh_part import MeshOperand, MeshPart
+    from .sketch2d import Profile2D
 
 
 # A body is treated as convex when its volume matches its convex hull's volume
@@ -330,3 +331,268 @@ def mesh_minkowski_difference(a: "MeshOperand", b: "MeshOperand") -> "MeshPart":
             f"{result.status()}"
         )
     return MeshPart(result)
+
+
+# ---------------------------------------------------------------------------
+# 2-D → 3-D — native extrude / revolve via CrossSection
+# ---------------------------------------------------------------------------
+
+
+def mesh_extrude(
+    profile: "Profile2D",
+    height: float,
+    *,
+    twist: float = 0.0,
+    scale: float | tuple[float, float] = 1.0,
+    n_divisions: int = 0,
+    tolerance: float = 0.1,
+) -> "MeshPart":
+    """Linear-extrude a 2-D profile to a 3-D :class:`MeshPart`.
+
+    Routes a build123d 2-D profile through
+    :func:`~build123d.mesh.sketch2d.to_cross_section` and then drives
+    ``manifold3d.CrossSection.extrude`` — the native primitive that also
+    supports a *twist* and a *top-scale* (a non-1 ``scale`` tapers the top
+    relative to the bottom; ``scale=0`` collapses the top to a point).
+
+    The result is a synthesised faceted body — no input ``face_id`` traces
+    through ``extrude`` — so the returned :class:`MeshPart` carries an empty
+    side-map and :meth:`MeshPart.to_solid` falls back to the faceted bake.
+
+    Args:
+        profile: a build123d :class:`~build123d.Sketch` /
+            :class:`~build123d.Face` / :class:`~build123d.Compound`, or a plain
+            ``[(x, y), ...]`` point list.
+        height (float): the extrusion distance along +Z. Must be positive.
+        twist (float): rotation of the top face about Z, in degrees. Defaults
+            to 0 (no twist). A non-zero twist is interpolated linearly across
+            ``n_divisions`` slices.
+        scale (float | tuple[float, float]): top-face scale relative to the
+            bottom — a scalar applies isotropically, a pair scales X and Y
+            independently. Defaults to 1.0 (parallel-sided prism). Set to 0
+            for a pointed cone-like top.
+        n_divisions (int): number of intermediate cross-section slices. The
+            native primitive uses 0 for a flat top, raise it when twist or
+            scale needs smoother facets. Defaults to 0.
+        tolerance (float): linear deflection used to polygonise curved edges
+            of the profile. Defaults to 0.1.
+
+    Returns:
+        MeshPart: the extruded mesh body, with no face provenance.
+
+    Raises:
+        ValueError: if the profile yields no closed contours, ``height`` is
+            not positive, or the native extrude produces an invalid manifold.
+    """
+    # pylint: disable=import-outside-toplevel
+    from .mesh_part import MeshPart
+    from .sketch2d import to_cross_section
+
+    if height <= 0.0:
+        raise ValueError(f"mesh_extrude needs a positive height, got {height!r}")
+    scale_top = (
+        (float(scale), float(scale))
+        if isinstance(scale, (int, float))
+        else (float(scale[0]), float(scale[1]))
+    )
+    cross_section = to_cross_section(profile, tolerance=tolerance)
+    manifold = cross_section.extrude(
+        height=float(height),
+        n_divisions=int(n_divisions),
+        twist_degrees=float(twist),
+        scale_top=scale_top,
+    )
+    if manifold.is_empty() or manifold.status() != m3d.Error.NoError:
+        raise ValueError(
+            f"mesh_extrude produced an invalid manifold: {manifold.status()}"
+        )
+    return MeshPart(manifold)
+
+
+def mesh_revolve(
+    profile: "Profile2D",
+    *,
+    angle: float = 360.0,
+    circular_segments: int = 0,
+    tolerance: float = 0.1,
+) -> "MeshPart":
+    """Revolve a 2-D profile about the Y axis to a 3-D :class:`MeshPart`.
+
+    Routes a build123d 2-D profile through
+    :func:`~build123d.mesh.sketch2d.to_cross_section` and then drives
+    ``manifold3d.CrossSection.revolve``. **The profile is revolved about the
+    Y axis** — only its ``X >= 0`` half is swept; any region with ``X < 0`` is
+    clipped before the sweep (the same convention OpenSCAD's
+    ``rotate_extrude`` follows).
+
+    The result is a synthesised faceted body — no input ``face_id`` traces
+    through ``revolve`` — so the returned :class:`MeshPart` carries an empty
+    side-map and :meth:`MeshPart.to_solid` falls back to the faceted bake.
+
+    Args:
+        profile: a build123d :class:`~build123d.Sketch` /
+            :class:`~build123d.Face` / :class:`~build123d.Compound`, or a plain
+            ``[(x, y), ...]`` point list.
+        angle (float): revolution angle in degrees. Defaults to 360 (full).
+            Set to < 360 for a partial revolve.
+        circular_segments (int): number of facets around the full revolution
+            (the native primitive picks a sensible default for 0). Defaults
+            to 0.
+        tolerance (float): linear deflection used to polygonise curved edges
+            of the profile. Defaults to 0.1.
+
+    Returns:
+        MeshPart: the revolved mesh body, with no face provenance.
+
+    Raises:
+        ValueError: if the profile yields no closed contours, ``angle`` is
+            non-positive, or the native revolve produces an invalid manifold.
+    """
+    # pylint: disable=import-outside-toplevel
+    from .mesh_part import MeshPart
+    from .sketch2d import to_cross_section
+
+    if angle <= 0.0:
+        raise ValueError(f"mesh_revolve needs a positive angle, got {angle!r}")
+    cross_section = to_cross_section(profile, tolerance=tolerance)
+    manifold = cross_section.revolve(
+        circular_segments=int(circular_segments),
+        revolve_degrees=float(angle),
+    )
+    if manifold.is_empty() or manifold.status() != m3d.Error.NoError:
+        raise ValueError(
+            f"mesh_revolve produced an invalid manifold: {manifold.status()}"
+        )
+    return MeshPart(manifold)
+
+
+# ---------------------------------------------------------------------------
+# 3-D offset / shell — Minkowski with a faceted sphere
+# ---------------------------------------------------------------------------
+
+
+# Default tessellation segment count for the sphere "tool" used to round (or
+# erode) edges in the 3-D offset / shell ops. 32 is a balance: faceted enough
+# to resolve the sphere shape, coarse enough that the Minkowski cost stays in
+# the seconds range for a small body. Tune up for smoother rounds, down for
+# speed.
+_OFFSET_SPHERE_SEGMENTS = 32
+
+
+def _offset_sphere(radius: float, *, segments: int) -> m3d.Manifold:
+    """Return a tessellated sphere used as the Minkowski tool in 3-D offset.
+
+    Built directly via ``manifold3d.Manifold.sphere`` so the offset op does
+    not invoke the BREP bridge for what is purely a mesh-space tool body.
+
+    Args:
+        radius (float): the sphere radius (absolute value of the offset).
+        segments (int): the sphere's facet segment count.
+
+    Returns:
+        manifold3d.Manifold: the sphere body.
+    """
+    return m3d.Manifold.sphere(radius, segments)
+
+
+def mesh_offset(
+    body: "MeshOperand",
+    amount: float,
+    *,
+    sphere_segments: int = _OFFSET_SPHERE_SEGMENTS,
+) -> "MeshPart":
+    """3-D offset (inflate / deflate) by ``amount``, via Minkowski with a sphere.
+
+    Outward offset (``amount > 0``) is the Minkowski **sum** of ``body`` with a
+    sphere of radius ``amount`` — the body grows outward by ``amount`` with
+    every sharp edge rounded by a sphere of that radius. This case is robust:
+    it reuses :func:`mesh_minkowski` (``method="native"``).
+
+    Inward offset (``amount < 0``) is the Minkowski **difference** with a
+    sphere of radius ``|amount|`` — :func:`mesh_minkowski_difference`. Inward
+    erosion is **fragile** on a faceted sphere tool: the native
+    ``minkowski_difference`` can collapse to an empty body, hit numerical
+    instability, or produce a degenerate manifold when the eroding sphere is
+    comparable in size to the body's thinnest feature. See the module
+    docstring's "honest limits" note.
+
+    The result is a synthesised faceted body; the returned :class:`MeshPart`
+    carries an empty side-map.
+
+    Args:
+        body: the body to offset (build123d Shape or MeshPart).
+        amount (float): the offset distance. Positive grows outward, negative
+            erodes inward, zero is a no-op (the input body, in mesh space).
+        sphere_segments (int): segment count for the sphere tool. Higher is
+            smoother but materially slower. Defaults to 32.
+
+    Returns:
+        MeshPart: the offset body, with no provenance.
+
+    Raises:
+        ValueError: if the offset produces an invalid (or, for inward offset
+            larger than the body, an empty) manifold. The error message
+            points at the honest-limits caveat for inward offsets.
+    """
+    # pylint: disable=import-outside-toplevel
+    from .mesh_part import MeshPart, _coerce
+
+    part = _coerce(body)
+    if amount == 0.0:
+        return MeshPart(part.manifold)
+    sphere = _offset_sphere(abs(amount), segments=sphere_segments)
+    if amount > 0.0:
+        result = part.manifold.minkowski_sum(sphere)
+    else:
+        result = part.manifold.minkowski_difference(sphere)
+    if result.status() != m3d.Error.NoError:
+        raise ValueError(
+            f"mesh_offset produced an invalid manifold: {result.status()}. "
+            "Inward offsets are fragile on a faceted sphere tool — "
+            "raise sphere_segments or reduce |amount|."
+        )
+    if result.is_empty():
+        raise ValueError(
+            f"mesh_offset({amount}) produced an empty manifold — the body's "
+            "thinnest feature is smaller than the offset radius (inward "
+            "erosion of a body by a tool larger than its thinnest section "
+            "legitimately empties it)."
+        )
+    return MeshPart(result)
+
+
+def mesh_shell(
+    body: "MeshOperand",
+    thickness: float,
+    *,
+    sphere_segments: int = _OFFSET_SPHERE_SEGMENTS,
+) -> "MeshPart":
+    """Hollow ``body`` to a wall of ``thickness`` via ``body − offset(−thickness)``.
+
+    Inward-offsets the body by ``thickness`` and subtracts the eroded body
+    from the original, leaving a hollow shell of the given wall thickness.
+    Inherits :func:`mesh_offset`'s honest limit on inward erosion — if the
+    thickness exceeds the body's thinnest half-feature the inward offset can
+    collapse and the shell raises a clear error.
+
+    Args:
+        body: the body to hollow (build123d Shape or MeshPart).
+        thickness (float): wall thickness. Must be strictly positive.
+        sphere_segments (int): segment count for the sphere tool used by the
+            inward offset. Defaults to 32.
+
+    Returns:
+        MeshPart: the hollow shell, with no provenance.
+
+    Raises:
+        ValueError: if ``thickness`` is not positive, or the inward offset
+            collapses (the body is too thin to accommodate the wall).
+    """
+    # pylint: disable=import-outside-toplevel
+    from .mesh_part import MeshPart, _coerce, mesh_cut
+
+    if thickness <= 0.0:
+        raise ValueError(f"mesh_shell needs a positive thickness, got {thickness!r}")
+    part = _coerce(body)
+    eroded = mesh_offset(part, -float(thickness), sphere_segments=sphere_segments)
+    return MeshPart(mesh_cut(part, eroded).manifold)
