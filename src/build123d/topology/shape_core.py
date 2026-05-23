@@ -1625,18 +1625,25 @@ class Shape(NodeMixin, Generic[TOPODS]):
         *,
         relative: bool = True,
     ):
-        """Generate triangulation if none exists.
+        """Generate a triangulation of this Shape if one is not already cached.
+
+        Drives OCCT's ``BRepMesh_IncrementalMesh`` with a configurable
+        relative/absolute deflection toggle. The triangulation is cached on the
+        underlying ``TopoDS_Shape``; subsequent callers (``tessellate``, the
+        STEP / STL exporters, …) reuse it.
 
         Args:
-          tolerance: float:
-          angular_tolerance: float:  (Default value = 0.1)
-          relative: bool: when True (the default) ``tolerance`` is a relative
-            linear deflection that scales per edge; when False it is an absolute
-            deflection in model units, which keeps parts of different sizes on a
-            common grid (useful for mesh CSG). Defaults to True.
+            tolerance (float): linear deflection of the triangulation.
+            angular_tolerance (float, optional): angular deflection in radians.
+                Defaults to 0.1.
+            relative (bool, optional): when True (the default) ``tolerance`` is
+                a *relative* linear deflection that scales per edge; when False
+                it is an *absolute* deflection in model units, which keeps
+                parts of different sizes on a common grid (useful for mesh
+                CSG). Defaults to True.
 
-        Returns:
-
+        Raises:
+            ValueError: if this Shape is empty (no wrapped ``TopoDS_Shape``).
         """
         if self._wrapped is None:
             raise ValueError("Cannot mesh an empty shape")
