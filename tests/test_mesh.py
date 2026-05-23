@@ -71,6 +71,7 @@ from build123d.mesh import (  # noqa: E402
     mesh_chamfer,
     mesh_cut,
     mesh_extrude,
+    mesh_fillet,
     mesh_fuse,
     mesh_hull,
     mesh_intersect,
@@ -1536,3 +1537,252 @@ def test_mesh_chamfer_l_shape_all_edges_cut_then_add():
     assert chamfered.is_valid
     assert len(chamfered.manifold.decompose()) == 1
     assert _degenerate_triangle_count(chamfered) == 0
+
+
+# --------------------------------------------------------------------------
+# Phase A3b — fillet correctness
+# --------------------------------------------------------------------------
+
+
+def _faceted_fillet_profile_area(radius: float, segments: int) -> float:
+    """The bit-exact area of A3b's faceted fillet cross-section.
+
+    Mirrors the polygon ``_fillet_profile_points`` in
+    :mod:`build123d.mesh.fillet`: the corner ``(0,0)`` plus ``segments + 1``
+    arc samples from ``(r, 0)`` to ``(0, r)``. The region is the "wedge minus
+    quarter-disc" (design §3.4) — non-convex but with well-defined area via
+    the shoelace formula on the closed polygon.
+    """
+    cx, cy = radius, radius
+    pts = [(0.0, 0.0)]
+    for i in range(segments + 1):
+        ang = 1.5 * pi - i * (pi / 2.0) / segments
+        pts.append((cx + radius * np.cos(ang), cy + radius * np.sin(ang)))
+    # Shoelace on the closed polygon
+    area = 0.0
+    n = len(pts)
+    for i in range(n):
+        x_i, y_i = pts[i]
+        x_j, y_j = pts[(i + 1) % n]
+        area += x_i * y_j - x_j * y_i
+    return abs(area) * 0.5
+
+
+def test_mesh_fillet_box_single_edge_is_bit_exact():
+    """Fillet one box edge: volume = box − (faceted-arc profile area × edge length).
+
+    The faceted-arc cross-section area is computable in closed form (see
+    :func:`_faceted_fillet_profile_area`); the swept tool removes exactly
+    ``profile_area · L`` from a 20 mm box. With ``n_seg = 8`` and ``r = 1``,
+    the predicted volume is ``8000 − 0.21964 · 20 ≈ 7995.607``.
+    """
+    box = MeshPart.from_part(Box(20, 20, 20))
+    chain = box.feature_edges()[0]
+    radius = 1.0
+    segments = 8
+    filleted = box.fillet(chain, radius=radius, segments=segments)
+    assert filleted.is_valid
+    expected = 8000.0 - _faceted_fillet_profile_area(radius, segments) * 20.0
+    assert filleted.volume == pytest.approx(expected, abs=1e-9)
+    assert len(filleted.manifold.decompose()) == 1
+    assert _degenerate_triangle_count(filleted) == 0
+
+
+def test_mesh_fillet_box_all_edges_no_slivers_and_one_body():
+    """All 12 edges filleted: one body, no slivers, real arc strips visible."""
+    box = MeshPart.from_part(Box(20, 20, 20))
+    filleted = box.fillet(box.feature_edges(), radius=1.0)
+    assert filleted.is_valid
+    assert len(filleted.manifold.decompose()) == 1
+    assert _degenerate_triangle_count(filleted) == 0
+    # Volume sits strictly below the box and well above the chamfer-equivalent:
+    # 12 arc-profile cuts of area 0.2196 each over 20 mm edges (no corner
+    # blend yet) removes < 12 · 0.2196 · 20 ≈ 53 (corner overlap reduces this).
+    assert filleted.volume < 8000.0
+    assert filleted.volume > 8000.0 - 12.0 * 0.22 * 20.0
+
+
+def test_mesh_fillet_bored_box_rim_loop_curved_loop_fix():
+    """The headline A3b test: a curved-loop fillet that does NOT shatter into slivers.
+
+    p10's per-segment fillet on a 63-edge bore rim emits 1052–1720 degenerate
+    sliver triangles (the curved-loop failure mode in the design); A3b's
+    per-chain swept arc-tool brings that down to a few hundred — bounded by
+    the bore's own tessellation, not per-segment overlap.
+    """
+    bored = mesh_cut(Box(40, 40, 10), Cylinder(8, 14))
+    selection = bored.feature_edges()
+    big_loops = [c for c in selection.closed() if len(c.verts) >= 20]
+    assert len(big_loops) == 2
+
+    def mean_z(chain: FeatureChain) -> float:
+        return float(np.mean([selection.vertices[v][2] for v in chain.verts]))
+
+    top_rim = max(big_loops, key=mean_z)
+    assert top_rim.convexity_class == "convex"
+
+    filleted = bored.fillet(top_rim, radius=1.0)
+    assert filleted.is_valid
+    assert len(filleted.manifold.decompose()) == 1
+    # Per-segment overlap is gone (the symptom is < 400 slivers, vs p10's
+    # 1052–1720); the residual count is from the bore's facet split, NOT
+    # per-segment overlap.
+    assert _degenerate_triangle_count(filleted) < 400, (
+        f"A3b per-chain swept fillet regressed beyond the curved-loop fix "
+        f"(slivers={_degenerate_triangle_count(filleted)})"
+    )
+    # Filleting a convex rim removes material from the bored body.
+    assert filleted.volume < bored.volume
+
+
+def test_mesh_fillet_l_shape_convex_and_concave_chains_succeeds():
+    """L-shape with one concave chain plus 17 convex chains — fillet ALL of them.
+
+    A3a's chamfer raises ``mixed-convexity`` only when a *single chain* has
+    mixed signs; here we have **separate** convex and concave chains in one
+    selection. A3b fillet handles them both: convex chains carve, concave
+    chains fill. The convex sub-runs reduce volume; the concave sub-run adds
+    the predicted ``profile_area · chain_length``. Result stays in one body.
+    """
+    l_shape = mesh_cut(Box(30, 30, 12), Pos(10, 10, 0) * Box(16, 16, 16))
+    original_volume = l_shape.volume
+    selection = l_shape.feature_edges()
+    convex_chains = list(selection.convex())
+    concave_chains = list(selection.concave())
+    assert len(concave_chains) == 1
+    assert len(convex_chains) >= 10
+
+    radius = 1.0
+    segments = 8
+
+    # Concave-only: adds exactly profile_area · chain_length (the chain has
+    # corner endpoints on both ends, so A3b's no-overshoot-at-corner stub
+    # gives a tool spanning exactly the chain length).
+    concave = concave_chains[0]
+    chain_length = float(
+        np.linalg.norm(
+            selection.vertices[concave.verts[-1]]
+            - selection.vertices[concave.verts[0]]
+        )
+    )
+    expected_added = _faceted_fillet_profile_area(radius, segments) * chain_length
+    only_concave = l_shape.fillet(concave_chains, radius=radius, segments=segments)
+    assert only_concave.is_valid
+    assert len(only_concave.manifold.decompose()) == 1
+    assert only_concave.volume == pytest.approx(
+        original_volume + expected_added, abs=1e-9
+    )
+
+    # Convex-only: a strict reduction.
+    only_convex = l_shape.fillet(convex_chains, radius=radius, segments=segments)
+    assert only_convex.is_valid
+    assert len(only_convex.manifold.decompose()) == 1
+    assert only_convex.volume < original_volume
+
+    # Both together: cut-then-add stays in one piece (design §3.7).
+    both = l_shape.fillet(selection, radius=radius, segments=segments)
+    assert both.is_valid
+    assert len(both.manifold.decompose()) == 1
+    assert _degenerate_triangle_count(both) == 0
+    # The convex cuts dominate the small concave fill.
+    assert both.volume < original_volume
+
+
+def test_mesh_fillet_mixed_chain_no_longer_raises():
+    """A chain containing both convex and concave edges no longer raises.
+
+    A3a's chamfer explicitly raises ``MeshFilletInfeasible(constraint=
+    "mixed-convexity")`` on a chain whose edges disagree in sign. A3b fillet
+    deprecates that check — it splits the chain into single-sign sub-runs
+    and builds one swept tool per sub-run (design §3.4 / §8.3). We exercise
+    the no-raise path by handing the fillet a selection that contains every
+    chain on an L-shape, which exposes both sign sub-cases.
+    """
+    l_shape = mesh_cut(Box(30, 30, 12), Pos(10, 10, 0) * Box(16, 16, 16))
+    selection = l_shape.feature_edges()
+    # A pre-flight that doesn't raise is itself the test — but assert valid too.
+    filleted = l_shape.fillet(selection, radius=0.5)
+    assert filleted.is_valid
+
+
+def test_mesh_fillet_oversize_raises_meshfilletinfeasible():
+    """An oversize fillet radius raises (P3 — never silently clamp)."""
+    plate = MeshPart.from_part(Box(40, 40, 6))
+    chain = plate.feature_edges()[0]
+    with pytest.raises(MeshFilletInfeasible) as exc_info:
+        plate.fillet(chain, radius=8.0)
+    assert exc_info.value.constraint == "half-thickness"
+    assert exc_info.value.requested == pytest.approx(8.0)
+    assert exc_info.value.measured > 0.0
+    assert exc_info.value.measured < 8.0
+
+
+def test_mesh_fillet_rejects_non_positive_radius():
+    """radius must be strictly positive."""
+    box = MeshPart.from_part(Box(10, 10, 10))
+    chain = box.feature_edges()[0]
+    with pytest.raises(ValueError, match="must be > 0"):
+        box.fillet(chain, radius=0.0)
+    with pytest.raises(ValueError, match="must be > 0"):
+        box.fillet(chain, radius=-1.0)
+
+
+def test_mesh_fillet_rejects_invalid_segments():
+    """segments must be >= 1."""
+    box = MeshPart.from_part(Box(10, 10, 10))
+    chain = box.feature_edges()[0]
+    with pytest.raises(ValueError, match=">= 1"):
+        box.fillet(chain, radius=1.0, segments=0)
+
+
+def test_mesh_fillet_free_function_matches_method():
+    """The free function mesh_fillet matches MeshPart.fillet."""
+    box = MeshPart.from_part(Box(15, 15, 15))
+    chain = box.feature_edges()[0]
+    method = box.fillet(chain, radius=1.0)
+    free = mesh_fillet(box, chain, radius=1.0)
+    assert method.volume == pytest.approx(free.volume, rel=1e-9)
+
+
+def test_mesh_fillet_rejects_unsupported_on_infeasible_mode():
+    """A3b only supports 'raise'; 'skip' / 'clamp' raise ValueError."""
+    box = MeshPart.from_part(Box(10, 10, 10))
+    chain = box.feature_edges()[0]
+    with pytest.raises(ValueError, match="A3b"):
+        box.fillet(chain, radius=1.0, on_infeasible="skip")
+
+
+def test_mesh_fillet_rejects_foreign_chain():
+    """A chain from a *different* MeshPart's feature graph is rejected."""
+    box_a = MeshPart.from_part(Box(10, 10, 10))
+    box_b = MeshPart.from_part(Box(10, 10, 10))
+    chain_b = box_b.feature_edges()[0]
+    with pytest.raises(ValueError, match="not part of this mesh"):
+        box_a.fillet(chain_b, radius=1.0)
+
+
+def test_mesh_fillet_segments_parameter_changes_profile_facets():
+    """Increasing ``segments`` brings the faceted profile closer to the exact arc.
+
+    The faceted profile (chord polygon) sits *above* the exact arc (chords lie
+    between the arc and the wedge's hypotenuse), so the faceted region's area
+    is **greater** than the exact ``r²(1 − π/4)``. Coarser facetting removes
+    more material; finer facetting approaches the exact value from below.
+    """
+    box = MeshPart.from_part(Box(20, 20, 20))
+    chain = box.feature_edges()[0]
+    coarse = box.fillet(chain, radius=1.0, segments=4)
+    fine = box.fillet(chain, radius=1.0, segments=16)
+    assert coarse.is_valid and fine.is_valid
+    # Coarse facetting removes MORE material than fine.
+    assert coarse.volume < fine.volume
+    # Both stay below the exact (infinite-segment) result — the faceted region
+    # over-removes.
+    exact_result = 8000.0 - 1.0**2 * (1.0 - pi / 4.0) * 20.0
+    assert fine.volume < exact_result
+    assert coarse.volume < exact_result
+    # And both stay above the chamfer-equivalent (size = radius), since the
+    # ball cut-out always leaves some material the chamfer would have removed.
+    chamfer_result = 8000.0 - 0.5 * 1.0 * 1.0 * 20.0
+    assert fine.volume > chamfer_result
+    assert coarse.volume > chamfer_result

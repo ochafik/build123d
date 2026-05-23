@@ -877,6 +877,69 @@ class MeshPart:
             self, edges, size, on_infeasible=on_infeasible  # type: ignore[arg-type]
         )
 
+    def fillet(
+        self,
+        edges: object,
+        radius: float,
+        *,
+        segments: int = 8,
+        on_infeasible: str = "raise",
+    ) -> "MeshPart":
+        """Apply a faceted fillet of ``radius`` to ``edges`` (Phase A3b).
+
+        Method form of :func:`build123d.mesh.mesh_fillet`. The selection
+        argument follows design §8.1: a :class:`FeatureChainSelection` (from
+        :meth:`feature_edges`), a single :class:`FeatureChain`, or any iterable
+        of :class:`FeatureChain`.
+
+        A3b's profile is a ``segments``-faceted quarter-disc tangent to both
+        adjacent faces at distance ``radius`` from the edge (the rolling-ball
+        cross-section). The construction is one **swept tool per chain**
+        (design §3) using the same per-vertex frame + ``hull_points`` loft
+        substrate as A3a's chamfer. Convex chains have their tool subtracted
+        (round the edge); concave chains have it unioned (fill the channel).
+        Mixed convex/concave chains are split at the sign flip into single-sign
+        sub-runs (design §3.4 / §8.3); each sub-run becomes its own swept tool
+        and is added to the appropriate cut or add batch.
+
+        Over-size requests **raise** :class:`~build123d.mesh.MeshFilletInfeasible`
+        (P3 — never silently clamp). Multi-chain corner blends (setback +
+        spherical patch) land in A3c; for A3b, corners are handled by the
+        chain tool's endpoint overshoot (the result is valid but the corner is
+        a thin patch rather than a real ball corner).
+
+        Args:
+            edges: chains to fillet — a
+                :class:`~build123d.mesh.FeatureChainSelection`, a single
+                :class:`~build123d.mesh.FeatureChain`, or any iterable of
+                :class:`~build123d.mesh.FeatureChain`. Chains must originate
+                from this mesh's own chain graph.
+            radius (float): rolling-ball radius (> 0).
+            segments (int): arc facet count for the cross-section (default 8).
+            on_infeasible (str): A3b only supports ``"raise"`` (the default).
+                Other modes (``"skip"``) land in A4.
+
+        Returns:
+            MeshPart: the filleted mesh body.
+
+        Raises:
+            ValueError: if ``radius <= 0``, ``segments < 1``, or this MeshPart
+                is empty.
+            MeshFilletInfeasible: if any feasibility constraint fails — see
+                :class:`~build123d.mesh.MeshFilletInfeasible`.
+            TypeError: if ``edges`` is none of the accepted shapes.
+        """
+        # pylint: disable=import-outside-toplevel
+        from .fillet import mesh_fillet
+
+        return mesh_fillet(
+            self,
+            edges,  # type: ignore[arg-type]
+            radius,
+            segments=segments,
+            on_infeasible=on_infeasible,  # type: ignore[arg-type]
+        )
+
     # ---- Source-filtered selection ----
 
     def faces_from(self, source: str) -> ShapeList[Face]:

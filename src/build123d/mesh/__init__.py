@@ -82,7 +82,7 @@ from .feature_edges import (
     FeatureChainSelection,
     FeatureEdge,
 )
-from .fillet import MeshFilletInfeasible, mesh_chamfer
+from .fillet import MeshFilletInfeasible, mesh_chamfer, mesh_fillet
 from .mesh_part import MeshPart, mesh_cut, mesh_fuse, mesh_intersect
 from .ops import (
     mesh_extrude,
@@ -111,6 +111,7 @@ __all__ = [
     "mesh_chamfer",
     "mesh_cut",
     "mesh_extrude",
+    "mesh_fillet",
     "mesh_fuse",
     "mesh_hull",
     "mesh_intersect",
