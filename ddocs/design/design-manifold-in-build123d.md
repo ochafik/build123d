@@ -99,16 +99,26 @@ story.
   faceted. A round-tripped sphere is a polyhedron. Analytic refit
   (`brep_from_stl.detect_primitives`) is a *separate* problem and out of scope
   here (it is incomplete anyway — doc 02 §5).
-- **NG5 — `fillet`/`chamfer`/`loft`/`sweep` on mesh shapes.** They need analytic
-  edges, surfaces, and blend geometry. Undefined on a faceted mesh — `MeshPart`
-  must not pretend otherwise.
+- **NG5 — Analytic `fillet`/`chamfer`/`loft`/`sweep` on mesh shapes** — i.e. on
+  the *exact-BREP* of a meshed-then-baked solid. They need analytic edges +
+  surfaces + blend geometry; on a *faceted* solid those are gone. *Note
+  (post-A3):* mesh-domain *approximate* `fillet`/`chamfer` **are** in scope
+  and shipped (see `ddocs/research/12-mesh-approximation-mode.md` plus
+  A3a/A3b/A3c/A4 in `ddocs/design/mesh-fillet-engineering.md`) — selective,
+  faceted, faceID-feature-edge-driven, with `MeshFilletInfeasible` raising on
+  any case the design forbids (P3). `loft`/`sweep` on mesh remain out of
+  scope. `MeshPart` does not pretend to perform analytic finishing.
 - **NG6 — A 2D mesh subsystem in Phase 0–2.** manifold3d's `CrossSection`
   exists; a `MeshSketch` is plausible but deferred (see §11, open question).
   2D stays on OCC `Face`/`Sketch` for now.
-- **NG7 — Mutating `Shape` operators to accept `MeshPart`.** `native_part -
-  mesh_part` cannot work without patching `Shape.__sub__`/`_bool_op`; that is
-  core surgery for an optional extra. The asymmetry is documented, not fixed
-  (§4.5).
+- ~~**NG7 — Mutating `Shape` operators to accept `MeshPart`.**~~ *(resolved,
+  G1-P2.)* The implementation found this is not "core surgery" at all — the
+  right fix is the standard Python operator protocol: `Shape.__add__` /
+  `__sub__` / `__and__` return `NotImplemented` for unrecognised operands so
+  the reflected operator on the right-hand side takes over. Idiomatic Python,
+  not a hack; ~25 lines in `shape_core.py` + `composite.py`, no `manifold3d`
+  import in core. Both `mesh_part - native_part` and `native_part - mesh_part`
+  now work; §4.5 is amended accordingly.
 
 ---
 
@@ -483,8 +493,19 @@ def mesh_fuse(*shapes: Shape | MeshPart) -> MeshPart: ...
 def mesh_cut(base: Shape | MeshPart, *tools: Shape | MeshPart) -> MeshPart: ...
 def mesh_intersect(*shapes: Shape | MeshPart) -> MeshPart: ...
 def mesh_hull(*shapes: Shape | MeshPart) -> MeshPart: ...
-def mesh_minkowski(a: Shape | MeshPart, b: Shape | MeshPart) -> MeshPart: ...
+def mesh_minkowski(a: Shape | MeshPart, b: Shape | MeshPart, *, method: str = "native") -> MeshPart: ...
+def mesh_minkowski_difference(a: Shape | MeshPart, b: Shape | MeshPart) -> MeshPart: ...
 ```
+
+`mesh_minkowski(..., method="native"|"decompose")` — manifold3d 3.4.x ships a
+native `Manifold.minkowski_sum`, used as the default backend. `method="decompose"`
+selects the scad2py-ported convex-pairs algorithm (Apache-2.0, ochafik), exact
+for convex operands and unions of convex parts; a connected non-convex operand
+under `method="decompose"` raises a clear error pointing at `method="native"`.
+`mesh_minkowski_difference` is the morphological erosion (`a ⊖ b`) — best-effort
+on faceted tools (sub-percent non-convexity from weld jitter can collapse the
+result; documented honestly).
+
 
 Each tessellates any `Shape` operand and returns a `MeshPart`. These are the
 **primary surface** (Phase 0): they need zero changes to the `Shape` hierarchy
@@ -563,22 +584,28 @@ hull   = mesh_hull(*[Sphere(2).moved(Pos(*p)) for p in points])
 rounded = mesh_minkowski(Box(20, 20, 5), MeshPart.sphere(2))   # faceted "fillet"
 ```
 
-### 4.5 Operator interop with native `Part`/`Solid` — the asymmetry
+### 4.5 Operator interop with native `Part`/`Solid` — resolved
 
-`MeshPart` operators coerce a `Shape` operand by tessellating it:
+`MeshPart` operators coerce a `Shape` operand by tessellating it. `native_part
+OP mesh_part` and `mesh_part OP native_part` **both work**:
 
-- `mesh_part - native_part` — **works.** `MeshPart.__sub__` sees the `Part`,
-  calls `MeshPart.from_part` on it.
-- `native_part - mesh_part` — **does not work.** This hits `Shape.__sub__` →
-  `_bool_op`, which expects a `TopoDS` operand and cannot see a `MeshPart`.
-  `__radd__` papers over `+` only.
+- `mesh_part - native_part` — `MeshPart.__sub__` sees the `Part`, calls
+  `MeshPart.from_part` on it.
+- `native_part - mesh_part` — `Shape.__sub__` returns `NotImplemented` for
+  any non-`Shape` operand, and Python's operator protocol calls
+  `MeshPart.__rsub__` next, which coerces. *Idiomatic Python, not a hack*:
+  `NotImplemented` is the right answer for an unrecognised operand type
+  regardless of the manifold backend; build123d simply lacked it before.
 
-This asymmetry is **inherent** — full symmetry needs patching `Shape`'s
-operators, which is core surgery for an optional extra (NG7, `p3` §3.3).
-**Resolution:** document loudly that *the mesh operand must be on the left*, and
-steer users to the free-function API (`mesh_cut(native, mesh)`) where operand
-direction is explicit and the asymmetry vanishes. The free functions are the
-recommended interop surface for exactly this reason.
+The change is small (~25 lines in `shape_core.py` + `composite.py`, no
+`manifold3d` import in core), is independently a *correctness fix* for
+build123d's operator protocol (`Part - 5` now raises the standard Python
+`TypeError` instead of a build123d-specific one), and supersedes NG7's
+"asymmetry is inherent" stance (see the revised NG7 in §1.2).
+
+The free-function API (`mesh_cut(base, *tools)`) remains the recommended
+surface where operand *direction* needs to be **explicit** (e.g. an N-way
+`mesh_cut(base, tool1, tool2, ...)`), but operators are now symmetric.
 
 ### 4.6 Color & property handling
 
@@ -1011,7 +1038,7 @@ browser build feasible.
 | R4 | **Curvature & fillets permanently lost** through BREP→mesh→BREP. | **Medium** (inherent, not a bug) | Document prominently; `to_solid()` docstring shouts. Route fillet/chamfer/STEP-grade work through OCC and never let it leave (NG4, NG5). Not "fixable" — communicated. |
 | R5 | **Huge-BREP downstream cost.** A 1M-face baked `Solid`: `BRepCheck` ~76 s/15 GB, STEP ~147 s/2.5 GB (`p7` §7). | **Medium** | P5: bake once/late, do not validate intermediates, optional `unify_coplanar`. Keep geometry in `MeshPart` form; warn in `to_solid()` above ~10⁵ triangles. |
 | R6 | **`Mesher._get_shape` void-detection bug** mis-classifies a multi-body mesh as one Solid-with-fake-void (`p1` §2). | **Medium** | `Solid.from_mesh` (core addition #2) uses bbox-nesting classification, not "largest = outer, rest = voids". `p1`'s `bridge.py` already has the fix to port. Latent build123d bug — document, fix in the new code path, do not silently inherit. |
-| R7 | **Operator interop asymmetry** — `native - mesh` does not work. | **Low** | Documented; steer to the free-function API where direction is explicit (§4.5). Inherent to a non-`Shape` value type (NG7). |
+| ~~R7~~ | ~~**Operator interop asymmetry** — `native - mesh` does not work.~~ *Resolved (G1-P2).* | n/a | The `Shape.__add__/__sub__/__and__` `NotImplemented` change (§4.5) makes `native_part OP mesh_part` work via Python's operator protocol — idiomatic, ~25 lines, no `manifold3d` in core. |
 | R8 | **manifold3d API drift** — doc 03 is 2.3.1; prototypes are 3.4.x; a future 3.x bump could move signatures. | **Low–Medium** | Pin `>= 3.4, < 4` (§8.1). Re-introspect the live wheel at build time. The bridge is small and isolated in `build123d.mesh` — one place to patch. |
 | R9 | **Per-vertex color is lossy at seams** — interpolated, float32 rounding; modal collapse picks the wrong color (`p3` §5). | **Low** | Use `run_original_id` integer tags for solid color (exact, §4.6); reserve per-vertex properties for genuine gradients only. |
 | R10 | **Intermittent 2.3.1 segfault** (doc 03 §3.5) in a long-lived process. | **Low** | Not reproduced on 3.4.x by any prototype (doc 09 §4.1). Pin 3.x; spot-check under a long-lived process in Phase 0 hardening. |
