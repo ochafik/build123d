@@ -2347,3 +2347,100 @@ def test_mesh_fillet_report_exports_and_is_iterable():
     # Empty report would be falsy; a populated one is truthy.
     assert bool(report) is True
     assert report.total_skipped == 1
+
+
+# --------------------------------------------------------------------------
+# Mixed-provenance recovery — unseeded face_ids must not be silently dropped
+# (regression: a hull/Minkowski/from_mesh operand combined with a seeded
+# operand leaves a non-empty side-map AND result ids with no provenance.)
+# --------------------------------------------------------------------------
+
+
+def test_recovery_result_exposes_unseeded_counter():
+    """RecoveryResult carries the n_unseeded_faceted counter, defaulting to 0."""
+    drilled = mesh_cut(Box(20, 20, 10), Box(6, 6, 20))
+    recovered = recover_brep(read_result(drilled.manifold), drilled.side_map)
+    # An all-planar, fully-seeded CSG result has no unseeded ids.
+    assert recovered.n_unseeded_faceted == 0
+    assert recovered.n_exact_planar > 0
+
+
+def test_mixed_provenance_recovers_unseeded_faces_not_dropped():
+    """A hull (unseeded) fused with a seeded box keeps BOTH in recovery.
+
+    Before the fix, recover_brep silently ``continue``d past the hull's
+    auto-assigned face_ids (absent from the side-map), dropping the entire
+    hull and leaving only the seeded box. The volume collapsed toward the
+    seeded operand alone. The fix renders unseeded ids as faceted patches.
+    """
+    # Two-sphere hull (no provenance) + a seeded box, well separated so the
+    # union volume is close to the sum minus a small overlap.
+    hull = mesh_hull(
+        MeshPart.sphere(radius=20).move(Location((0, 0, 0))),
+        MeshPart.sphere(radius=14).move(Location((10, 0, 40))),
+    )
+    assert len(hull.side_map) == 0  # a hull carries no provenance
+    box = MeshPart.from_part(Box(40, 40, 6)).move(Location((0, 0, -40)))
+    assert len(box.side_map) == 6
+
+    mixed = hull + box
+    # The merged side-map covers only the box's 6 faces...
+    assert len(mixed.side_map) == 6
+    # ...but the result mesh has many more distinct ids (the hull facets).
+    result_mesh = read_result(mixed.manifold)
+    assert len(result_mesh.distinct_ids) > 6
+
+    recovered = recover_brep(result_mesh, mixed.side_map)
+    # The hull's unseeded ids are recovered as faceted patches, not dropped.
+    assert recovered.n_unseeded_faceted > 0
+    assert recovered.n_exact_planar > 0
+    # The recovered volume is close to the true union volume (not the box
+    # alone, which would be the silent-drop symptom).
+    assert recovered.volume == pytest.approx(mixed.manifold.volume(), rel=0.02)
+
+
+def test_to_solid_mixed_provenance_is_valid_and_full_volume():
+    """to_solid() on a mixed-provenance MeshPart returns a valid full body.
+
+    Regression for the bp10 footgun: hull-of-spheres + a seeded bore used to
+    bake to a near-empty solid (~vol 0). After the auto-fallback fix, to_solid
+    always returns a valid solid whose volume matches the mesh.
+    """
+    hull = mesh_hull(
+        MeshPart.sphere(radius=20).move(Location((0, 0, 0))),
+        MeshPart.sphere(radius=14).move(Location((10, 0, 40))),
+    )
+    mixed = hull + MeshPart.from_part(Box(40, 40, 6)).move(Location((0, 0, -40)))
+    mesh_volume = mixed.manifold.volume()
+
+    solid = mixed.to_solid()
+    assert isinstance(solid, (Solid, Compound))
+    assert solid.is_valid  # the always-valid contract
+    # Full body, not the silent-drop near-empty result.
+    assert solid.volume == pytest.approx(mesh_volume, rel=1e-3)
+    # And it matches the explicit faceted bake (the fallback path).
+    faceted = mixed.to_solid(reconstruct=False)
+    assert solid.volume == pytest.approx(faceted.volume, rel=1e-6)
+
+
+@pytest.mark.parametrize(
+    "make_mesh_part",
+    [
+        # all-planar CSG -> exact recovery, valid
+        lambda: mesh_cut(Box(20, 20, 10), Box(6, 6, 20)),
+        # curved-seeded only -> faceted recovery, valid
+        lambda: MeshPart.from_part(Sphere(10)),
+        # mixed provenance -> auto-fallback to faceted, valid
+        lambda: mesh_hull(
+            MeshPart.sphere(radius=20),
+            MeshPart.sphere(radius=14).move(Location((10, 0, 40))),
+        )
+        + MeshPart.from_part(Box(40, 40, 6)).move(Location((0, 0, -40))),
+    ],
+    ids=["all-planar", "curved-seeded", "mixed-provenance"],
+)
+def test_to_solid_is_always_valid(make_mesh_part):
+    """to_solid() returns a BRepCheck-valid solid for every provenance mix."""
+    solid = make_mesh_part().to_solid()
+    assert isinstance(solid, (Solid, Compound))
+    assert solid.is_valid
