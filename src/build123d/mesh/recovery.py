@@ -163,7 +163,18 @@ def _connected_components(triangles: np.ndarray) -> list[np.ndarray]:
                         component[neighbour] = next_component
                         stack.append(neighbour)
         next_component += 1
-    return [np.where(component == k)[0] for k in range(next_component)]
+    # Split into per-component index arrays in one O(n log n) argsort pass
+    # rather than one O(n) np.where scan per component (which would be
+    # O(n · components), quadratic when a group fragments into many pieces).
+    # Labels are contiguous 0..next_component-1, so bincount gives the run
+    # lengths and a stable argsort gives ascending indices within each run.
+    if next_component == 0:
+        return []
+    order = np.argsort(component, kind="stable")
+    counts = np.bincount(component, minlength=next_component)
+    ends = np.cumsum(counts)
+    starts = ends - counts
+    return [order[starts[k] : ends[k]] for k in range(next_component)]
 
 
 # ---------------------------------------------------------------------------

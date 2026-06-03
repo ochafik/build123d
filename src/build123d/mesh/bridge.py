@@ -68,7 +68,7 @@ license:
 from __future__ import annotations
 
 import itertools
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 import numpy as np
@@ -97,6 +97,10 @@ _WELD_DECIMALS = 6
 # A process-wide counter so face ids are globally unique across every shape ever
 # seeded — booleans can then merge two side-maps with a plain ``dict.update``.
 _FACE_ID_COUNTER = itertools.count()
+
+# Shared read-only empty index array returned by ResultMesh.triangles_of for an
+# id with no triangles (matches the old np.where([])[0] dtype/shape).
+_EMPTY_INDEX = np.empty(0, dtype=np.intp)
 
 
 # ---------------------------------------------------------------------------
@@ -507,15 +511,38 @@ class ResultMesh:
     vertices: np.ndarray
     triangles: np.ndarray
     face_id: np.ndarray
+    # Lazily-built ``face_id -> triangle indices`` map (see _bucket_map).
+    _buckets: Optional[dict[int, np.ndarray]] = field(
+        default=None, init=False, repr=False, compare=False
+    )
+
+    def _bucket_map(self) -> dict[int, np.ndarray]:
+        """Triangle indices grouped by seeded id, built once in O(T log T).
+
+        Recovery touches every distinct id (in ``_vertex_positions``, the main
+        loop, and each per-face recover helper). A naive ``np.where(face_id ==
+        fid)`` per id is O(T) each, so recovery was Θ(T · ids) — quadratic when
+        ids scale with triangle count (synthetic-shattered hulls, densely
+        perforated panels). This single ``argsort``-and-split pass buckets all
+        triangles by id once; :meth:`triangles_of` is then an O(1) lookup.
+        """
+        if self._buckets is None:
+            ids = np.asarray(self.face_id)
+            order = np.argsort(ids, kind="stable")
+            sorted_ids = ids[order]
+            uniq, starts = np.unique(sorted_ids, return_index=True)
+            ends = np.append(starts[1:], len(sorted_ids))
+            self._buckets = {int(u): order[s:e] for u, s, e in zip(uniq, starts, ends)}
+        return self._buckets
 
     @property
     def distinct_ids(self) -> list[int]:
         """The sorted list of distinct seeded ids present in the result."""
-        return sorted(set(self.face_id.tolist()))
+        return sorted(self._bucket_map().keys())
 
     def triangles_of(self, face_id: int) -> np.ndarray:
         """Return the triangle indices whose seeded id equals ``face_id``."""
-        return np.where(self.face_id == face_id)[0]
+        return self._bucket_map().get(int(face_id), _EMPTY_INDEX)
 
 
 def read_result(manifold: m3d.Manifold) -> ResultMesh:

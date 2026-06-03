@@ -433,37 +433,38 @@ def group_shells_into_solids(
     Returns:
         One ``(outer_shell, void_shells)`` tuple per top-level body.
     """
+    count = len(shells)
+    if count <= 1:  # the common case (one body, no voids): nothing to nest
+        return [(shells[0], [])] if shells else []
+
+    # Vectorised bounding-box nesting. ``shell.bounding_box()`` is the only
+    # per-shell OCC cost; the containment test is a single numpy broadcast
+    # instead of the old pairwise Python loop with a redundant volume recompute
+    # per pair. Still O(shells²) comparisons worst case — but over *body count*
+    # (almost always tiny), and the inner loop is now vectorised, so the
+    # constant shrinks ~100×. (A true O(n log n) would need an R-tree, not
+    # worth a core dependency for a path that is ~1 body in practice.)
     boxes = [shell.bounding_box() for shell in shells]
+    mins = np.array([[b.min.X, b.min.Y, b.min.Z] for b in boxes])
+    maxs = np.array([[b.max.X, b.max.Y, b.max.Z] for b in boxes])
+    volumes = np.prod(maxs - mins, axis=1)
+    eps = 1e-7
 
-    def is_inside(inner: BoundBox, outer: BoundBox) -> bool:
-        eps = 1e-7
-        return (
-            outer.min.X - eps <= inner.min.X
-            and outer.min.Y - eps <= inner.min.Y
-            and outer.min.Z - eps <= inner.min.Z
-            and inner.max.X <= outer.max.X + eps
-            and inner.max.Y <= outer.max.Y + eps
-            and inner.max.Z <= outer.max.Z + eps
+    parent: list[int | None] = [None] * count
+    for i in range(count):
+        # Boxes that enclose box i (dominate it on all three axes); the
+        # smallest-volume such box is i's parent (matches the old tiebreak).
+        encloses = np.all(mins <= mins[i] + eps, axis=1) & np.all(
+            maxs >= maxs[i] - eps, axis=1
         )
-
-    def box_volume(box: BoundBox) -> float:
-        size = box.size
-        return size.X * size.Y * size.Z
-
-    parent: list[int | None] = [None] * len(shells)
-    for i in range(len(shells)):
-        for j in range(len(shells)):
-            if i == j:
-                continue
-            if is_inside(boxes[i], boxes[j]):
-                # j encloses i; keep the smallest such enclosing shell.
-                current = parent[i]
-                if current is None or box_volume(boxes[j]) < box_volume(boxes[current]):
-                    parent[i] = j
+        encloses[i] = False
+        candidates = np.flatnonzero(encloses)
+        if candidates.size:
+            parent[i] = int(candidates[np.argmin(volumes[candidates])])
 
     groups: list[tuple[Shell, list[Shell]]] = []
     for i, shell in enumerate(shells):
         if parent[i] is None:  # a top-level (outer) shell
-            voids = [shells[k] for k in range(len(shells)) if parent[k] == i]
+            voids = [shells[k] for k in range(count) if parent[k] == i]
             groups.append((shell, voids))
     return groups

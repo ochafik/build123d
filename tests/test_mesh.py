@@ -696,6 +696,39 @@ def test_reconstruction_disjoint_bodies_yield_a_compound():
     assert faceted.volume == pytest.approx(native.volume, abs=1e-6)
 
 
+def test_triangles_of_bucketing_matches_a_scan():
+    """ResultMesh.triangles_of (O(1) bucket) equals the old O(T) np.where scan.
+
+    The recovery hot-path bucketed triangles by face_id once (O(T log T))
+    instead of scanning per id (O(T·ids), quadratic when ids scale with the
+    triangle count). This locks in that the bucket returns exactly the same
+    indices as the scan for every id — including an id with no triangles.
+    """
+    drilled = mesh_cut(
+        Box(30, 30, 12), *(Box(2, 2, 30).moved(Pos(x, 0, 0)) for x in (-8, 0, 8))
+    )
+    result = read_result(drilled.manifold)
+
+    # distinct_ids matches the unique set of the raw face_id array.
+    assert result.distinct_ids == sorted(set(result.face_id.tolist()))
+
+    # triangles_of matches a fresh np.where scan for every id, and the union of
+    # all buckets is exactly the full triangle index range (no triangle lost).
+    seen = []
+    for fid in result.distinct_ids:
+        bucketed = result.triangles_of(fid)
+        scanned = np.where(result.face_id == fid)[0]
+        assert np.array_equal(bucketed, scanned)
+        seen.append(bucketed)
+    assert np.array_equal(
+        np.sort(np.concatenate(seen)), np.arange(len(result.triangles))
+    )
+
+    # An id not present returns an empty index array (matches np.where([])).
+    missing = max(result.distinct_ids) + 10_000
+    assert result.triangles_of(missing).shape == (0,)
+
+
 def test_curved_result_reconstructs_but_stays_faceted():
     """A cylindrical bore is identified by faceID but recovered faceted."""
     drilled = mesh_cut(Box(30, 30, 12), Cylinder(5, 40))
