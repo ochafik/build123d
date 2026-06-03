@@ -99,6 +99,7 @@ from typing import (
 )
 
 import numpy as np
+from scipy.spatial import cKDTree
 
 import manifold3d as m3d  # type: ignore[import-not-found]
 
@@ -403,11 +404,52 @@ def _unit(vector: np.ndarray) -> np.ndarray:
     return vector / norm if norm > 1e-12 else vector
 
 
+def _build_vertex_face_normal_index(
+    triangles: np.ndarray,
+    face_id: np.ndarray,
+    tri_normals: np.ndarray,
+) -> dict[tuple[int, int], np.ndarray]:
+    """Accumulate, in ONE mesh pass, ``(vertex, face_id) → summed triangle normal``.
+
+    Built once per fillet/chamfer call and shared across every chain, this
+    turns :func:`_per_vertex_face_normals` from a full-triangle scan *per
+    chain* (which made the whole operation ``O(chains × triangles)`` —
+    quadratic on a uniformly perforated panel) into ``O(chain_verts)`` dict
+    lookups. The stored value is the *sum* of incident triangle normals;
+    :func:`_unit` is scale-invariant, so the unit of the sum equals the unit
+    of the mean the old code computed.
+
+    Args:
+        triangles (np.ndarray): host mesh ``(M, 3)`` triangles.
+        face_id (np.ndarray): host mesh ``(M,)`` per-triangle face id.
+        tri_normals (np.ndarray): host mesh ``(M, 3)`` per-triangle normals.
+
+    Returns:
+        dict[tuple[int, int], np.ndarray]: ``(vertex_index, face_id)`` → summed
+        normal over the incident triangles of that vertex on that face.
+    """
+    index: dict[tuple[int, int], np.ndarray] = {}
+    fids = face_id.astype(np.int64)
+    for tri_index in range(len(triangles)):
+        fid = int(fids[tri_index])
+        normal = tri_normals[tri_index]
+        tri = triangles[tri_index]
+        for vi in tri:
+            key = (int(vi), fid)
+            acc = index.get(key)
+            if acc is None:
+                index[key] = normal.copy()
+            else:
+                acc += normal
+    return index
+
+
 def _per_vertex_face_normals(
     chain: FeatureChain,
     triangles: np.ndarray,
     face_id: np.ndarray,
     tri_normals: np.ndarray,
+    index: Optional[dict[tuple[int, int], np.ndarray]] = None,
 ) -> tuple[list[np.ndarray], list[np.ndarray]]:
     """Compute ``(n_a, n_b)`` averaged face-side normals at every chain vertex.
 
@@ -422,29 +464,25 @@ def _per_vertex_face_normals(
         triangles (np.ndarray): host mesh ``(M, 3)`` triangles.
         face_id (np.ndarray): host mesh ``(M,)`` per-triangle face id.
         tri_normals (np.ndarray): host mesh ``(M, 3)`` per-triangle normals.
+        index (dict | None): a prebuilt ``(vertex, face_id) → summed normal``
+            index from :func:`_build_vertex_face_normal_index`, shared across
+            all chains of one call. Built here if not supplied (correct, but
+            an ``O(triangles)`` scan — pass a shared index in hot loops).
 
     Returns:
         tuple[list[np.ndarray], list[np.ndarray]]: per-vertex
         ``(n_a, n_b)`` arrays, aligned with ``chain.verts``.
     """
-    fid_a, _fid_b = chain.pair
-    vertex_set = set(chain.verts)
-    samples_a: dict[int, list[np.ndarray]] = defaultdict(list)
-    samples_b: dict[int, list[np.ndarray]] = defaultdict(list)
-    for tri_index, tri in enumerate(triangles):
-        fid = int(face_id[tri_index])
-        if fid not in chain.pair:
-            continue
-        bucket = samples_a if fid == fid_a else samples_b
-        for vi in tri:
-            v_index = int(vi)
-            if v_index in vertex_set:
-                bucket[v_index].append(tri_normals[tri_index])
+    if index is None:
+        index = _build_vertex_face_normal_index(triangles, face_id, tri_normals)
+    fid_a, fid_b = chain.pair
+    zero = np.zeros(3)
     n_a: list[np.ndarray] = []
     n_b: list[np.ndarray] = []
     for vertex_index in chain.verts:
-        n_a.append(_unit(np.mean(samples_a[vertex_index], axis=0)))
-        n_b.append(_unit(np.mean(samples_b[vertex_index], axis=0)))
+        v = int(vertex_index)
+        n_a.append(_unit(index.get((v, fid_a), zero)))
+        n_b.append(_unit(index.get((v, fid_b), zero)))
     return n_a, n_b
 
 
@@ -592,6 +630,7 @@ def _build_chain_chamfer_tool(
     tri_normals: np.ndarray,
     sizes: np.ndarray,
     endpoint_overshoots: Optional[tuple[float, float]] = None,
+    normal_index: Optional[dict[tuple[int, int], np.ndarray]] = None,
 ) -> Optional[m3d.Manifold]:
     """Build the swept chamfer tool for one chain (a single manifold body).
 
@@ -631,7 +670,7 @@ def _build_chain_chamfer_tool(
         every segment hull failed (degenerate input).
     """
     n_a_per_vertex, n_b_per_vertex = _per_vertex_face_normals(
-        chain, triangles, face_id, tri_normals
+        chain, triangles, face_id, tri_normals, normal_index
     )
     open_overshoot = max(_OPEN_OVERSHOOT * _chain_max_size(sizes), _MIN_PRISM_THICKNESS)
     frames = _vertex_frames(
@@ -674,6 +713,7 @@ def _half_thickness_feasibility(
     n_a_per_vertex: list[np.ndarray],
     n_b_per_vertex: list[np.ndarray],
     sizes: np.ndarray,
+    tree: Optional[cKDTree] = None,
 ) -> Optional[tuple[int, float, float]]:
     """Constraint A — half-thickness rule (per-vertex, A4-compatible).
 
@@ -689,20 +729,36 @@ def _half_thickness_feasibility(
     that ray. This is approximate but conservative — it never *passes* a thin
     plate that the swept tool would actually breach.
 
+    **Performance.** The check can only *fail* on a host vertex whose depth
+    along the inward ray is ``< 2·size`` and whose radial offset is
+    ``< 1.5·size`` — i.e. within Euclidean radius ``2.5·size`` of the chain
+    vertex (``sqrt((2·size)² + (1.5·size)²) = 2.5·size``). So instead of the
+    old per-chain-vertex scan over the *entire* host mesh (which made the
+    whole fillet ``O(chain_verts × mesh_verts)`` — quadratic on a uniformly
+    perforated panel; text-to-cad ``eval/phase-d/A4_MESH_FILLET_SCALING.md``),
+    a ``cKDTree`` radius query returns just the local candidates. Same
+    pass/fail and same reported ``nearest_depth`` (the nearest on-axis-ahead
+    point, when it fails, is by construction inside that radius), but the
+    aggregate is ``O(chain_verts · log mesh_verts)``. The caller builds the
+    tree once over the host vertices and passes it to every chain; a ``None``
+    tree is built here (correct, just not shared) for direct callers.
+
     Args:
         chain (FeatureChain): the chain to test.
         vertices (np.ndarray): host mesh vertices.
         n_a_per_vertex (list[np.ndarray]): per-vertex face-A normal.
         n_b_per_vertex (list[np.ndarray]): per-vertex face-B normal.
         sizes (np.ndarray): per-vertex requested chamfer leg / fillet radius.
+        tree (cKDTree | None): prebuilt spatial index over ``vertices``; built
+            here if not supplied.
 
     Returns:
         tuple[int, float, float] | None: ``(host_vertex_index, requested_size,
         measured_thickness)`` for the first failing vertex, or ``None`` if
         every vertex passes.
     """
-    bbox_min, bbox_max = vertices.min(axis=0), vertices.max(axis=0)
-    bbox_diag = float(np.linalg.norm(bbox_max - bbox_min))
+    if tree is None:
+        tree = cKDTree(vertices)
 
     for index, v_index in enumerate(chain.verts):
         size_i = float(sizes[index])
@@ -711,13 +767,16 @@ def _half_thickness_feasibility(
         inward = _unit(-(n_a_per_vertex[index] + n_b_per_vertex[index]))
         if float(np.linalg.norm(inward)) < 1e-9:
             continue
-        # Look along inward at all other vertices of the host mesh; the closest
-        # vertex on the far-side along this ray gives an upper bound for the
-        # opposing-face distance.
-        offsets = vertices - p_i
+        # A failing host vertex must lie within Euclidean radius 2.5·size of
+        # p_i (depth < 2·size AND radial < 1.5·size). Query just that ball;
+        # points outside it cannot cause a failure.
+        candidate_idx = tree.query_ball_point(p_i, r=2.5 * size_i + 1e-6)
+        if not candidate_idx:
+            continue
+        candidates = vertices[candidate_idx]
+        offsets = candidates - p_i
         depths = offsets @ inward
-        # Only points *ahead* along the inward ray, within bbox_diag
-        ahead = (depths > 1e-6) & (depths < bbox_diag * 2.0)
+        ahead = (depths > 1e-6) & (depths < threshold)
         if not ahead.any():
             continue
         # Reject points far off-axis (we want roughly axial hits). The radial
@@ -740,6 +799,7 @@ def _check_feasibility(
     n_a_per_vertex: list[np.ndarray],
     n_b_per_vertex: list[np.ndarray],
     sizes: np.ndarray,
+    tree: Optional[cKDTree] = None,
 ) -> None:
     """Run per-chain feasibility checks, raise :exc:`MeshFilletInfeasible` on failure.
 
@@ -761,7 +821,7 @@ def _check_feasibility(
     """
     # Constraint A — half-thickness, per vertex (A4)
     failure = _half_thickness_feasibility(
-        chain, vertices, n_a_per_vertex, n_b_per_vertex, sizes
+        chain, vertices, n_a_per_vertex, n_b_per_vertex, sizes, tree
     )
     if failure is not None:
         v_idx, requested, measured = failure
@@ -1102,7 +1162,13 @@ def _mesh_chamfer_impl(
         active_corners = _filter_corners_for_skip(corners, representative_size, report)
 
     # Pre-flight every chain *before* building any tool — fail fast on raise,
-    # collect on skip.
+    # collect on skip. Build the host-vertex spatial index ONCE and share it
+    # across all chains (the half-thickness check is a local radius query —
+    # without this the pre-flight is O(chains × mesh), the §A4 quadratic).
+    host_tree = cKDTree(vertices)
+    # Shared per-vertex face-normal index — see _build_vertex_face_normal_index
+    # (without it _per_vertex_face_normals re-scans every triangle per chain).
+    normal_index = _build_vertex_face_normal_index(triangles, face_id, tri_normals)
     per_chain_normals: dict[int, tuple[list[np.ndarray], list[np.ndarray]]] = {}
     per_chain_sizes: dict[int, np.ndarray] = {}
     for chain in chains:
@@ -1142,7 +1208,7 @@ def _mesh_chamfer_impl(
         # does NOT swallow these).
         sizes = _chain_radius_samples(chain, per_vertex_fn)
         n_a_per_vertex, n_b_per_vertex = _per_vertex_face_normals(
-            chain, triangles, face_id, tri_normals
+            chain, triangles, face_id, tri_normals, normal_index
         )
         try:
             _check_feasibility(
@@ -1151,6 +1217,7 @@ def _mesh_chamfer_impl(
                 n_a_per_vertex,
                 n_b_per_vertex,
                 sizes,
+                host_tree,
             )
         except MeshFilletInfeasible as exc:
             if on_infeasible == "raise":
@@ -1207,6 +1274,7 @@ def _mesh_chamfer_impl(
             tri_normals,
             sizes,
             endpoint_overshoots=overshoots,
+            normal_index=normal_index,
         )
         if tool is None:
             if on_infeasible == "skip":
@@ -1831,6 +1899,7 @@ def _build_swept_arc_tool(
     endpoint_overshoots: Optional[tuple[float, float]] = None,
     *,
     sign: str = "convex",
+    normal_index: Optional[dict[tuple[int, int], np.ndarray]] = None,
 ) -> Optional[m3d.Manifold]:
     """Build a swept fillet tool for one single-sign sub-run.
 
@@ -1897,7 +1966,7 @@ def _build_swept_arc_tool(
         edges=[],
     )
     n_a_per_vertex, n_b_per_vertex = _per_vertex_face_normals(
-        transient, triangles, face_id, tri_normals
+        transient, triangles, face_id, tri_normals, normal_index
     )
     open_overshoot = max(_OPEN_OVERSHOOT * _chain_max_size(radii), _MIN_PRISM_THICKNESS)
     frames = _vertex_frames(
@@ -1952,6 +2021,8 @@ def _check_fillet_feasibility(
     face_id: np.ndarray,
     tri_normals: np.ndarray,
     radii: np.ndarray,
+    tree: Optional[cKDTree] = None,
+    normal_index: Optional[dict[tuple[int, int], np.ndarray]] = None,
 ) -> None:
     """Run the fillet feasibility checks for one chain (design §5.1).
 
@@ -1972,9 +2043,9 @@ def _check_fillet_feasibility(
         MeshFilletInfeasible: with ``constraint`` set to the failing check.
     """
     n_a_per_vertex, n_b_per_vertex = _per_vertex_face_normals(
-        chain, triangles, face_id, tri_normals
+        chain, triangles, face_id, tri_normals, normal_index
     )
-    _check_feasibility(chain, vertices, n_a_per_vertex, n_b_per_vertex, radii)
+    _check_feasibility(chain, vertices, n_a_per_vertex, n_b_per_vertex, radii, tree)
 
 
 # ---------------------------------------------------------------------------
@@ -2119,6 +2190,14 @@ def _mesh_fillet_impl(
 
     # Pre-flight every chain — sample radii, then run the half-thickness /
     # chain-length checks. Per-vertex sample arrays are cached for tool build.
+    # The host-vertex spatial index is built ONCE and shared across chains
+    # (without it the half-thickness pre-flight is O(chains × mesh) — the §A4
+    # quadratic; see text-to-cad eval/phase-d/A4_MESH_FILLET_SCALING.md).
+    host_tree = cKDTree(vertices)
+    # Per-vertex face-normal index, also built ONCE and shared across chains —
+    # without it _per_vertex_face_normals re-scans every triangle per chain,
+    # the dominant O(chains × triangles) term (see the same A4 note).
+    normal_index = _build_vertex_face_normal_index(triangles, face_id, tri_normals)
     per_chain_radii: dict[int, np.ndarray] = {}
     for chain in chains:
         if chain.convexity_class == "flat":
@@ -2128,7 +2207,8 @@ def _mesh_fillet_impl(
         radii = _chain_radius_samples(chain, per_vertex_fn)
         try:
             _check_fillet_feasibility(
-                chain, vertices, triangles, face_id, tri_normals, radii
+                chain, vertices, triangles, face_id, tri_normals, radii,
+                host_tree, normal_index,
             )
         except MeshFilletInfeasible as exc:
             if on_infeasible == "raise":
@@ -2219,6 +2299,7 @@ def _mesh_fillet_impl(
                 segments,
                 endpoint_overshoots,
                 sign=sign,
+                normal_index=normal_index,
             )
             if tool is None:
                 if on_infeasible == "skip":
