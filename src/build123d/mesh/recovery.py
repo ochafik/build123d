@@ -372,6 +372,10 @@ def _vertex_positions(result: ResultMesh, side_map: SideMap) -> np.ndarray:
 
     for face_id in result.distinct_ids:
         record = side_map[face_id] if face_id in side_map else None
+        # Only a *seeded* planar record carries an exact input plane to project
+        # onto. A synthetic record's plane (if any) is fitted from these very
+        # vertices during recovery, so projecting them here would be circular and
+        # could pull a shared seam vertex off a neighbouring region — keep raw.
         is_planar = record is not None and record.is_planar
         triangles = result.triangles[result.triangles_of(face_id)]
         incident = np.unique(triangles)
@@ -420,7 +424,7 @@ class RecoveredFace:
 
 
 @dataclass
-class RecoveryResult:
+class RecoveryResult:  # pylint: disable=too-many-instance-attributes
     """The outcome of a faceID-grouped B-rep recovery.
 
     Attributes:
@@ -430,8 +434,18 @@ class RecoveryResult:
             :class:`~build123d.Shell` if no closed solid could be made.
         recovered_faces (list[RecoveredFace]): one record per face_id in the
             result mesh (seeded *or* unseeded).
-        n_exact_planar (int): number of exact planar faces built.
+        n_exact_planar (int): number of exact planar faces built (seeded ids on
+            the *known input* ``Geom_Plane``).
         n_faceted_curved (int): number of curved seeded ids kept faceted.
+        n_synthetic_planar (int): number of synthetic coplanar-region ids
+            (``hull`` / ``minkowski`` / ``from_mesh``) recovered as a single
+            **fitted**-plane analytic face per connected component — planar
+            within tolerance, but on a plane fitted from the region's own
+            triangles, NOT a seeded-from-input exact plane. Distinct from
+            :attr:`n_exact_planar` for exactly that reason.
+        n_synthetic_faceted (int): number of synthetic coplanar-region ids whose
+            triangles were *not* coplanar within tolerance (a curved region of a
+            constructive op) and so were kept as a single faceted patch.
         n_unseeded_faceted (int): number of result face_ids that had no
             side-map entry — recovered as anonymous faceted patches (one flat
             ``TopoDS_Face`` per triangle). Non-zero when the input MeshPart
@@ -451,6 +465,8 @@ class RecoveryResult:
     recovered_faces: list[RecoveredFace] = field(default_factory=list)
     n_exact_planar: int = 0
     n_faceted_curved: int = 0
+    n_synthetic_planar: int = 0
+    n_synthetic_faceted: int = 0
     n_unseeded_faceted: int = 0
     is_valid: bool = False
     volume: float = 0.0
@@ -575,6 +591,159 @@ def _recover_planar_face(
     return RecoveredFace(face_id, "PLANE", faces, True, note)
 
 
+# ---------------------------------------------------------------------------
+# synthetic coplanar-region recovery: fitted plane if planar, else faceted
+# ---------------------------------------------------------------------------
+
+# A synthetic region is treated as planar when every triangle normal aligns with
+# the area-weighted region normal to within this cosine tolerance (~0.6 degrees).
+# Constructive-op output (hull / from_mesh / Minkowski) that is genuinely flat
+# clears this comfortably; a rounded Minkowski shell's facets do not.
+_SYNTHETIC_PLANAR_COS_TOLERANCE = 1e-4
+
+
+def _fit_plane(
+    result: ResultMesh, group: np.ndarray
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Fit a plane to a synthetic region's triangles, or ``None`` if not planar.
+
+    Computes the area-weighted mean normal of ``group`` and accepts the region
+    as planar only if **every** triangle's unit normal aligns with that mean to
+    within :data:`_SYNTHETIC_PLANAR_COS_TOLERANCE`. The returned origin is the
+    region's centroid; the normal is the unit mean normal. This is a *fitted*
+    plane (from the region's own tessellated vertices), deliberately distinct
+    from a seeded-from-input exact ``Geom_Plane``.
+
+    Args:
+        result (ResultMesh): the boolean result mesh.
+        group (np.ndarray): ``(M, 3)`` triangle vertex indices of one synthetic
+            id.
+
+    Returns:
+        tuple[np.ndarray, np.ndarray] | None: ``(origin, unit_normal)`` if the
+        region is coplanar within tolerance, else ``None``.
+    """
+    corner_a = result.vertices[group[:, 0]]
+    corner_b = result.vertices[group[:, 1]]
+    corner_c = result.vertices[group[:, 2]]
+    cross = np.cross(corner_b - corner_a, corner_c - corner_a)  # 2*area * normal
+    lengths = np.linalg.norm(cross, axis=1)
+    keep = lengths > 0.0
+    if not np.any(keep):
+        return None
+    mean_normal = cross[keep].sum(axis=0)
+    mean_length = np.linalg.norm(mean_normal)
+    if mean_length == 0.0:
+        return None
+    unit_normal = mean_normal / mean_length
+    # Every (non-degenerate) facet normal must align with the mean normal.
+    unit_facets = cross[keep] / lengths[keep][:, None]
+    if np.min(unit_facets @ unit_normal) < 1.0 - _SYNTHETIC_PLANAR_COS_TOLERANCE:
+        return None
+    origin = np.concatenate([corner_a, corner_b, corner_c], axis=0).mean(axis=0)
+    return origin, unit_normal
+
+
+def _recover_synthetic_face(
+    result: ResultMesh,
+    face_id: int,
+    topology: _SharedTopology,
+    component_of_triangle: np.ndarray,
+    faces_by_component: dict[int, list[Face]],
+) -> tuple[RecoveredFace, bool]:
+    """Recover one synthetic coplanar-region id.
+
+    Synthetic ids come from constructive ops (``hull`` / ``minkowski`` /
+    ``from_mesh``) that have no input provenance but whose ``manifold3d``-derived
+    ``face_id`` channel groups coplanar triangles. If the region's triangles are
+    coplanar within tolerance (:func:`_fit_plane`), it is rebuilt as **one
+    fitted-plane analytic** :class:`~build123d.Face` per connected component —
+    merging what would otherwise be one anonymous ``TopoDS_Face`` per triangle
+    into a single planar face. Otherwise (a curved region of the op, e.g. a
+    Minkowski rounded shell) it is kept as a single faceted patch.
+
+    The fitted-plane face reuses :func:`_recover_planar_face` via a temporary
+    planar :class:`FaceRecord`, so its wires are built from the same shared
+    per-segment edges and share seams with neighbours exactly like a seeded face.
+
+    Args:
+        result (ResultMesh): the boolean result mesh.
+        face_id (int): the synthetic id to recover.
+        topology (_SharedTopology): the shared vertex/edge cache.
+        component_of_triangle (np.ndarray): per-triangle body component label.
+        faces_by_component (dict[int, list[Face]]): built faces filed by body
+            component (mutated in place).
+
+    Returns:
+        tuple[RecoveredFace, bool]: the recovered record, and ``True`` if it was
+        rebuilt as fitted-plane face(s) (``False`` if kept faceted).
+    """
+    group = result.triangles[result.triangles_of(face_id)]
+    # A single-triangle synthetic region is not a *merge*: manifold simply did
+    # not coplanar-group it (e.g. a Minkowski rounded shell emits one id per
+    # triangle). A lone triangle trivially satisfies the plane fit, so guard
+    # against counting it as a genuine merged planar face — keep it faceted so
+    # n_synthetic_planar honestly means "coplanar triangles actually merged".
+    if len(group) <= 1:
+        patch = _faceted_patch(
+            result, face_id, topology, component_of_triangle, faces_by_component
+        )
+        return (
+            RecoveredFace(
+                face_id,
+                "SYNTHETIC-faceted",
+                patch,
+                False,
+                f"faceted: {len(patch)} triangle, ungrouped synthetic region",
+            ),
+            False,
+        )
+    fitted = _fit_plane(result, group)
+    if fitted is not None:
+        origin, normal = fitted
+        # A *fitted* plane, not a seeded input plane: a synthetic record carrying
+        # the fit so _recover_planar_face can build wires on it.
+        fitted_record = FaceRecord(
+            face_id=face_id,
+            b3d_face=None,
+            surface_kind="SYNTHETIC",
+            geom_surface=None,
+            source="synthetic",
+            plane_origin=origin,
+            plane_normal=normal,
+        )
+        recovered = _recover_planar_face(
+            result,
+            face_id,
+            fitted_record,
+            topology,
+            component_of_triangle,
+            faces_by_component,
+        )
+        if recovered.faces:
+            note = "fitted plane (synthetic coplanar region)"
+            if len(recovered.faces) > 1:
+                note = f"fitted plane (synthetic), split into {len(recovered.faces)}"
+            return (
+                RecoveredFace(face_id, "SYNTHETIC-plane", recovered.faces, False, note),
+                True,
+            )
+    # Not coplanar (or the fitted face failed to build): keep it faceted.
+    patch = _faceted_patch(
+        result, face_id, topology, component_of_triangle, faces_by_component
+    )
+    return (
+        RecoveredFace(
+            face_id,
+            "SYNTHETIC-faceted",
+            patch,
+            False,
+            f"faceted: {len(patch)} triangles, synthetic non-planar region",
+        ),
+        False,
+    )
+
+
 def _faceted_patch(
     result: ResultMesh,
     face_id: int,
@@ -695,6 +864,8 @@ def recover_brep(result: ResultMesh, side_map: SideMap) -> RecoveryResult:
     recovered_faces: list[RecoveredFace] = []
     n_exact_planar = 0
     n_faceted_curved = 0
+    n_synthetic_planar = 0
+    n_synthetic_faceted = 0
     n_unseeded_faceted = 0
 
     # Faces grouped by body component label, ready for shell assembly. A single
@@ -729,7 +900,25 @@ def recover_brep(result: ResultMesh, side_map: SideMap) -> RecoveryResult:
             )
             continue
         record = side_map[face_id]
-        if record.is_planar:
+        if record.is_synthetic:
+            # Synthetic coplanar-region id from a constructive op (hull /
+            # minkowski / from_mesh): one fitted-plane analytic face per
+            # connected component when coplanar-within-tolerance, else a single
+            # faceted patch. Strictly better than the unseeded per-triangle path
+            # and clearly distinct from a seeded exact plane.
+            synthetic, is_fitted_plane = _recover_synthetic_face(
+                result,
+                face_id,
+                topology,
+                component_of_triangle,
+                faces_by_component,
+            )
+            if is_fitted_plane:
+                n_synthetic_planar += len(synthetic.faces)
+            else:
+                n_synthetic_faceted += 1
+            recovered_faces.append(synthetic)
+        elif record.is_planar:
             recovered = _recover_planar_face(
                 result,
                 face_id,
@@ -814,6 +1003,8 @@ def recover_brep(result: ResultMesh, side_map: SideMap) -> RecoveryResult:
         recovered_faces=recovered_faces,
         n_exact_planar=n_exact_planar,
         n_faceted_curved=n_faceted_curved,
+        n_synthetic_planar=n_synthetic_planar,
+        n_synthetic_faceted=n_synthetic_faceted,
         n_unseeded_faceted=n_unseeded_faceted,
         is_valid=is_valid,
         volume=volume,

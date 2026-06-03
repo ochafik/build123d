@@ -68,7 +68,7 @@ from build123d.geometry import BoundBox, Location
 from build123d.topology import Compound, Face, Part, Shape, ShapeList, Solid
 
 from ._utils import triangle_normals
-from .bridge import SideMap, read_result, shape_to_manifold
+from .bridge import SideMap, read_result, shape_to_manifold, synthetic_side_map
 from .recovery import recover_brep
 
 # manifold3d is a C extension; pylint cannot introspect its members statically.
@@ -186,9 +186,14 @@ class MeshPart:
         guaranteed-manifold body. The mesh must already be a closed, oriented,
         indexed 2-manifold; the manifold status is asserted after construction.
 
-        The resulting :class:`MeshPart` carries an **empty** side-map: a raw mesh
-        has no analytic provenance, so :meth:`to_solid` falls back to the faceted
-        bake (one planar face per triangle).
+        The resulting :class:`MeshPart` carries a **synthetic** side-map: a raw
+        mesh has no analytic provenance, but ``manifold3d`` groups its triangles
+        into coplanar regions. Those regions are seeded as synthetic ids (no
+        claimed analytic surface), so :meth:`to_solid` recovers **one merged
+        planar face per coplanar region** — an imported STL of a cube becomes 6
+        faces, not 12 triangles — fitting a plane where the region is planar and
+        keeping curved regions faceted. (Use ``to_solid(reconstruct=False)`` for
+        the pure one-face-per-triangle bake.)
 
         Args:
             vertices: ``(N, 3)`` array of vertex coordinates.
@@ -196,7 +201,8 @@ class MeshPart:
                 counter-clockwise for outward normals.
 
         Returns:
-            MeshPart: a guaranteed-manifold mesh body with no provenance.
+            MeshPart: a guaranteed-manifold mesh body carrying synthetic
+            coplanar-region provenance.
 
         Raises:
             ValueError: if the arrays are mis-shaped or the mesh does not import
@@ -216,7 +222,11 @@ class MeshPart:
                 f"Raw mesh is not a valid manifold: {manifold.status()}. It "
                 "must be a closed, oriented, 2-manifold triangle mesh."
             )
-        return cls(manifold)
+        # No input provenance, but manifold3d groups the raw triangles into
+        # coplanar regions; seed those as synthetic ids so to_solid merges each
+        # planar region into a single face (a cube STL -> 6 faces, not 12).
+        seeded, side_map = synthetic_side_map(manifold)
+        return cls(seeded, side_map)
 
     # ---- Faceted primitive constructors ----
 

@@ -126,8 +126,11 @@ class FaceRecord:
 
     Attributes:
         face_id (int): the globally unique seeded id.
-        b3d_face (Face): the originating build123d Face.
-        surface_kind (str): ``"PLANE"``, ``"CYLINDER"``, ``"SPHERE"``, etc.
+        b3d_face (Face | None): the originating build123d Face, or ``None`` for a
+            synthetic coplanar-region record (which has no originating face).
+        surface_kind (str): ``"PLANE"``, ``"CYLINDER"``, ``"SPHERE"``, … for a
+            seeded face; ``"SYNTHETIC"`` for a coplanar-region id from a
+            constructive op (``hull`` / ``minkowski`` / ``from_mesh``).
         geom_surface (object): the exact ``Geom_Surface`` handle.
         source (str): a name for the source shape (for provenance reporting).
         plane_origin (np.ndarray | None): exact plane origin (planar faces only).
@@ -135,7 +138,7 @@ class FaceRecord:
     """
 
     face_id: int
-    b3d_face: Face
+    b3d_face: Optional[Face]
     surface_kind: str
     geom_surface: object
     source: str
@@ -144,8 +147,27 @@ class FaceRecord:
 
     @property
     def is_planar(self) -> bool:
-        """True if this face lies on an exact ``Geom_Plane``."""
+        """True if this face lies on a *known input* exact ``Geom_Plane``.
+
+        Only a record seeded from an analysed build123d face (``surface_kind ==
+        "PLANE"``) is planar in this exact sense; a :attr:`is_synthetic` record
+        carries no input plane (its plane, if any, is *fitted* during recovery —
+        see :mod:`build123d.mesh.recovery`).
+        """
         return self.surface_kind == "PLANE"
+
+    @property
+    def is_synthetic(self) -> bool:
+        """True if this is a synthetic coplanar-region id (no input provenance).
+
+        A synthetic record tags a coplanar region of a *constructive* op's output
+        (``hull`` / ``minkowski`` / ``from_mesh``) — geometry with no originating
+        build123d face. It claims **no** analytic surface: recovery fits a plane
+        from the region's own triangles when they are coplanar-within-tolerance
+        (a *fitted* plane, distinct from a seeded-from-input exact ``Geom_Plane``)
+        and otherwise keeps the region faceted.
+        """
+        return self.surface_kind == "SYNTHETIC"
 
     def transformed(self, matrix: np.ndarray) -> "FaceRecord":
         """Return a copy with planar parameters moved by a 3x4 affine transform.
@@ -510,3 +532,77 @@ def read_result(manifold: m3d.Manifold) -> ResultMesh:
     triangles = np.asarray(mesh.tri_verts, dtype=np.int64)
     face_id = np.asarray(mesh.face_id, dtype=np.int64)
     return ResultMesh(vertices=vertices, triangles=triangles, face_id=face_id)
+
+
+# ---------------------------------------------------------------------------
+# synthetic coplanar-region seeding for constructive ops (hull / minkowski /
+# from_mesh) -- no input provenance, but a usable coplanar grouping
+# ---------------------------------------------------------------------------
+
+
+def synthetic_side_map(manifold: m3d.Manifold) -> tuple[m3d.Manifold, SideMap]:
+    """Re-seed a constructive op's output with synthetic coplanar-region ids.
+
+    A constructive op (``hull`` / ``minkowski`` / ``from_mesh``) synthesises new
+    surfaces, so no input ``face_id`` traces through it. ``manifold3d`` does,
+    however, fill ``face_id`` from its **own** coplanar-region calculation — and
+    that grouping is good: a hull of a box yields one id per planar facet (6, not
+    12 triangles); a Minkowski box ⊕ box yields 6; a Minkowski box ⊕ sphere keeps
+    the 6 flat faces merged while the rounded shell stays per-facet. Rather than
+    recompute a coplanar+connected flood-fill in Python, this reuses that
+    grouping directly.
+
+    The manifold's own ids are small integers (``0, 2, 4, …``) that would
+    *collide* with the process-wide seeded-id counter the moment the result is
+    mixed into a boolean with a seeded operand. So every distinct manifold id is
+    remapped to a fresh globally-unique id and re-stamped onto the mesh; the
+    returned manifold carries the remapped ids and the returned :class:`SideMap`
+    records each as a **synthetic** :class:`FaceRecord` (``surface_kind ==
+    "SYNTHETIC"``) — a coplanar region with no input provenance. Recovery
+    (:mod:`build123d.mesh.recovery`) groups by these ids and emits **one** face
+    per coplanar region: a *fitted*-plane analytic face when the region's
+    triangles are coplanar-within-tolerance, else a single faceted patch —
+    instead of one anonymous ``TopoDS_Face`` per triangle.
+
+    Args:
+        manifold (manifold3d.Manifold): a constructive-op result whose own
+            ``face_id`` channel carries a coplanar grouping.
+
+    Returns:
+        tuple[manifold3d.Manifold, SideMap]: the manifold re-stamped with fresh
+        globally-unique synthetic ids, and the matching synthetic side-map. If
+        the manifold is empty the original manifold and an empty side-map are
+        returned unchanged.
+    """
+    mesh = manifold.to_mesh()
+    triangles = np.asarray(mesh.tri_verts)
+    if len(triangles) == 0:
+        return manifold, SideMap()
+    raw_ids = np.asarray(mesh.face_id, dtype=np.int64)
+
+    # Remap each distinct manifold coplanar-region id to a fresh global id, so it
+    # never collides with a seeded id once mixed into a later boolean.
+    remap: dict[int, int] = {}
+    records: dict[int, FaceRecord] = {}
+    new_ids = np.empty(len(raw_ids), dtype=np.uint64)
+    for position, raw in enumerate(raw_ids.tolist()):
+        global_id = remap.get(raw)
+        if global_id is None:
+            global_id = next(_FACE_ID_COUNTER)
+            remap[raw] = global_id
+            records[global_id] = FaceRecord(
+                face_id=global_id,
+                b3d_face=None,
+                surface_kind="SYNTHETIC",
+                geom_surface=None,
+                source="synthetic",
+            )
+        new_ids[position] = global_id
+
+    vertices = np.asarray(mesh.vert_properties, dtype=np.float64)[:, :3]
+    reseeded = _build_manifold(
+        np.ascontiguousarray(vertices),
+        np.ascontiguousarray(triangles, dtype=np.uint64),
+        new_ids,
+    )
+    return reseeded, SideMap(records)

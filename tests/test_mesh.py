@@ -564,13 +564,22 @@ def test_side_maps_merge_without_collision():
     assert len(drilled.side_map) == len(block.side_map) + len(tool.side_map)
 
 
-def test_from_mesh_has_an_empty_side_map():
-    """A MeshPart built from raw arrays carries no provenance."""
+def test_from_mesh_carries_a_synthetic_side_map():
+    """A MeshPart from raw arrays gets synthetic coplanar-region provenance.
+
+    A raw mesh has no input face provenance, but manifold3d groups its triangles
+    into coplanar regions; from_mesh seeds those as synthetic ids so to_solid can
+    merge each planar region into a single face. Every record is synthetic (no
+    claimed analytic surface).
+    """
     source = MeshPart.from_part(Box(8, 8, 8))
     vertices, triangles = source.to_arrays()
     wrapped = MeshPart.from_mesh(vertices, triangles)
-    assert len(wrapped.side_map) == 0
-    assert not wrapped.side_map
+    # A welded box has 6 coplanar regions -> 6 synthetic ids.
+    assert len(wrapped.side_map) == 6
+    assert all(record.is_synthetic for record in wrapped.side_map.records.values())
+    # Synthetic is NOT seeded-exact-planar: no record claims an input plane.
+    assert not any(record.is_planar for record in wrapped.side_map.records.values())
 
 
 # --------------------------------------------------------------------------
@@ -596,16 +605,26 @@ def test_reconstructed_faces_are_analytic_planes():
         assert face.geom_type == GeomType.PLANE
 
 
-def test_reconstruction_falls_back_to_faceted_without_side_map():
-    """A MeshPart with no side-map bakes via the faceted path."""
+def test_from_mesh_recovers_merged_planar_faces_via_synthetic_ids():
+    """A from_mesh body recovers merged planar faces from its synthetic ids.
+
+    A raw cube mesh (12 triangles, 6 coplanar regions) bakes — through the
+    synthetic coplanar-region grouping — to a solid of **6 merged planar faces**,
+    not 12 per-triangle faces, with exact volume. ``reconstruct=False`` still
+    forces the one-face-per-triangle faceted bake.
+    """
     source = MeshPart.from_part(Box(10, 10, 10))
     vertices, triangles = source.to_arrays()
     wrapped = MeshPart.from_mesh(vertices, triangles)
     solid = wrapped.to_solid()
     assert solid.is_valid
     assert solid.volume == pytest.approx(1000.0, rel=1e-6)
-    # The faceted box has 12 triangle faces, not 6 merged planes.
-    assert len(solid.faces()) == 12
+    # Synthetic grouping merges each coplanar region: 6 faces, not 12 triangles.
+    assert len(solid.faces()) == 6
+    # The pure faceted bake still yields one face per triangle.
+    faceted = wrapped.to_solid(reconstruct=False)
+    assert faceted.is_valid
+    assert len(faceted.faces()) == 12
 
 
 def test_reconstruct_false_forces_the_faceted_path():
@@ -882,11 +901,31 @@ def test_mesh_hull_method_on_meshpart():
     assert enveloped.volume == pytest.approx(24 * 4 * 4, rel=1e-6)
 
 
-def test_mesh_hull_carries_no_provenance():
-    """A hull is new geometry: the result carries an empty side-map."""
+def test_mesh_hull_carries_synthetic_provenance():
+    """A hull's coplanar facets are seeded as synthetic ids (no input surface).
+
+    A hull synthesises new envelope facets with no input provenance, but
+    manifold3d groups them into coplanar regions; mesh_hull seeds those as
+    synthetic ids. to_solid then recovers ONE merged planar face per hull facet
+    (the flat hull faces become single faces, not N triangles) instead of one
+    anonymous face per triangle.
+    """
     hull = mesh_hull(Box(4, 4, 4), Box(4, 4, 4).moved(Pos(20, 0, 0)))
-    assert len(hull.side_map) == 0
-    # With no provenance, to_solid falls back to the faceted bake.
+    # Synthetic provenance, not seeded-exact: every record is synthetic.
+    assert len(hull.side_map) > 0
+    assert all(record.is_synthetic for record in hull.side_map.records.values())
+
+    result_mesh = read_result(hull.manifold)
+    recovered = recover_brep(result_mesh, hull.side_map)
+    assert recovered.is_valid
+    # The flat hull faces recover as merged planar faces, far fewer than the
+    # triangle count (the grouped, not per-triangle, win).
+    merged_face_count = sum(len(r.faces) for r in recovered.recovered_faces)
+    assert merged_face_count < len(result_mesh.triangles)
+    # No seeded-exact planar faces -- a hull claims no input surface.
+    assert recovered.n_exact_planar == 0
+    assert recovered.n_synthetic_planar > 0
+
     solid = hull.to_solid()
     assert solid.is_valid
 
@@ -921,8 +960,17 @@ def test_mesh_minkowski_sphere_box_rounds_the_box():
     assert rounded.volume < analytic
     # The rounded body is strictly larger than the bare core box.
     assert rounded.volume > core
-    # A Minkowski sum is new geometry: no provenance survives.
-    assert len(rounded.side_map) == 0
+    # A Minkowski sum is new geometry: no input provenance, but manifold3d's
+    # coplanar grouping is seeded as synthetic ids (the 6 flat faces merge,
+    # the rounded shell stays per-facet).
+    assert len(rounded.side_map) > 0
+    assert all(record.is_synthetic for record in rounded.side_map.records.values())
+    # The 6 flat faces recover as 6 large merged planar faces.
+    solid = rounded.to_solid()
+    big_planar = [
+        f for f in solid.faces() if f.geom_type == GeomType.PLANE and f.area > 50.0
+    ]
+    assert len(big_planar) == 6
 
 
 def test_mesh_minkowski_box_box_is_exact_convex_case():
@@ -979,6 +1027,115 @@ def test_mesh_minkowski_method_on_meshpart():
 
 
 # --------------------------------------------------------------------------
+# Synthetic coplanar-region seeding (Option E): hull / minkowski / from_mesh
+# recover one merged face per coplanar region, not one per triangle
+# --------------------------------------------------------------------------
+
+
+def test_synthetic_from_mesh_cube_recovers_six_faces_exact_volume():
+    """from_mesh of a cube's raw arrays recovers 6 merged planar faces, exact."""
+    # A unit cube: 8 corner vertices, 12 triangles (2 per face), CCW outward.
+    vertices = np.array(
+        [
+            [0, 0, 0],
+            [1, 0, 0],
+            [1, 1, 0],
+            [0, 1, 0],
+            [0, 0, 1],
+            [1, 0, 1],
+            [1, 1, 1],
+            [0, 1, 1],
+        ],
+        dtype=np.float64,
+    )
+    triangles = np.array(
+        [
+            [0, 2, 1],
+            [0, 3, 2],  # bottom z=0
+            [4, 5, 6],
+            [4, 6, 7],  # top z=1
+            [0, 1, 5],
+            [0, 5, 4],  # y=0
+            [2, 3, 7],
+            [2, 7, 6],  # y=1
+            [1, 2, 6],
+            [1, 6, 5],  # x=1
+            [0, 4, 7],
+            [0, 7, 3],  # x=0
+        ],
+        dtype=np.int64,
+    )
+    part = MeshPart.from_mesh(vertices, triangles)
+    solid = part.to_solid()
+    assert isinstance(solid, Solid)
+    assert solid.is_valid
+    # 6 merged planar faces, not 12 triangles.
+    assert len(solid.faces()) == 6
+    assert all(f.geom_type == GeomType.PLANE for f in solid.faces())
+    assert solid.volume == pytest.approx(1.0, abs=1e-9)
+
+
+def test_synthetic_hull_of_boxes_recovers_merged_planar_faces():
+    """mesh_hull of boxes recovers merged planar faces ~ the true planar count.
+
+    The hull of two stacked-and-offset boxes is a convex polyhedron with a small
+    number of true planar faces. Recovery must merge each coplanar facet region
+    into a single planar face -- a face count near the planar-face count, far
+    below the triangle count -- and keep the volume.
+    """
+    hull = mesh_hull(
+        Box(20, 20, 6),
+        Box(6, 6, 20).moved(Pos(0, 0, 10)),
+    )
+    result_mesh = read_result(hull.manifold)
+    recovered = recover_brep(result_mesh, hull.side_map)
+    assert recovered.is_valid
+    merged = sum(len(r.faces) for r in recovered.recovered_faces)
+    # Far fewer faces than triangles: the coplanar regions merged.
+    assert merged < len(result_mesh.triangles)
+    # A convex hull of two axis-aligned boxes is bounded by a modest number of
+    # planar faces; the merged count is well under 40 (not hundreds of facets).
+    assert merged < 40
+    # No seeded-exact planes (a hull claims no input surface), all synthetic.
+    assert recovered.n_exact_planar == 0
+    assert recovered.n_synthetic_planar > 0
+
+    solid = hull.to_solid()
+    assert solid.is_valid
+    assert solid.volume == pytest.approx(hull.manifold.volume(), rel=1e-3)
+
+
+def test_synthetic_minkowski_rounded_box_merges_flats_facets_rounds():
+    """mesh_minkowski(box, small box) is a box; box ⊕ sphere rounds + merges.
+
+    box ⊕ box is exactly a larger box: its 6 flat faces merge to 6 planar faces.
+    box ⊕ sphere is a rounded box: the 6 flat faces merge to large planar faces
+    while the rounded edges/corners stay faceted -- and the body is valid.
+    """
+    # box ⊕ box -> a 12-cube, 6 merged planar faces.
+    bigger = mesh_minkowski(Box(10, 10, 10), Box(2, 2, 2))
+    big_solid = bigger.to_solid()
+    assert big_solid.is_valid
+    assert big_solid.volume == pytest.approx(12**3, rel=1e-3)
+    assert len(big_solid.faces()) == 6
+
+    # box ⊕ sphere -> rounded box: 6 large flat faces merged, rounded rest.
+    rounded = mesh_minkowski(Box(10, 10, 10), Sphere(3))
+    rounded_solid = rounded.to_solid()
+    assert rounded_solid.is_valid
+    big_planar = [
+        f
+        for f in rounded_solid.faces()
+        if f.geom_type == GeomType.PLANE and f.area > 50.0
+    ]
+    # Exactly the 6 flat faces survive as large merged planar faces; the rounded
+    # shell is faceted (many small faces), so total face count is far larger.
+    assert len(big_planar) == 6
+    assert len(rounded_solid.faces()) > 6
+    assert rounded_solid.volume == pytest.approx(rounded.manifold.volume(), rel=1e-3)
+
+
+# --------------------------------------------------------------------------
 # faces() / faces_from() selectors
 # --------------------------------------------------------------------------
 
@@ -1019,12 +1176,27 @@ def test_faces_supports_build123d_selectors():
 
 
 def test_faces_rejects_a_meshpart_without_provenance():
-    """faces() raises on a MeshPart that carries no side-map (a raw mesh)."""
+    """faces() raises on a MeshPart that carries no side-map at all.
+
+    from_mesh now seeds synthetic ids, so the only way to reach an empty
+    side-map is wrapping a bare Manifold directly (the low-level constructor).
+    """
+    source = MeshPart.from_part(Box(8, 8, 8))
+    bare = MeshPart(source.manifold)  # no side-map passed
+    assert len(bare.side_map) == 0
+    with pytest.raises(ValueError, match="provenance"):
+        bare.faces()
+
+
+def test_from_mesh_faces_recovers_merged_planar_faces():
+    """faces() on a from_mesh body returns its merged synthetic planar faces."""
     source = MeshPart.from_part(Box(8, 8, 8))
     vertices, triangles = source.to_arrays()
     wrapped = MeshPart.from_mesh(vertices, triangles)
-    with pytest.raises(ValueError, match="provenance"):
-        wrapped.faces()
+    faces = wrapped.faces()
+    # 6 coplanar regions -> 6 merged faces, every one a PLANE.
+    assert len(faces) == 6
+    assert all(f.geom_type == GeomType.PLANE for f in faces)
 
 
 def test_analytic_faces_raises_on_a_curved_region():
@@ -2365,35 +2537,40 @@ def test_recovery_result_exposes_unseeded_counter():
     assert recovered.n_exact_planar > 0
 
 
-def test_mixed_provenance_recovers_unseeded_faces_not_dropped():
-    """A hull (unseeded) fused with a seeded box keeps BOTH in recovery.
+def test_mixed_provenance_recovers_synthetic_hull_faces_not_dropped():
+    """A synthetic hull fused with a seeded box keeps BOTH in recovery.
 
-    Before the fix, recover_brep silently ``continue``d past the hull's
-    auto-assigned face_ids (absent from the side-map), dropping the entire
-    hull and leaving only the seeded box. The volume collapsed toward the
-    seeded operand alone. The fix renders unseeded ids as faceted patches.
+    The hull now carries synthetic coplanar-region ids (no input surface), and
+    the box carries seeded exact-planar ids. The merged side-map covers every
+    result id, so nothing is dropped: the seeded box recovers exact planar faces
+    and the hull recovers as merged synthetic faces (planar where flat, faceted
+    where curved). The recovered volume matches the true union volume.
     """
-    # Two-sphere hull (no provenance) + a seeded box, well separated so the
-    # union volume is close to the sum minus a small overlap.
+    # Two-sphere hull (synthetic provenance) + a seeded box, well separated so
+    # the union volume is close to the sum minus a small overlap.
     hull = mesh_hull(
         MeshPart.sphere(radius=20).move(Location((0, 0, 0))),
         MeshPart.sphere(radius=14).move(Location((10, 0, 40))),
     )
-    assert len(hull.side_map) == 0  # a hull carries no provenance
+    # The hull now carries synthetic coplanar-region provenance, not an empty map.
+    assert len(hull.side_map) > 0
+    assert all(r.is_synthetic for r in hull.side_map.records.values())
     box = MeshPart.from_part(Box(40, 40, 6)).move(Location((0, 0, -40)))
     assert len(box.side_map) == 6
 
     mixed = hull + box
-    # The merged side-map covers only the box's 6 faces...
-    assert len(mixed.side_map) == 6
-    # ...but the result mesh has many more distinct ids (the hull facets).
+    # The merged side-map now covers the box's 6 seeded faces AND the hull's
+    # synthetic ids -- every result id has provenance, none is unseeded.
     result_mesh = read_result(mixed.manifold)
     assert len(result_mesh.distinct_ids) > 6
+    assert all(fid in mixed.side_map for fid in result_mesh.distinct_ids)
 
     recovered = recover_brep(result_mesh, mixed.side_map)
-    # The hull's unseeded ids are recovered as faceted patches, not dropped.
-    assert recovered.n_unseeded_faceted > 0
+    # The box keeps exact-planar faces; the hull recovers via synthetic ids;
+    # nothing falls into the unseeded path any more.
     assert recovered.n_exact_planar > 0
+    assert recovered.n_synthetic_planar + recovered.n_synthetic_faceted > 0
+    assert recovered.n_unseeded_faceted == 0
     # The recovered volume is close to the true union volume (not the box
     # alone, which would be the silent-drop symptom).
     assert recovered.volume == pytest.approx(mixed.manifold.volume(), rel=0.02)
@@ -2505,14 +2682,16 @@ def test_mixed_seam_valid_and_exact_planar_faces_preserved():
 
 
 def test_bp10_hull_blob_with_seeded_bore_does_not_collapse():
-    """bp10-style: a faceted hull blob with a seeded planar bore stays full.
+    """bp10-style: a synthetic hull blob with a seeded planar bore stays full.
 
-    A convex hull of four spheres (unseeded, faceted) has a seeded box bore
+    A convex hull of four spheres (synthetic, grouped) has a seeded box bore
     subtracted through it -- the eval case that surfaced the seam bug. The
     hull's tessellation is not deterministic, so this asserts the guarantees the
     rewrite provides regardless of tessellation: the recovery keeps the exact
     seeded planar bore walls, the full body volume (not the silent-drop
-    near-empty result), and to_solid returns a valid body.
+    near-empty result), and to_solid returns a valid body. The hull side is now
+    GROUPED via synthetic ids (merged coplanar regions), not one face per
+    triangle, and carries no unseeded ids.
     """
     blob = mesh_hull(
         MeshPart.sphere(5).translate((0, 0, 0)),
@@ -2523,8 +2702,9 @@ def test_bp10_hull_blob_with_seeded_bore_does_not_collapse():
     body = blob - MeshPart.from_part(Box(3, 3, 40))
 
     recovered = recover_brep(read_result(body.manifold), body.side_map)
-    # Mixed provenance: the hull is unseeded/faceted, the bore is seeded/planar.
-    assert recovered.n_unseeded_faceted > 0
+    # The hull now recovers via synthetic ids (grouped), not the unseeded path.
+    assert recovered.n_unseeded_faceted == 0
+    assert recovered.n_synthetic_planar + recovered.n_synthetic_faceted > 0
     # The seeded planar bore walls survive as EXACT analytic faces, not facets.
     assert recovered.n_exact_planar > 0
     # Full body, not the near-empty silent-drop result of the old code. The

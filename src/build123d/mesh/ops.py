@@ -13,12 +13,19 @@ the convex :func:`mesh_hull` and the Minkowski sum / difference
 
 Unlike a boolean, hull and Minkowski do **not** preserve face provenance: they
 synthesise entirely new surfaces (the hull's envelope facets, the rounded shell
-of a Minkowski sum). ``manifold3d`` therefore re-derives ``face_id`` from its own
-coplanar-region calculation, which does **not** trace back to any input
-build123d :class:`~build123d.Face`. The resulting :class:`MeshPart` carries an
-**empty** :class:`~build123d.mesh.bridge.SideMap`; :meth:`MeshPart.to_solid`
-then falls back to the faceted bake (one planar face per triangle). This is an
-honest consequence of the operation, not a limitation of the bridge.
+of a Minkowski sum) that trace back to no input build123d
+:class:`~build123d.Face`. ``manifold3d`` does, however, re-derive ``face_id``
+from its own coplanar-region calculation, and that grouping is good: a hull of a
+box yields one id per planar facet, a Minkowski box ⊕ box yields six, and a
+Minkowski box ⊕ sphere keeps the six flat faces merged while the rounded shell
+stays per-facet. So the resulting :class:`MeshPart` carries a **synthetic**
+:class:`~build123d.mesh.bridge.SideMap` (see
+:func:`~build123d.mesh.bridge.synthetic_side_map`): coplanar-region ids with no
+claimed analytic surface. :meth:`MeshPart.to_solid` groups by those ids and
+recovers **one merged face per coplanar region** — a *fitted* plane where the
+region is planar, a single faceted patch where it is curved — instead of one
+anonymous ``TopoDS_Face`` per triangle. This is strictly better than the old
+fully-faceted bake, while honestly *not* claiming an exact input surface.
 
 MINKOWSKI BACKENDS
 ------------------
@@ -97,16 +104,20 @@ def mesh_hull(*operands: "MeshOperand") -> "MeshPart":
     ``quickhull`` engine OpenSCAD's ``hull()`` uses, but watertight by
     construction.
 
-    A hull synthesises new envelope facets, so no input ``face_id`` survives:
-    the returned :class:`~build123d.mesh.MeshPart` carries an **empty**
-    side-map and :meth:`MeshPart.to_solid` bakes it faceted (see this module's
-    docstring).
+    A hull synthesises new envelope facets, so no input ``face_id`` survives —
+    but ``manifold3d`` groups those facets into coplanar regions. The returned
+    :class:`~build123d.mesh.MeshPart` carries a **synthetic** side-map (no
+    claimed analytic surface) keyed by those regions, so
+    :meth:`MeshPart.to_solid` recovers **one merged planar face per hull facet**
+    (a box-shaped hull face becomes a single planar face, not N triangles)
+    rather than one anonymous face per triangle. See this module's docstring.
 
     Args:
         *operands: one or more build123d Shapes / MeshParts to envelop.
 
     Returns:
-        MeshPart: the convex hull, in mesh space, with no provenance.
+        MeshPart: the convex hull, in mesh space, with synthetic
+        coplanar-region provenance.
 
     Raises:
         ValueError: if no operand is given, or the hull is degenerate (all
@@ -114,6 +125,7 @@ def mesh_hull(*operands: "MeshOperand") -> "MeshPart":
     """
     # Imported here, not at module scope, to avoid a circular import:
     # mesh_part imports this module for the MeshPart.hull/.minkowski methods.
+    from .bridge import synthetic_side_map  # pylint: disable=import-outside-toplevel
     from .mesh_part import _coerce  # pylint: disable=import-outside-toplevel
     from .mesh_part import MeshPart  # pylint: disable=import-outside-toplevel
 
@@ -131,8 +143,11 @@ def mesh_hull(*operands: "MeshOperand") -> "MeshPart":
             "mesh_hull produced an empty manifold; the operands are degenerate "
             "(fewer than four non-coplanar points)."
         )
-    # A hull is new geometry: no input face_id traces through it -> empty map.
-    return MeshPart(hull)
+    # A hull is new geometry: no input face_id traces through it. But manifold3d
+    # groups the envelope facets into coplanar regions -> seed those as synthetic
+    # ids so to_solid recovers one merged planar face per hull facet.
+    seeded, side_map = synthetic_side_map(hull)
+    return MeshPart(seeded, side_map)
 
 
 # ---------------------------------------------------------------------------
@@ -262,7 +277,9 @@ def mesh_minkowski(
       decomposition needs an external library, intentionally not bundled).
 
     A Minkowski sum synthesises a new rounded shell, so no input ``face_id``
-    survives: the result carries an **empty** side-map and bakes faceted.
+    survives — but ``manifold3d``'s coplanar grouping merges its flat faces. The
+    result carries a **synthetic** side-map: :meth:`MeshPart.to_solid` recovers
+    the flat faces as merged fitted-planes and the rounded shell as faceted.
 
     Args:
         a: the first operand (build123d Shape or MeshPart).
@@ -270,12 +287,14 @@ def mesh_minkowski(
         method (str): ``"native"`` (default) or ``"decompose"``.
 
     Returns:
-        MeshPart: the Minkowski sum, in mesh space, with no provenance.
+        MeshPart: the Minkowski sum, in mesh space, with synthetic
+        coplanar-region provenance.
 
     Raises:
         ValueError: for an unknown ``method``, an invalid manifold result, or
             a non-convex operand under ``method="decompose"``.
     """
+    from .bridge import synthetic_side_map  # pylint: disable=import-outside-toplevel
     from .mesh_part import _coerce  # pylint: disable=import-outside-toplevel
     from .mesh_part import MeshPart  # pylint: disable=import-outside-toplevel
 
@@ -294,7 +313,10 @@ def mesh_minkowski(
         raise ValueError(
             f"mesh_minkowski produced an invalid manifold: {result.status()}"
         )
-    return MeshPart(result)
+    # New rounded shell: no input provenance, but manifold3d's coplanar grouping
+    # merges the flat faces (the rounded part stays per-facet). Seed synthetic.
+    seeded, side_map = synthetic_side_map(result)
+    return MeshPart(seeded, side_map)
 
 
 def mesh_minkowski_difference(a: "MeshOperand", b: "MeshOperand") -> "MeshPart":
@@ -305,20 +327,23 @@ def mesh_minkowski_difference(a: "MeshOperand", b: "MeshOperand") -> "MeshPart":
     sphere shrinks every face inward by the sphere's radius). Uses
     ``manifold3d.Manifold.minkowski_difference``.
 
-    Like the sum, erosion synthesises new geometry: the result carries an empty
-    side-map and bakes faceted.
+    Like the sum, erosion synthesises new geometry: the result carries a
+    **synthetic** coplanar-region side-map (an *empty* result — erosion by a
+    tool larger than ``a`` — carries none).
 
     Args:
         a: the body to erode (build123d Shape or MeshPart).
         b: the eroding body (build123d Shape or MeshPart).
 
     Returns:
-        MeshPart: the Minkowski difference, in mesh space, with no provenance.
+        MeshPart: the Minkowski difference, in mesh space, with synthetic
+        coplanar-region provenance (empty side-map if the result is empty).
 
     Raises:
         ValueError: if the result is an invalid manifold (erosion of ``a`` by a
             ``b`` larger than ``a`` legitimately yields an *empty* body).
     """
+    from .bridge import synthetic_side_map  # pylint: disable=import-outside-toplevel
     from .mesh_part import _coerce  # pylint: disable=import-outside-toplevel
     from .mesh_part import MeshPart  # pylint: disable=import-outside-toplevel
 
@@ -330,7 +355,12 @@ def mesh_minkowski_difference(a: "MeshOperand", b: "MeshOperand") -> "MeshPart":
             f"mesh_minkowski_difference produced an invalid manifold: "
             f"{result.status()}"
         )
-    return MeshPart(result)
+    if result.is_empty():
+        # Erosion by a tool larger than the body legitimately empties it; an
+        # empty manifold carries no coplanar regions to seed.
+        return MeshPart(result)
+    seeded, side_map = synthetic_side_map(result)
+    return MeshPart(seeded, side_map)
 
 
 # ---------------------------------------------------------------------------
@@ -535,11 +565,12 @@ def mesh_offset(
             points at the honest-limits caveat for inward offsets.
     """
     # pylint: disable=import-outside-toplevel
+    from .bridge import synthetic_side_map
     from .mesh_part import MeshPart, _coerce
 
     part = _coerce(body)
     if amount == 0.0:
-        return MeshPart(part.manifold)
+        return MeshPart(part.manifold, part.side_map)
     sphere = _offset_sphere(abs(amount), segments=sphere_segments)
     if amount > 0.0:
         result = part.manifold.minkowski_sum(sphere)
@@ -558,7 +589,8 @@ def mesh_offset(
             "erosion of a body by a tool larger than its thinnest section "
             "legitimately empties it)."
         )
-    return MeshPart(result)
+    seeded, side_map = synthetic_side_map(result)
+    return MeshPart(seeded, side_map)
 
 
 def mesh_shell(
@@ -595,4 +627,4 @@ def mesh_shell(
         raise ValueError(f"mesh_shell needs a positive thickness, got {thickness!r}")
     part = _coerce(body)
     eroded = mesh_offset(part, -float(thickness), sphere_segments=sphere_segments)
-    return MeshPart(mesh_cut(part, eroded).manifold)
+    return mesh_cut(part, eroded)
