@@ -2133,6 +2133,31 @@ attributes: `chains`, `constraint`, `requested`, `measured`. The P3 contract:
 Corner-level pre-flight (`_check_corner_feasibility`, see I.47) raises on
 **mixed corners** (`mixed-corner`) and **k > 6 corners** (`k>6-corner`).
 
+**Performance — the two per-chain full-mesh scans (fixed).** The naïve
+half-thickness check and the per-vertex face-normal sampling each walked the
+*entire host mesh once per chain*, making `mesh_fillet`/`mesh_chamfer`
+**O(chains × mesh)** — quadratic on a uniformly perforated panel. A deburr of
+a 900-hole panel (~1800 chains) took ~18 min. Both are now linearised:
+
+* **`_half_thickness_feasibility`** — a failure can only occur within
+  Euclidean radius `2.5 · size` of a chain vertex (`depth < 2·size` **and**
+  `radial < 1.5·size` ⟹ `dist < sqrt((2·size)² + (1.5·size)²) = 2.5·size`).
+  So instead of scanning all host vertices, a `scipy.spatial.cKDTree` radius
+  query returns just the local candidates — identical pass/fail and identical
+  reported `nearest_depth`, at `O(chain_verts · log mesh)`.
+* **`_per_vertex_face_normals`** — replaced the per-chain triangle scan with a
+  single `(vertex, face_id) → summed-normal` index
+  (`_build_vertex_face_normal_index`), built once per call and shared across
+  all chains; per chain it is now `O(chain_verts)` dict lookups. `_unit` is
+  scale-invariant, so unit-of-sum == unit-of-mean — the result is unchanged.
+
+Both indices are built once in `_mesh_fillet_impl` / `_mesh_chamfer_impl` and
+threaded through the feasibility and tool-build passes (a `None` default
+rebuilds locally for direct callers). Measured (perforated panel, round
+holes): 462 chains 71.5 s → 7.5 s; 812 chains >120 s (DNF) → 15.1 s; **1812
+chains (the bp17 case) ~18 min → 30.4 s (~36×)** — now ~linear at ~17 ms/chain.
+Provenance: text-to-cad `eval/phase-d/A4_MESH_FILLET_SCALING.md`.
+
 ---
 
 ## I. `corners.py` — multi-chain corner blending (A3c)
