@@ -43,7 +43,9 @@ The deliverable touches three areas:
 9. `shape_to_manifold(shape, source=, ...)` — per-face tessellate + weld +
    seeded `Mesh64.face_id`
 10. `read_result(manifold)` — extract `vertices`/`triangles`/`face_id`;
-    `ResultMesh.distinct_ids` / `.triangles_of(fid)`
+    `ResultMesh.distinct_ids` / `.triangles_of(fid)`; plus
+    `synthetic_side_map(manifold)` (B.11) — manifold's coplanar `face_id` →
+    synthetic SideMap for hull / Minkowski / `from_mesh`
 
 ### C. `recovery.py` — the IN leg (exact reconstruction)
 
@@ -55,8 +57,13 @@ The deliverable touches three areas:
 15. `_recover_planar_face(result, face_id, record)` — exact `TopoDS_Face` on
     known plane; per-id connected-component split (p8 fix)
 16. `_faceted_patch(result, face_id)` — curved-id fallback
-17. `recover_brep(result, side_map)` — group → split → recover → sew →
-    shells → void-classify → `Solid` / `Compound`
+17. `recover_brep(result, side_map)` — per-id recover (4 record kinds) →
+    file by body component → direct shell assembly → void-classify →
+    `Solid` / `Compound`
+18. `_SharedTopology` / `_vertex_positions` — shared seam vertices/edges +
+    the seam-vertex projection rule
+19. `_fit_plane` / `_recover_synthetic_face` — synthetic coplanar-region
+    recovery (hull / Minkowski / `from_mesh`)
 
 ### D. `mesh_part.py`
 
@@ -503,9 +510,9 @@ non-negotiables shape the whole module:
 
 ### B.7 `FaceRecord` / `SideMap` — provenance side-map
 
-**Code**: `mesh/bridge.py::FaceRecord` (line 117),
-`mesh/bridge.py::SideMap` (line 185),
-`mesh/bridge.py::_analyse_face` (line 272).
+**Code**: `mesh/bridge.py::FaceRecord` (line 118),
+`mesh/bridge.py::SideMap` (line 207),
+`mesh/bridge.py::_analyse_face` (line 294).
 
 **What it does.** Captures, per seeded face id, everything `recovery.py` needs
 to rebuild an exact analytic face: the originating build123d Face, its
@@ -592,7 +599,7 @@ are called by every operation on `MeshPart` that produces a new map.
 
 ### B.8 `_weld(vertices, triangles, decimals=6)` — array-level weld
 
-**Code**: `mesh/bridge.py::_weld` (line 313).
+**Code**: `mesh/bridge.py::_weld` (line 335).
 
 **What it does.** Numpy-array sibling of `_weld_mesh` (A.1). Merges
 coincident vertices in a per-face soup by grid-snap, returns the welded
@@ -627,8 +634,8 @@ without also pruning the face_ids).
 
 ### B.9 `shape_to_manifold(shape, source=, ...)` — the full OUT leg
 
-**Code**: `mesh/bridge.py::shape_to_manifold` (line 350),
-`mesh/bridge.py::_build_manifold` (line 444).
+**Code**: `mesh/bridge.py::shape_to_manifold` (line 372),
+`mesh/bridge.py::_build_manifold` (line 466).
 
 **What it does.** Convert a build123d `Shape` into a `(Manifold, SideMap)`
 pair: tessellate per-face, stamp each triangle with the originating face id,
@@ -719,8 +726,8 @@ mesh_part.py:158); every primitive constructor (`MeshPart.box`, `.sphere`,
 
 ### B.10 `read_result(manifold)` — extract identity from a boolean result
 
-**Code**: `mesh/bridge.py::read_result` (line 499),
-`mesh/bridge.py::ResultMesh` (line 474).
+**Code**: `mesh/bridge.py::read_result` (line 521),
+`mesh/bridge.py::ResultMesh` (line 497).
 
 **What it does.** Read the vertex / triangle arrays and the seeded
 `face_id` array out of a Manifold (typically the result of a boolean) into a
@@ -758,6 +765,38 @@ own arrays; mutating them would corrupt the manifold. Recovery never mutates.
 
 ---
 
+### B.11 `synthetic_side_map(manifold)` — provenance for constructive ops
+
+**Code**: `mesh/bridge.py::synthetic_side_map` (line 543).
+
+**What it does.** `hull` / `minkowski` / `level_set` / `from_mesh` synthesise
+surfaces with no input `Face` provenance — their output would otherwise be
+*unseeded* and recover as one `TopoDS_Face` per triangle. This reads
+manifold3d's **own** per-triangle coplanar `face_id` channel (already computed
+for un-seeded meshes), remaps each id to a fresh **global** id (manifold's
+small ids `0, 2, 4…` would collide with the seeded counter once mixed into a
+boolean), re-stamps the mesh, and returns a `SideMap` of `surface_kind =
+"SYNTHETIC"` records (no `Geom_Surface`, no input `Face`).
+
+**Why reuse manifold's grouping.** Verified it does not over-shatter:
+`hull(box)` → 6 ids, `batch_hull(2 boxes)` → 10, `minkowski(box, box)` → 6,
+`from_mesh(cube)` → 6. So no Python flood-fill is needed; a synthetic id that
+is a genuine coplanar region is later merged into one fitted-plane face by
+`_recover_synthetic_face` (C.19). (Curved outputs like `minkowski(box,
+sphere)` get ~one id per triangle — manifold's limit, not ours; those stay
+faceted.)
+
+**Trade-offs.** Synthetic ids carry *no* analytic surface — a fitted plane is
+"better than faceted, not exact" (distinct from a seeded `Geom_Plane`).
+
+**Where invoked from.** `mesh_hull` / `mesh_minkowski` /
+`mesh_minkowski_difference` / `mesh_offset` (`ops.py`) and `MeshPart.from_mesh`
+(`mesh_shell` preserves the map).
+
+**Tests.** The synthetic-seeding family in `test_mesh.py` (see C.19).
+
+---
+
 ## C. `recovery.py` — the IN leg (exact reconstruction)
 
 The IN leg is where mesh CSG pays for itself. A `MeshPart` carrying a non-empty
@@ -769,7 +808,7 @@ recovery; the items below are the algorithms that ship.
 
 ### C.11 `_connected_components(triangles)` — edge-connectivity BFS
 
-**Code**: `mesh/recovery.py::_connected_components` (line 91).
+**Code**: `mesh/recovery.py::_connected_components` (line 118).
 
 **What it does.** Split a triangle set into edge-connected components.
 
@@ -833,7 +872,7 @@ return is O(M·K) for K components — fine because both are tiny in practice
 
 ### C.12 `_boundary_loops(triangles)` — one-use edges → ordered loops
 
-**Code**: `mesh/recovery.py::_boundary_loops` (line 147).
+**Code**: `mesh/recovery.py::_boundary_loops` (line 174).
 
 **What it does.** Return the boundary of one connected triangle group as a
 list of ordered vertex-index loops — the outer loop plus any hole loops.
@@ -887,7 +926,7 @@ of a planar id.
 
 ### C.13 `_project_to_plane(point, origin, normal)`
 
-**Code**: `mesh/recovery.py::_project_to_plane` (line 203).
+**Code**: `mesh/recovery.py::_project_to_plane` (line 230).
 
 **What it does.** Orthogonal projection of a 3-D point onto a plane given by
 origin and (not necessarily unit) normal.
@@ -922,7 +961,7 @@ side-map plane record, but the routine is paranoid).
 
 ### C.14 `_exact_plane(record)` — Geom_Plane from side-map parameters
 
-**Code**: `mesh/recovery.py::_exact_plane` (line 275).
+**Code**: `mesh/recovery.py::_exact_plane` (line 480).
 
 **What it does.** Build a `Geom_Plane` from a planar side-map record's
 origin / normal parameters.
@@ -950,7 +989,7 @@ the normal disambiguates).
 
 ### C.15 `_recover_planar_face(result, face_id, record)` — exact analytic face
 
-**Code**: `mesh/recovery.py::_recover_planar_face` (line 291).
+**Code**: `mesh/recovery.py::_recover_planar_face` (line 496).
 
 **What it does.** Rebuild exact planar `TopoDS_Face`s for one seeded planar
 id — one face per edge-connected component of the id's triangle group, with
@@ -1032,7 +1071,7 @@ the recovered B-rep is filletable using native OCC `BRepFilletAPI`.
 
 ### C.16 `_faceted_patch(result, face_id)` — curved-id fallback
 
-**Code**: `mesh/recovery.py::_faceted_patch` (line 394).
+**Code**: `mesh/recovery.py::_faceted_patch` (line 747).
 
 **What it does.** Return a curved seeded id as a list of flat triangle faces
 — one `TopoDS_Face` per triangle.
@@ -1072,61 +1111,128 @@ contract).
 
 ### C.17 `recover_brep(result, side_map)` — full pipeline
 
-**Code**: `mesh/recovery.py::recover_brep` (line 427).
+**Code**: `mesh/recovery.py::recover_brep` (line 803).
 
-**What it does.** End-to-end recovery: group → split → recover → sew →
-shells → void-classify → `Solid` / `Compound` / `Shell` / None.
+**What it does.** End-to-end recovery via **shared seam topology + direct
+shell assembly** (no sewing): per-id recover → file faces by body component →
+assemble shells → void-classify → `Solid` / `Compound` / `Shell`.
 
 **How.** The pipeline:
 
 1. **Validate.** Empty side-map → raise (a MeshPart from raw arrays has no
    provenance; use `to_solid(reconstruct=False)`).
-2. **Per-id recovery.** Loop over `result.distinct_ids`; for each, fetch the
-   side-map record. Planar → `_recover_planar_face`; non-planar →
-   `_faceted_patch`. Add every produced face to a single
-   `BRepBuilderAPI_Sewing` instance (tolerance `_SEW_TOLERANCE = 1e-6`).
-3. **Sew shells.** `sewing.Perform()`; one shell per connected component of
-   faces falls out. Each shell is fixed via `ShapeFix_Shell`.
-4. **Shells → solids with bbox void-classification.** Exactly the same
-   `_group_shells_into_solids` routine as `Solid.from_mesh` (A.5). The
-   rationale (one Solid per outer shell, voids added with
-   `BRepBuilderAPI_MakeSolid.Add`) is identical and load-bearing — without
-   this, a multi-body recovery would silently lose its disjoint-body
-   structure.
-5. **Pack the result.** Exactly one solid → return it; multiple solids →
-   `Compound`; otherwise (no closed solid built) → the first shell (rare,
-   degraded result).
+2. **Build shared topology.** `_SharedTopology(_vertex_positions(result,
+   side_map))` (C.18) — one `TopoDS_Vertex` per result-mesh vertex index, one
+   `TopoDS_Edge` per unordered index pair, shared reversed between incident
+   faces. This is what lets a planar face and an adjacent faceted patch share
+   edges instead of contributing one-long-edge vs many-short-edges (the seam
+   that BRepCheck used to reject).
+3. **Per-id recovery — four record kinds.** Loop over `result.distinct_ids`;
+   each id's faces are filed into `faces_by_component` under the body label of
+   the triangles that produced it (a `face_id` is **not** confined to one
+   disjoint body after a fuse, so filing is per-triangle-component, not
+   per-id):
+   - **unseeded** (`face_id not in side_map`) → anonymous `_faceted_patch`
+     (rare now — hull/Minkowski/from_mesh seed synthetic ids; §C.19, B).
+   - **synthetic** (`record.is_synthetic`) → `_recover_synthetic_face` (C.19):
+     a coplanar multi-triangle region → one *fitted*-plane face; else faceted.
+   - **seeded planar** (`record.is_planar`) → `_recover_planar_face` (C.15):
+     exact analytic face on the *known input* `Geom_Plane`.
+   - **seeded curved** (a record, not planar) → `_faceted_patch` (C.16).
+4. **Direct shell assembly.** One `TopoDS_Shell` per body component via
+   `BRep_Builder.MakeShell`/`.Add` — the faces already share vertices and
+   edges through `topology`, so the shell is connected and manifold with **no
+   seam repair / no sewing**.
+5. **Shells → solids with bbox void-classification.** Same
+   `group_shells_into_solids` routine as `Solid.from_mesh` (A.5): one Solid per
+   outer shell, nested shells added as internal voids.
+6. **Pack the result.** One solid → return it; several → `Compound`; otherwise
+   (no closed solid) → the first shell (degraded, rare).
 
-```python
-for outer_shell, void_shells in _group_shells_into_solids(shells):
-    solid_builder = BRepBuilderAPI_MakeSolid(outer_shell.wrapped)
-    for void_shell in void_shells:
-        solid_builder.Add(void_shell.wrapped)
-    if not solid_builder.IsDone(): continue
-    solid_fix = ShapeFix_Solid(solid_builder.Solid())
-    solid_fix.Perform()
-    solids.append(Solid(TopoDS.Solid_s(solid_fix.Solid())))
-```
+The volume on `RecoveryResult` sums per-Solid volumes (each already accounts
+for its voids → sum is over disjoint top-level bodies). Counters
+`n_exact_planar` / `n_faceted_curved` / `n_synthetic_planar` /
+`n_synthetic_faceted` / `n_unseeded_faceted` keep the breakdown honest.
 
-The volume reported on `RecoveryResult` sums the per-Solid volumes — each
-Solid already accounts for its internal voids, so the sum is over disjoint
-top-level bodies only.
+**Why direct assembly, not sewing.** Sewing merges coincident-but-distinct
+vertices by spatial tolerance — fragile exactly at the exact-plane↔faceted
+seam (different edge subdivisions). Shared topology makes the shell valid *by
+construction*, so the old `to_solid` auto-fallback-to-faceted (kept as a
+safety net for degenerate meshes) no longer triggers for mixed-provenance
+input.
 
-**Trade-offs.** Sewing tolerance is fixed at `1e-6` — the welded mesh's
-vertex spacing is well under this. The `BRepBuilderAPI_Sewing` is per-call;
-no caching, no incremental update.
+**Where invoked from.** `MeshPart.to_solid` (analytic path), `MeshPart.faces`,
+`MeshPart.analytic_faces`, `MeshPart.faces_from`.
 
-**Where invoked from.** `MeshPart.to_solid` (the analytic path),
-`MeshPart.faces`, `MeshPart.analytic_faces`, `MeshPart.faces_from`.
+**Tests.** The "reconstruction" + "payoff" families in `test_mesh.py`, plus
+`test_mixed_seam_valid_and_exact_planar_faces_preserved`,
+`test_bp10_hull_blob_with_seeded_bore_does_not_collapse`, and the synthetic-
+seeding tests (`from_mesh(cube)`→6 faces, hull/minkowski grouping).
 
-**Tests.** The whole "reconstruction" test family plus the "payoff" family in
-`test_mesh.py` — `test_reconstruction_recovers_exact_planar_solid`,
-`…falls_back_to_faceted_without_side_map`,
-`…disjoint_bodies_yield_a_compound`, the payoff fillet/chamfer tests.
+**Prior art.** OCCT `BRep_Builder` direct shell assembly (mirrors
+`Solid.from_mesh`, A.3), driven by provenance + shared topology rather than
+spatial sewing.
 
-**Prior art.** OCCT `BRepBuilderAPI_Sewing` + `BRepBuilderAPI_MakeSolid` —
-the standard mesh-to-BREP sewing path, here driven by provenance instead of
-spatial tolerance.
+---
+
+### C.18 `_SharedTopology` / `_vertex_positions` — shared seam topology
+
+**Code**: `mesh/recovery.py::_SharedTopology` (line 252),
+`_vertex_positions` (line 350).
+
+**What it does.** Caches one `TopoDS_Vertex` per result-mesh vertex index and
+one `TopoDS_Edge` per unordered index pair (built once, reused reversed for the
+two faces sharing it) — the same shared-vertex/edge pattern as
+`Solid.from_mesh` (A.3), here serving both exact-planar faces and faceted
+patches so they share edges at seams.
+
+**Seam-vertex projection rule** (`_vertex_positions`). A vertex incident to
+**exactly one** seeded planar group is projected onto that group's exact
+`Geom_Plane` (erases tessellation jitter → planar faces stay bit-exact). A
+vertex incident to **several** planar groups, or to **any** curved / synthetic
+/ unseeded group, keeps its raw mesh position — projecting onto one plane would
+pull it off the others and tear the seam. (Synthetic regions keep raw
+positions regardless: their fitted plane is derived *from* those positions, so
+projecting would be circular.)
+
+**Trade-offs.** A vertex's position is decided once, globally; the
+single-planar-incidence rule is a heuristic that is exact at true planar
+corners (where the boolean already placed the vertex) and a sub-tolerance clean
+up elsewhere.
+
+---
+
+### C.19 `_fit_plane` / `_recover_synthetic_face` — synthetic-region recovery
+
+**Code**: `mesh/recovery.py::_fit_plane` (line 605),
+`_recover_synthetic_face` (line 647). Pairs with `bridge.synthetic_side_map`
+(B; `bridge.py:543`), which stamps hull / Minkowski / `from_mesh` output with
+synthetic faceIDs read from manifold3d's own coplanar `face_id` channel.
+
+**What it does.** A synthetic id (no input provenance, `surface_kind =
+"SYNTHETIC"`) whose triangles are coplanar within tolerance is rebuilt as **one
+*fitted*-plane analytic `Face` per connected component** — merging what would
+otherwise be one `TopoDS_Face` per triangle — reusing `_recover_planar_face`
+via a temporary planar record so its wires use the same shared seam edges.
+A non-coplanar region (e.g. a Minkowski rounded shell) stays a faceted patch.
+
+**`_fit_plane`.** Area-weighted average normal; accepts the region as planar
+only if every facet normal is within ~0.6° (cosine tolerance) of it. A
+**single-triangle** region is *not* treated as a merge (a lone triangle
+trivially fits a plane): it is kept faceted so `n_synthetic_planar` honestly
+means "coplanar triangles actually merged". This matters because manifold3d
+does **not** coplanar-group some outputs — e.g. native `minkowski_sum(box,
+sphere)` emits ~one id per shell triangle (2516 tris → 2189 ids), so without
+the guard the rounded shell would inflate the planar counter.
+
+**Honest status.** A fitted plane is "better than faceted, not exact": it is
+fitted from the facets, *not* a known input `Geom_Plane` (that is what
+`is_planar` / C.15 reserve). `is_synthetic` and `is_planar` are deliberately
+distinct on `FaceRecord`.
+
+**Tests.** `from_mesh(cube)` → 6 merged planar faces; `mesh_hull(2 boxes)` →
+the true planar-face count (not the triangle count); `minkowski(box, sphere)` →
+merged flats + faceted shell, valid.
 
 ---
 
@@ -1144,7 +1250,7 @@ explicit cost of operations and absence of surprise behaviour.
 
 ### D.18 `MeshPart` value type — invariant
 
-**Code**: `mesh/mesh_part.py::MeshPart` (line 85).
+**Code**: `mesh/mesh_part.py::MeshPart` (line 87).
 
 **Invariant.** A `MeshPart` holds two things, both immutable from the outside:
 
@@ -1175,8 +1281,8 @@ So `MeshPart` is its own value type with its own surface. `to_solid` /
 
 ### D.19 `from_part`, `from_mesh`; primitive constructors
 
-**Code**: `mesh/mesh_part.py::MeshPart.from_part` (line 129),
-`mesh_part.py::MeshPart.from_mesh` (line 167);
+**Code**: `mesh/mesh_part.py::MeshPart.from_part` (line 140),
+`mesh_part.py::MeshPart.from_mesh` (line 178);
 primitives `box` / `sphere` / `cylinder` / `cone` / `torus` (lines 213-316).
 
 **`from_part(shape, source='shape', linear_tolerance=0.1,
@@ -1248,8 +1354,8 @@ here.
 
 ### D.21 Transforms `translate / rotate / scale / move(Location)`
 
-**Code**: `mesh/mesh_part.py::translate` (line 540), `rotate` (line 558),
-`scale` (line 578), `move` (line 600); `_euler_rotation_matrix` (line 1028).
+**Code**: `mesh/mesh_part.py::translate` (line 573), `rotate` (line 591),
+`scale` (line 611), `move` (line 633); `_euler_rotation_matrix` (line 1102).
 
 **What it does.** Move the manifold *and* its side-map together so the
 recovered B-rep lands in the transformed frame.
@@ -1305,7 +1411,7 @@ transformed mesh still bakes back to an exact B-rep).
 
 ### D.22 `to_solid(reconstruct=, unify_coplanar=)`
 
-**Code**: `mesh/mesh_part.py::MeshPart.to_solid` (line 627);
+**Code**: `mesh/mesh_part.py::MeshPart.to_solid` (line 660);
 `to_part` (line 676).
 
 **What it does.** Bake the mesh to a build123d `Solid` (or `Compound` for
@@ -1348,7 +1454,7 @@ indirectly via `to_part`.
 
 ### D.23 `faces() / analytic_faces() / faces_from(source)`
 
-**Code**: `mesh_part.py::MeshPart.faces` (line 691),
+**Code**: `mesh_part.py::MeshPart.faces` (line 742),
 `analytic_faces` (line 737), `faces_from` (line 945).
 
 **What it does.** Recover the build123d Faces of the mesh body — three
@@ -1380,7 +1486,7 @@ All three guard against empty mesh / empty side-map with clear errors.
 
 ### D.24 Direct STL writer
 
-**Code**: `mesh_part.py::export_stl` (line 985),
+**Code**: `mesh_part.py::export_stl` (line 1059),
 `_triangle_normals` (line 1215), `_write_binary_stl` (line 1233),
 `_write_ascii_stl` (line 1256).
 
@@ -1433,7 +1539,7 @@ double precision but the on-disk format is float32 (lossy by spec).
 
 ### D.25 `offset(amount)` — 3-D Minkowski offset
 
-**Code**: `mesh/ops.py::mesh_offset` (line 498); also wired through
+**Code**: `mesh/ops.py::mesh_offset` (line 528); also wired through
 `MeshPart.offset` (mesh_part.py line 490).
 
 **What it does.** Outward (`amount > 0`) or inward (`amount < 0`) 3-D
@@ -1474,7 +1580,7 @@ have a dedicated test name in `test_mesh.py` but is exercised by
 
 ### D.26 `shell(thickness)` — `self - self.offset(-thickness)`
 
-**Code**: `mesh/ops.py::mesh_shell` (line 564);
+**Code**: `mesh/ops.py::mesh_shell` (line 596);
 `MeshPart.shell` (mesh_part.py line 516).
 
 **What it does.** Hollow a body to a wall of the given thickness.
@@ -1509,7 +1615,7 @@ an honest consequence of the operation, not a bridge limitation.
 
 ### E.27 `mesh_hull` — native quickhull
 
-**Code**: `mesh/ops.py::mesh_hull` (line 92);
+**Code**: `mesh/ops.py::mesh_hull` (line 99);
 `MeshPart.hull` (mesh_part.py line 425).
 
 **What it does.** Convex hull of any mix of build123d Shapes and MeshParts.
@@ -1535,7 +1641,7 @@ its own implementation.
 
 ### E.28 `mesh_minkowski(a, b, method=)` — sum with two backends
 
-**Code**: `mesh/ops.py::mesh_minkowski` (line 247);
+**Code**: `mesh/ops.py::mesh_minkowski` (line 262);
 `_minkowski_via_decomposition` (line 207);
 `_is_convex` (line 143); `_convex_parts` (line 163);
 `_part_vertices` (line 194);
@@ -1615,7 +1721,7 @@ Minkowski (Halperin–Sharir).
 
 ### E.29 `mesh_minkowski_difference` — erosion
 
-**Code**: `mesh/ops.py::mesh_minkowski_difference` (line 300).
+**Code**: `mesh/ops.py::mesh_minkowski_difference` (line 322).
 
 **What it does.** Morphological erosion `a ⊖ b` — `a` eroded by sweeping `b`
 across its surface and removing the swept region. The inverse of
@@ -1706,8 +1812,8 @@ profiles are silently flattened — explicit by design.
 
 ### F.31 `mesh_extrude(profile, height, ...)`; `mesh_revolve(profile, ...)`
 
-**Code**: `mesh/ops.py::mesh_extrude` (line 341);
-`mesh/ops.py::mesh_revolve` (line 412).
+**Code**: `mesh/ops.py::mesh_extrude` (line 371);
+`mesh/ops.py::mesh_revolve` (line 442).
 
 **What it does.** Drive `manifold3d.CrossSection.extrude` /
 `CrossSection.revolve` on the bridged profile.
@@ -1742,7 +1848,7 @@ index.
 
 ### G.32 `FeatureEdge` / `FeatureChain` / `FeatureChainSelection`
 
-**Code**: `mesh/feature_edges.py::FeatureEdge` (line 74),
+**Code**: `mesh/feature_edges.py::FeatureEdge` (line 77),
 `FeatureChain` (line 108), `FeatureChainSelection` (line 436).
 
 **Invariants.**
@@ -1767,7 +1873,7 @@ index.
 
 ### G.33 `extract_feature_edges` — faceID-boundary edge set
 
-**Code**: `feature_edges.py::extract_feature_edges` (line 212).
+**Code**: `feature_edges.py::extract_feature_edges` (line 197).
 
 **What it does.** Walk every mesh edge, find the ones where the two adjacent
 triangles carry different `face_id`s, and return them as `FeatureEdge`s.
@@ -1809,7 +1915,7 @@ by `MeshPart.feature_edges`).
 
 ### G.34 `build_chains` — order edges into chains/loops
 
-**Code**: `feature_edges.py::build_chains` (line 263).
+**Code**: `feature_edges.py::build_chains` (line 248).
 
 **What it does.** Group feature edges by `(lo, hi)` pair, then within each
 group order them into chains or loops by vertex adjacency.
@@ -1846,7 +1952,7 @@ exercised at the start of every operation).
 
 ### G.35 Convexity classification & vertex-kind classification
 
-**Code**: `feature_edges.py::edge_convexity_sign` (line 172),
+**Code**: `feature_edges.py::edge_convexity_sign` (line 157),
 `classify_chain_convexity` (line 369), `classify_vertex_kinds` (line 400).
 
 **Per-edge signed convexity** — robust against face-ordering noise:
@@ -1907,7 +2013,7 @@ construction.
 
 ### H.36 `_vertex_frames` — per-vertex local frame
 
-**Code**: `mesh/fillet.py::_vertex_frames` (line 223),
+**Code**: `mesh/fillet.py::_vertex_frames` (line 489),
 `_per_vertex_face_normals` (line 178).
 
 **What it does.** Build one `(origin, tangent, u_axis, w_axis)` frame per
@@ -1945,7 +2051,7 @@ chain.
 
 ### H.37 A3a chamfer wedge profile + prism-loft swept tool
 
-**Code**: `fillet.py::_chamfer_segment_hull` (line 312),
+**Code**: `fillet.py::_chamfer_segment_hull` (line 578),
 `_build_chain_chamfer_tool` (line 353); `_wedge_profile_points` (line 894).
 
 **Profile.** The chamfer cross-section is the right triangle
@@ -1975,7 +2081,7 @@ segments and the terminal frames are overshot per §3.6.
 
 ### H.38 A3b fillet profile — wedge minus rolling-ball
 
-**Code**: `fillet.py::_wedge_profile_points` (line 894),
+**Code**: `fillet.py::_wedge_profile_points` (line 1548),
 `_ball_profile_points` (line 911), `_build_swept_arc_tool` (line 1197),
 `_segment_hull_from_profiles` (line 961).
 
@@ -2023,7 +2129,7 @@ if sign == "concave":
 
 ### H.39 `_ribbon_mesh_from_rings` — direct-import ribbon loft
 
-**Code**: `fillet.py::_build_swept_from_profile` (line 989),
+**Code**: `fillet.py::_build_swept_from_profile` (line 1643),
 `_ribbon_mesh_from_rings` (line 1023), `_lift_profile_to_3d` (line 939).
 
 **What it does.** Stitch a list of lifted profile rings (one per chain
@@ -2068,7 +2174,7 @@ the swept solid, no per-segment seam issues.
 
 ### H.40 `_split_chain_by_sign` — per-edge sign splitting
 
-**Code**: `fillet.py::_split_chain_by_sign` (line 1107),
+**Code**: `fillet.py::_split_chain_by_sign` (line 1799),
 `_edge_signs` (line 1102).
 
 **What it does.** Split a chain into single-sign sub-runs (design §3.4 /
@@ -2108,9 +2214,12 @@ loop is broken into open arcs.
 
 ### H.41 Feasibility pre-flight; `MeshFilletInfeasible`
 
-**Code**: `fillet.py::MeshFilletInfeasible` (line 117),
-`_half_thickness_feasibility` (line 425), `_check_feasibility` (line 486),
-`_check_fillet_feasibility` (line 1306).
+**Code**: `fillet.py::MeshFilletInfeasible` (line 153),
+`_half_thickness_feasibility` (line 710), `_check_feasibility` (line 796),
+`_check_fillet_feasibility` (line 2017). The `O(chains × mesh) → O(chains ×
+log mesh)` linearisation (cKDTree radius query in `_half_thickness_feasibility`
++ a `_build_vertex_face_normal_index` (line 407) built once per call and shared
+across chains) is documented in the linearisation note below.
 
 **The exception.** `MeshFilletInfeasible(ValueError)` with structured
 attributes: `chains`, `constraint`, `requested`, `measured`. The P3 contract:
@@ -2323,7 +2432,7 @@ base points — a k=3 corner with all three chain tangents in one plane).
 
 ### I.47 `_check_corner_feasibility` — mixed / k>6 raise (P3)
 
-**Code**: `mesh/fillet.py::_check_corner_feasibility` (line 548).
+**Code**: `mesh/fillet.py::_check_corner_feasibility` (line 905).
 
 **What it does.** Enforce the design's NG_F4 (mixed corners) and NG_F5
 (k > 6 corners) non-goals: both raise `MeshFilletInfeasible` with a
@@ -2352,7 +2461,7 @@ design specifies a clean raise with a workaround in the message.
 
 ### I.48 `_drop_zero_volume_artifacts` — precision-pinch post-pass
 
-**Code**: `mesh/fillet.py::_drop_zero_volume_artifacts` (line 830).
+**Code**: `mesh/fillet.py::_drop_zero_volume_artifacts` (line 1484).
 
 **What it does.** Drop near-zero-volume components from a manifold.
 
@@ -2394,7 +2503,7 @@ reuses the same classifier the skip path consumes.
 
 ### J.49 — `RadiusInput` and `_normalise_radius`
 
-`fillet.py:301`
+`fillet.py:302`
 
 The public `radius` (fillet) / `size` (chamfer) argument is
 
@@ -2419,7 +2528,7 @@ embedded in both errors for clarity.
 
 ### J.50 — `_chain_radius_samples` / `_chain_max_size`
 
-`fillet.py:351`, `:384`
+`fillet.py:352`, `:385`
 
 `_chain_radius_samples(chain, per_vertex_fn)` calls the per-vertex function
 at every vertex of the chain, validates each sample `> 0` (a non-positive
@@ -2437,7 +2546,7 @@ always within the checked envelope.
 
 ### J.51 — `SkippedItem` and `FilletReport`
 
-`fillet.py:218`, `:254`
+`fillet.py:219`, `:255`
 
 The skip-mode return shape:
 
@@ -2476,7 +2585,7 @@ would have produced.
 
 ### J.52 — `_classify_corner_problem` — the raise/skip-shared classifier
 
-`fillet.py:802`
+`fillet.py:862`
 
 Pure classifier, no raise: returns `(constraint, message, chains)` or
 `None`. The A4 refactor: A3c's `_check_corner_feasibility` is now a thin
@@ -2488,7 +2597,7 @@ on *what* is infeasible, only differing on what to do about it. Classifies
 
 ### J.53 — `_filter_corners_for_skip`
 
-`fillet.py:881`
+`fillet.py:941`
 
 The skip-mode corner pre-flight. Walks every corner, runs
 `_classify_corner_problem`, and for each bad corner: appends a
@@ -2499,7 +2608,7 @@ corners feed the patch builders unchanged.
 
 ### J.54 — `_corner_size`
 
-`fillet.py:1332`
+`fillet.py:1400`
 
 For variable-radius corners, picks the patch radius from the incident
 chains' per-vertex sizes. For each chain endpoint at the corner, looks up
