@@ -695,17 +695,18 @@ class MeshPart:
                 and recovered.is_valid
             ):
                 return recovered.solid
-            # Recovery did not yield a valid closed solid. Two common reasons:
-            #   * the result type was a bare Shell (no closed solid built); or
-            #   * mixed-provenance (``n_unseeded_faceted > 0``) — exact-planar
-            #     faces and faceted-unseeded patches don't share TopoDS edges
-            #     at the seam, so the sewn solid fails ``BRepCheck`` even
-            #     though every face is present and the volume is approximately
-            #     correct.
-            # Either way, falling through to the faceted bake gives the caller
-            # a guaranteed-valid Solid. Callers that want the partially-exact
-            # recovered body can invoke ``recover_brep()`` directly and inspect
-            # the ``RecoveryResult``.
+            # Recovery did not yield a valid closed solid. With shared-topology
+            # recovery (one TopoDS_Vertex/Edge per mesh vertex index, shared
+            # across planar faces and faceted patches) a mixed-provenance body
+            # — exact-planar seeded faces abutting faceted hull / Minkowski /
+            # unseeded regions — is now valid by construction, so this fallback
+            # is *not* expected to trigger for bp10-style mixed input. It
+            # remains a safety net for genuinely-unrecoverable cases: a bare
+            # Shell (no closed solid built), or a degenerate mesh OCCT cannot
+            # close. Falling through to the faceted bake then still gives the
+            # caller a guaranteed-valid Solid; callers that want the
+            # partially-exact recovered body can invoke ``recover_brep()``
+            # directly and inspect the ``RecoveryResult``.
 
         vertices, triangles = self.to_arrays()
         solid = Solid.from_mesh(vertices, triangles, fix=False)

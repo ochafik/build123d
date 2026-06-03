@@ -2403,8 +2403,10 @@ def test_to_solid_mixed_provenance_is_valid_and_full_volume():
     """to_solid() on a mixed-provenance MeshPart returns a valid full body.
 
     Regression for the bp10 footgun: hull-of-spheres + a seeded bore used to
-    bake to a near-empty solid (~vol 0). After the auto-fallback fix, to_solid
-    always returns a valid solid whose volume matches the mesh.
+    bake to a near-empty solid (~vol 0). With shared-topology recovery, to_solid
+    returns a valid solid whose volume matches the mesh to tessellation
+    tolerance — and, unlike the old auto-fallback, it keeps the seeded box's
+    exact analytic planar faces instead of re-baking everything faceted.
     """
     hull = mesh_hull(
         MeshPart.sphere(radius=20).move(Location((0, 0, 0))),
@@ -2416,11 +2418,15 @@ def test_to_solid_mixed_provenance_is_valid_and_full_volume():
     solid = mixed.to_solid()
     assert isinstance(solid, (Solid, Compound))
     assert solid.is_valid  # the always-valid contract
-    # Full body, not the silent-drop near-empty result.
-    assert solid.volume == pytest.approx(mesh_volume, rel=1e-3)
-    # And it matches the explicit faceted bake (the fallback path).
-    faceted = mixed.to_solid(reconstruct=False)
-    assert solid.volume == pytest.approx(faceted.volume, rel=1e-6)
+    # Full body, not the silent-drop near-empty result. The exact-planar box
+    # makes the volume differ slightly from the pure faceted mesh volume, so
+    # this is a tessellation-tolerance match, not bit-exact.
+    assert solid.volume == pytest.approx(mesh_volume, rel=5e-3)
+    # The mixed body is no longer forced through the faceted fallback: at least
+    # the seeded box's analytic planar faces survive in the recovered body.
+    recovered = recover_brep(read_result(mixed.manifold), mixed.side_map)
+    assert recovered.is_valid
+    assert recovered.n_exact_planar > 0
 
 
 @pytest.mark.parametrize(
@@ -2444,3 +2450,91 @@ def test_to_solid_is_always_valid(make_mesh_part):
     solid = make_mesh_part().to_solid()
     assert isinstance(solid, (Solid, Compound))
     assert solid.is_valid
+
+
+# --------------------------------------------------------------------------
+# Shared-topology mixed recovery -- valid AND exact at the seam (bp10)
+# --------------------------------------------------------------------------
+
+
+def test_mixed_seam_valid_and_exact_planar_faces_preserved():
+    """Mixed faceted-curved / exact-planar body: valid AND exact at the seam.
+
+    The headline of the shared-topology rewrite. A seeded sphere (one curved
+    surface, recovered faceted) has a seeded box bore subtracted through it. The
+    four bore walls are exact planar seeded faces that abut the faceted sphere
+    region at a seam. Before the rewrite, an exact-planar face contributed ONE
+    long straight edge over the seam while the faceted patch contributed many
+    short edges, so they could not share edges and the sewn shell was
+    BRepCheck-invalid; to_solid then threw the exact recovery away and re-baked
+    fully faceted. With one shared TopoDS_Vertex/Edge per mesh vertex index, the
+    planar wire is subdivided at every seam vertex and the two regions share
+    their seam edges -- so the body is valid AND the bore walls survive as exact
+    analytic GeomType.PLANE faces.
+
+    This faceted-curved + planar body is deterministic; the hull-blob variant
+    (a non-deterministic tessellation) is covered by the regression test below.
+    """
+    body = MeshPart.sphere(10) - MeshPart.from_part(Box(4, 4, 40))
+
+    recovered = recover_brep(read_result(body.manifold), body.side_map)
+    # Valid by construction -- the shared seam topology is the whole point.
+    assert recovered.is_valid
+    # Mixed provenance: the sphere is curved/faceted, the bore is seeded/planar.
+    assert recovered.n_faceted_curved > 0
+    # The four seeded planar bore walls survive as EXACT analytic faces.
+    exact_planar = sum(len(r.faces) for r in recovered.recovered_faces if r.exact)
+    assert exact_planar == recovered.n_exact_planar
+    assert recovered.n_exact_planar >= 4
+    # The planar bore is exact and the faceted sphere is the only approximation,
+    # so the recovered volume matches the mesh body to tessellation tolerance.
+    assert recovered.volume == pytest.approx(body.volume, rel=1e-3)
+
+    # to_solid() returns that valid, partially-exact body -- no fall-through to a
+    # fully-faceted re-bake for this mixed input.
+    solid = body.to_solid()
+    assert isinstance(solid, (Solid, Compound))
+    assert solid.is_valid
+    # The exact bore walls survive as large analytic planes in the baked solid
+    # (a faceted patch is many tiny per-triangle planes; the bore walls are far
+    # larger), proving the planar faces were not re-baked faceted.
+    big_planes = [
+        f for f in solid.faces() if f.geom_type == GeomType.PLANE and f.area > 20.0
+    ]
+    assert len(big_planes) >= 4
+
+
+def test_bp10_hull_blob_with_seeded_bore_does_not_collapse():
+    """bp10-style: a faceted hull blob with a seeded planar bore stays full.
+
+    A convex hull of four spheres (unseeded, faceted) has a seeded box bore
+    subtracted through it -- the eval case that surfaced the seam bug. The
+    hull's tessellation is not deterministic, so this asserts the guarantees the
+    rewrite provides regardless of tessellation: the recovery keeps the exact
+    seeded planar bore walls, the full body volume (not the silent-drop
+    near-empty result), and to_solid returns a valid body.
+    """
+    blob = mesh_hull(
+        MeshPart.sphere(5).translate((0, 0, 0)),
+        MeshPart.sphere(5).translate((10, 0, 0)),
+        MeshPart.sphere(5).translate((0, 10, 0)),
+        MeshPart.sphere(5).translate((10, 10, 0)),
+    )
+    body = blob - MeshPart.from_part(Box(3, 3, 40))
+
+    recovered = recover_brep(read_result(body.manifold), body.side_map)
+    # Mixed provenance: the hull is unseeded/faceted, the bore is seeded/planar.
+    assert recovered.n_unseeded_faceted > 0
+    # The seeded planar bore walls survive as EXACT analytic faces, not facets.
+    assert recovered.n_exact_planar > 0
+    # Full body, not the near-empty silent-drop result of the old code. The
+    # hull tessellation is not deterministic, so this is a loose lower bound:
+    # the old bug collapsed the volume toward zero, here it is the full blob.
+    assert recovered.volume > 0.9 * body.volume
+
+    # to_solid always returns a valid body (shared topology, with the faceted
+    # fallback as a safety net for any tessellation OCCT cannot close).
+    solid = body.to_solid()
+    assert isinstance(solid, (Solid, Compound))
+    assert solid.is_valid
+    assert solid.volume > 0.9 * body.volume

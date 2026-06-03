@@ -10,28 +10,59 @@ result back into an analytic build123d :class:`~build123d.Solid`.
 
 Given a manifold boolean result whose triangles carry seeded ``face_id`` values
 (from :func:`build123d.mesh.bridge.shape_to_manifold`) and the matching
-:class:`~build123d.mesh.bridge.SideMap`:
+:class:`~build123d.mesh.bridge.SideMap`, recovery builds a single
+topologically-shared shell keyed by *result-mesh vertex index*, mirroring the
+direct-assembly pattern of :meth:`build123d.Solid.from_mesh`:
+
+* **One** ``TopoDS_Vertex`` per result-mesh vertex index, built once and reused.
+* **One** ``TopoDS_Edge`` per unordered mesh vertex-index pair, built once and
+  shared (reversed) between its two incident faces.
+
+This shared topology is the whole point: a planar face and an adjacent faceted
+patch that meet at a seam reference the *same* ``TopoDS_Edge`` objects, so the
+assembled shell is **valid by construction** — no free or non-manifold seam
+edges — even when exact-planar and faceted regions abut. It replaces the older
+"sew independently built faces, fall back to fully faceted if the seam is
+invalid" stopgap, under which a single unseeded (hull / Minkowski / …) region
+forced the *entire* solid to lose its exact planar faces.
+
+The per-id handling, on top of the shared topology:
 
 * Group output triangles by ``face_id``.
 * Split each group into edge-connected components — a single seeded id can carry
   a face the boolean cut into two disjoint pieces, and each piece must become
   its own :class:`~build123d.Face`.
 * For each **planar** component: extract the boundary edge loops (mesh edges used
-  by exactly one triangle of the component), project their vertices orthogonally
-  onto the *known input* ``Geom_Plane`` carried by the side-map — erasing
-  tessellation jitter — and build one **exact** planar ``TopoDS_Face`` on that
-  analytic plane. The largest loop is the outer boundary; any nested loop is a
-  hole.
-* For each **curved** component: keep it faceted (one flat face per triangle).
-  faceID *identifies* the surface but exact re-trimming of a known cylinder /
-  sphere with re-fitted boundary curves is out of scope.
-* Sew the faces into a :class:`~build123d.Solid` — or a
-  :class:`~build123d.Compound` when the result is several disjoint bodies.
+  by exactly one triangle of the component) and build one **exact** planar
+  ``TopoDS_Face`` on the *known input* ``Geom_Plane``. The boundary wire is
+  subdivided at every mesh vertex along the seam — each segment is the shared
+  per-pair ``TopoDS_Edge`` — so its edges line up one-to-one with any adjacent
+  faceted patch instead of spanning the seam as one long straight edge. The
+  largest loop is the outer boundary; any nested loop is a hole.
+* For each **curved** seeded component and each **unseeded** id: keep it faceted
+  (one flat face per triangle, built from the same shared edges). faceID
+  *identifies* a curved surface but exact re-trimming of a known cylinder /
+  sphere with re-fitted boundary curves is out of scope; unseeded ids carry no
+  surface claim at all.
+* Group the assembled faces into shells by shared vertex index, classify
+  void/disjoint shells with
+  :func:`build123d.topology.utils.group_shells_into_solids`, and emit a
+  :class:`~build123d.Solid` — or a :class:`~build123d.Compound` for several
+  disjoint bodies.
+
+Seam-vertex placement rule: a mesh vertex incident to **exactly one** planar
+group is projected orthogonally onto that group's exact ``Geom_Plane`` (erasing
+tessellation jitter, keeping the planar face bit-exact). A vertex incident to
+**several** planar groups, or to any faceted group as well, keeps its raw mesh
+position — projecting onto one plane would pull it off the others and tear the
+shared seam.
 
 For an all-planar CSG result this yields an exact, analytic, *filletable* B-rep:
 the recovered faces lie on the input analytic planes, so the volume is bit-exact
 and ``BRepFilletAPI`` fillet/chamfer succeed and produce real analytic blend
-surfaces.
+surfaces. For a mixed-provenance result the planar regions stay exact while only
+genuinely-curved / unseeded regions remain faceted — and the whole shell is
+still valid.
 
 license:
 
@@ -58,30 +89,26 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from OCP.BRep import BRep_Builder
 from OCP.BRepBuilderAPI import (
     BRepBuilderAPI_MakeEdge,
     BRepBuilderAPI_MakeFace,
-    BRepBuilderAPI_MakePolygon,
     BRepBuilderAPI_MakeSolid,
     BRepBuilderAPI_MakeVertex,
     BRepBuilderAPI_MakeWire,
-    BRepBuilderAPI_Sewing,
 )
 from OCP.Geom import Geom_Plane
 from OCP.gp import gp_Ax3, gp_Dir, gp_Pln, gp_Pnt
-from OCP.ShapeFix import ShapeFix_Shell, ShapeFix_Solid
-from OCP.TopAbs import TopAbs_ShapeEnum
-from OCP.TopExp import TopExp_Explorer
-from OCP.TopoDS import TopoDS
+from OCP.ShapeFix import ShapeFix_Solid
+from OCP.TopoDS import TopoDS, TopoDS_Edge, TopoDS_Shell, TopoDS_Vertex, TopoDS_Wire
 
 from build123d.topology import Compound, Face, Shell, Solid
-from build123d.topology.utils import group_shells_into_solids
+from build123d.topology.utils import (
+    connected_components_by_vertex,
+    group_shells_into_solids,
+)
 
 from .bridge import FaceRecord, ResultMesh, SideMap
-
-# Sewing tolerance: the welded mesh vertices are well within this of each other.
-_SEW_TOLERANCE = 1e-6
-
 
 # ---------------------------------------------------------------------------
 # connectivity -- split a seeded id into edge-connected components
@@ -218,6 +245,155 @@ def _project_to_plane(
 
 
 # ---------------------------------------------------------------------------
+# shared-topology assembly keyed by result-mesh vertex index
+# ---------------------------------------------------------------------------
+
+
+class _SharedTopology:
+    """Per-result-mesh-vertex-index shared ``TopoDS_Vertex`` / ``TopoDS_Edge``.
+
+    The crux of valid mixed planar/faceted recovery: every face built through
+    this object — exact planar wire segment *or* faceted triangle edge — that
+    references the same unordered mesh vertex-index pair reuses the **same**
+    ``TopoDS_Edge`` (shared reversed between its two incident faces), exactly as
+    :meth:`build123d.Solid.from_mesh`'s ``get_edge`` does. Planar and faceted
+    regions that abut at a seam therefore share edges, so the assembled shell
+    has no free / non-manifold seam edges and is valid by construction.
+
+    Vertex positions follow the seam rule (see :func:`_vertex_positions`):
+    vertices incident to exactly one planar group are pre-projected onto that
+    group's exact plane; every other vertex keeps its raw mesh position.
+
+    Attributes:
+        positions (np.ndarray): ``(V, 3)`` placed vertex coordinates.
+    """
+
+    def __init__(self, positions: np.ndarray):
+        """Initialise the shared-topology caches.
+
+        Args:
+            positions (np.ndarray): ``(V, 3)`` placed vertex coordinates, one
+                per result-mesh vertex index.
+        """
+        self.positions = positions
+        self._vertices: list[TopoDS_Vertex | None] = [None] * len(positions)
+        self._edges: dict[tuple[int, int], TopoDS_Edge] = {}
+
+    def vertex(self, index: int) -> TopoDS_Vertex:
+        """Return the shared ``TopoDS_Vertex`` for mesh vertex ``index``."""
+        vertex = self._vertices[index]
+        if vertex is None:
+            x, y, z = self.positions[index]
+            vertex = BRepBuilderAPI_MakeVertex(
+                gp_Pnt(float(x), float(y), float(z))
+            ).Vertex()
+            self._vertices[index] = vertex
+        return vertex
+
+    def edge(self, start: int, end: int) -> TopoDS_Edge | None:
+        """Return the shared ``TopoDS_Edge`` for the pair ``(start, end)``.
+
+        The edge is stored forward (``key[0] < key[1]``); a caller traversing it
+        in the opposite direction gets the SAME edge reversed, so its two
+        incident faces share topology.
+
+        Args:
+            start (int): first mesh vertex index of the directed edge.
+            end (int): second mesh vertex index of the directed edge.
+
+        Returns:
+            TopoDS_Edge | None: the shared edge, oriented ``start -> end``, or
+            ``None`` if the edge could not be built (degenerate).
+        """
+        if start == end:
+            return None
+        key = (start, end) if start < end else (end, start)
+        edge = self._edges.get(key)
+        if edge is None:
+            edge_builder = BRepBuilderAPI_MakeEdge(
+                self.vertex(key[0]), self.vertex(key[1])
+            )
+            if not edge_builder.IsDone():
+                return None
+            edge = edge_builder.Edge()
+            self._edges[key] = edge
+        return edge if start == key[0] else TopoDS.Edge_s(edge.Reversed())
+
+    def wire(self, loop: list[int]) -> TopoDS_Wire | None:
+        """Build a closed wire over ``loop`` from shared per-segment edges.
+
+        Each consecutive pair of loop vertices (and the closing pair) becomes the
+        shared :meth:`edge` — so the wire is subdivided at every mesh vertex and
+        its edges line up one-to-one with any adjacent faceted patch.
+
+        Args:
+            loop (list[int]): an ordered list of mesh vertex indices.
+
+        Returns:
+            TopoDS_Wire | None: the built wire, or ``None`` if any segment edge
+            failed or the wire did not close.
+        """
+        count = len(loop)
+        if count < 3:
+            return None
+        wire_builder = BRepBuilderAPI_MakeWire()
+        for position in range(count):
+            edge = self.edge(loop[position], loop[(position + 1) % count])
+            if edge is None:
+                return None
+            wire_builder.Add(edge)
+        if not wire_builder.IsDone():
+            return None
+        return wire_builder.Wire()
+
+
+def _vertex_positions(result: ResultMesh, side_map: SideMap) -> np.ndarray:
+    """Place every result-mesh vertex, applying the seam-projection rule.
+
+    A vertex incident to **exactly one** planar seeded group is projected
+    orthogonally onto that group's exact ``Geom_Plane`` — erasing tessellation
+    jitter so the planar face stays bit-exact. A vertex incident to several
+    planar groups, or to any curved / unseeded group as well, keeps its raw mesh
+    position: it already lies on the true seam within tolerance, and projecting
+    onto one plane would pull it off the others and tear the shared seam.
+
+    Args:
+        result (ResultMesh): the boolean result mesh.
+        side_map (SideMap): the ``faceID -> provenance`` map.
+
+    Returns:
+        np.ndarray: ``(V, 3)`` placed vertex coordinates.
+    """
+    vertex_count = len(result.vertices)
+    # For each vertex: the set of distinct planar groups touching it, and whether
+    # any non-planar (curved or unseeded) group touches it.
+    planar_groups: list[set[int]] = [set() for _ in range(vertex_count)]
+    touches_nonplanar = np.zeros(vertex_count, dtype=bool)
+
+    for face_id in result.distinct_ids:
+        record = side_map[face_id] if face_id in side_map else None
+        is_planar = record is not None and record.is_planar
+        triangles = result.triangles[result.triangles_of(face_id)]
+        incident = np.unique(triangles)
+        if is_planar:
+            for index in incident:
+                planar_groups[int(index)].add(face_id)
+        else:
+            touches_nonplanar[incident] = True
+
+    positions = result.vertices.copy()
+    for index in range(vertex_count):
+        groups = planar_groups[index]
+        if len(groups) == 1 and not touches_nonplanar[index]:
+            record = side_map[next(iter(groups))]
+            assert record.plane_origin is not None and record.plane_normal is not None
+            positions[index] = _project_to_plane(
+                result.vertices[index], record.plane_origin, record.plane_normal
+            )
+    return positions
+
+
+# ---------------------------------------------------------------------------
 # recovered-face / recovered-solid records
 # ---------------------------------------------------------------------------
 
@@ -261,8 +437,13 @@ class RecoveryResult:
             ``TopoDS_Face`` per triangle). Non-zero when the input MeshPart
             mixed seeded operands with hull / Minkowski / level_set /
             ``from_mesh`` / imported-STL geometry that synthesised new shell
-            facets without analytic provenance.
+            facets without analytic provenance. Such a mixed result is now
+            valid by construction (shared seam topology), so a non-zero count
+            no longer implies an invalid body.
         is_valid (bool): whether the recovered solid passes ``is_valid``.
+            Because planar and faceted regions share their seam edges, a mixed
+            planar/faceted body is valid here — the recovery no longer needs the
+            fully-faceted fallback for mixed input.
         volume (float): the recovered body's volume.
     """
 
@@ -297,26 +478,42 @@ def _exact_plane(record: FaceRecord) -> Geom_Plane:
 
 
 def _recover_planar_face(
-    result: ResultMesh, face_id: int, record: FaceRecord
+    result: ResultMesh,
+    face_id: int,
+    record: FaceRecord,
+    topology: _SharedTopology,
+    component_of_triangle: np.ndarray,
+    faces_by_component: dict[int, list[Face]],
 ) -> RecoveredFace:
     """Rebuild exact planar ``TopoDS_Face``(s) for one seeded planar id.
 
     Each edge-connected component of the id's triangle group becomes one exact
     planar :class:`~build123d.Face` on the *known input* ``Geom_Plane``. Within a
     component the largest boundary loop is the outer wire and any nested loop is
-    a hole. Boundary vertices are projected onto the exact plane, erasing
-    tessellation jitter, so the recovered face is exact.
+    a hole. Each wire is built from the **shared** per-segment ``TopoDS_Edge``
+    objects (see :class:`_SharedTopology`), subdividing the boundary at every
+    mesh vertex so its edges line up one-to-one with any adjacent faceted patch.
+
+    A single seeded id can span more than one disjoint body (face ids are not
+    confined to one connected component once meshes are fused), so each built
+    face is filed into ``faces_by_component`` under the body label of the
+    triangles that produced it.
 
     Args:
         result (ResultMesh): the boolean result mesh.
         face_id (int): the seeded id to recover.
         record (FaceRecord): the planar provenance record for ``face_id``.
+        topology (_SharedTopology): the shared vertex/edge cache.
+        component_of_triangle (np.ndarray): per-triangle body component label.
+        faces_by_component (dict[int, list[Face]]): built faces filed by body
+            component (mutated in place).
 
     Returns:
         RecoveredFace: the recovered face(s); ``faces`` is empty if no face
         could be built.
     """
-    group = result.triangles[result.triangles_of(face_id)]
+    group_indices = result.triangles_of(face_id)
+    group = result.triangles[group_indices]
     geom_plane = _exact_plane(record)
     origin = record.plane_origin
     normal = record.plane_normal
@@ -331,38 +528,14 @@ def _recover_planar_face(
     in_plane_u /= np.linalg.norm(in_plane_u)
     in_plane_v = np.cross(unit_normal, in_plane_u)
 
-    def loop_points(loop: list[int]) -> np.ndarray:
-        return np.array(
-            [_project_to_plane(result.vertices[i], origin, normal) for i in loop]
-        )
-
-    def loop_area(points: np.ndarray) -> float:
+    def loop_area(loop: list[int]) -> float:
+        points = topology.positions[loop]
         coords = np.column_stack([points @ in_plane_u, points @ in_plane_v])
         x_coords, y_coords = coords[:, 0], coords[:, 1]
         return 0.5 * abs(
             np.dot(x_coords, np.roll(y_coords, -1))
             - np.dot(y_coords, np.roll(x_coords, -1))
         )
-
-    def make_wire(loop: list[int]):
-        points = loop_points(loop)
-        vertices = [
-            BRepBuilderAPI_MakeVertex(gp_Pnt(*point)).Vertex() for point in points
-        ]
-        wire_builder = BRepBuilderAPI_MakeWire()
-        count = len(vertices)
-        all_edges_ok = True
-        for index in range(count):
-            edge_builder = BRepBuilderAPI_MakeEdge(
-                vertices[index], vertices[(index + 1) % count]
-            )
-            if not edge_builder.IsDone():
-                all_edges_ok = False
-                continue
-            wire_builder.Add(edge_builder.Edge())
-        if not all_edges_ok or not wire_builder.IsDone():
-            return None
-        return wire_builder.Wire()
 
     faces: list[Face] = []
     for component in _connected_components(group):
@@ -372,24 +545,27 @@ def _recover_planar_face(
         ]
         if not loops:
             continue
-        scored = sorted(
-            ((loop_area(loop_points(loop)), loop) for loop in loops),
-            key=lambda pair: -pair[0],
-        )
-        outer_wire = make_wire(scored[0][1])
+        scored = sorted(loops, key=loop_area, reverse=True)
+        outer_wire = topology.wire(scored[0])
         if outer_wire is None:
             continue
         face_builder = BRepBuilderAPI_MakeFace(geom_plane, outer_wire, True)
-        for _, hole_loop in scored[1:]:
-            hole_wire = make_wire(hole_loop)
+        for hole_loop in scored[1:]:
+            hole_wire = topology.wire(hole_loop)
             if hole_wire is not None:
                 face_builder.Add(TopoDS.Wire_s(hole_wire.Reversed()))
+        face: Face | None = None
         if face_builder.IsDone():
-            faces.append(Face(face_builder.Face()))
+            face = Face(face_builder.Face())
         else:
             fallback = BRepBuilderAPI_MakeFace(outer_wire, True)
             if fallback.IsDone():
-                faces.append(Face(fallback.Face()))
+                face = Face(fallback.Face())
+        if face is not None:
+            faces.append(face)
+            # A connected planar sub-component lies entirely in one body.
+            body = int(component_of_triangle[group_indices[component[0]]])
+            faces_by_component[body].append(face)
 
     if not faces:
         return RecoveredFace(face_id, "PLANE", [], False, "no face built")
@@ -399,31 +575,54 @@ def _recover_planar_face(
     return RecoveredFace(face_id, "PLANE", faces, True, note)
 
 
-def _faceted_patch(result: ResultMesh, face_id: int) -> list[Face]:
-    """Return a curved seeded id as a list of flat triangle faces (faceted).
+def _faceted_patch(
+    result: ResultMesh,
+    face_id: int,
+    topology: _SharedTopology,
+    component_of_triangle: np.ndarray,
+    faces_by_component: dict[int, list[Face]],
+) -> list[Face]:
+    """Return a curved / unseeded id as a list of flat triangle faces (faceted).
 
-    faceID identifies *which* analytic surface the region lies on, but exact
+    faceID identifies *which* analytic surface a curved region lies on, but exact
     re-trimming of that surface with re-fitted boundary curves is out of scope —
-    so a curved group is recovered as one flat ``TopoDS_Face`` per triangle.
+    so a curved (or unseeded) group is recovered as one flat ``TopoDS_Face`` per
+    triangle. Each triangle's wire is built from the **shared** per-segment
+    ``TopoDS_Edge`` objects (see :class:`_SharedTopology`), so the patch shares
+    its boundary edges with any neighbouring planar face or patch.
+
+    Each triangle face is filed into ``faces_by_component`` under its own body
+    component label, so a single faceted id spanning more than one disjoint body
+    is split across the right shells.
 
     Args:
         result (ResultMesh): the boolean result mesh.
-        face_id (int): the seeded curved id to recover.
+        face_id (int): the seeded curved / unseeded id to recover.
+        topology (_SharedTopology): the shared vertex/edge cache.
+        component_of_triangle (np.ndarray): per-triangle body component label.
+        faces_by_component (dict[int, list[Face]]): built faces filed by body
+            component (mutated in place).
 
     Returns:
         list[Face]: one flat triangle face per triangle of the group.
     """
     patch: list[Face] = []
-    for triangle in result.triangles[result.triangles_of(face_id)]:
-        polygon = BRepBuilderAPI_MakePolygon()
-        for vertex_index in triangle:
-            polygon.Add(gp_Pnt(*(float(x) for x in result.vertices[vertex_index])))
-        polygon.Close()
-        if not polygon.IsDone():
+    for triangle_index in result.triangles_of(face_id):
+        triangle = result.triangles[triangle_index]
+        corner_a, corner_b, corner_c = (int(x) for x in triangle)
+        edge_ab = topology.edge(corner_a, corner_b)
+        edge_bc = topology.edge(corner_b, corner_c)
+        edge_ca = topology.edge(corner_c, corner_a)
+        if edge_ab is None or edge_bc is None or edge_ca is None:
             continue
-        face_builder = BRepBuilderAPI_MakeFace(polygon.Wire())
+        wire_builder = BRepBuilderAPI_MakeWire(edge_ab, edge_bc, edge_ca)
+        if not wire_builder.IsDone():
+            continue
+        face_builder = BRepBuilderAPI_MakeFace(wire_builder.Wire(), True)
         if face_builder.IsDone():
-            patch.append(Face(face_builder.Face()))
+            face = Face(face_builder.Face())
+            patch.append(face)
+            faces_by_component[int(component_of_triangle[triangle_index])].append(face)
     return patch
 
 
@@ -450,14 +649,21 @@ def recover_brep(result: ResultMesh, side_map: SideMap) -> RecoveryResult:
       these ids would be silently dropped and the result would be missing
       whole regions of the input mesh.
 
-    The faces are sewn into a :class:`~build123d.Solid`, or a
+    All faces are assembled into shared-topology shells: every ``TopoDS_Vertex``
+    is built once per mesh vertex index, every ``TopoDS_Edge`` once per unordered
+    index pair and shared (reversed) between its two incident faces (see
+    :class:`_SharedTopology`). A planar face and an adjacent faceted patch that
+    meet at a seam therefore reference the **same** edge objects, so the result
+    shell is valid by construction — no free / non-manifold seam edges. The
+    shells become a :class:`~build123d.Solid`, or a
     :class:`~build123d.Compound` when the result is several disjoint bodies.
 
     For an all-planar CSG result this is exact: bit-exact volume, analytic
     planar faces, and a ``fillet()`` / ``chamfer()`` works on the result.
-    For a mixed seeded+unseeded result the seeded portion is still exact;
-    the unseeded portion is faceted but present (see
-    :attr:`RecoveryResult.n_unseeded_faceted` to detect this).
+    For a mixed seeded+unseeded result the seeded planar portion stays exact and
+    the curved / unseeded portion is faceted but present — and, unlike the old
+    independently-sewn recovery, the whole shell is still valid (see
+    :attr:`RecoveryResult.n_unseeded_faceted` to detect a mixed result).
 
     Args:
         result (ResultMesh): the boolean result mesh, with seeded ``face_id``.
@@ -475,11 +681,27 @@ def recover_brep(result: ResultMesh, side_map: SideMap) -> RecoveryResult:
             "arrays carries no provenance — use to_solid(reconstruct=False)."
         )
 
+    # One TopoDS_Vertex / TopoDS_Edge per result-mesh vertex index, placed by
+    # the seam-projection rule, shared across all faces built below.
+    topology = _SharedTopology(_vertex_positions(result, side_map))
+
+    # Split the whole result into disjoint bodies up front (triangles sharing a
+    # vertex index are one body), so each recovered face can be filed into the
+    # shell of the body it belongs to — exactly as Solid.from_mesh does.
+    component_of_triangle = connected_components_by_vertex(
+        result.triangles, len(result.vertices)
+    )
+
     recovered_faces: list[RecoveredFace] = []
-    sewing = BRepBuilderAPI_Sewing(_SEW_TOLERANCE)
     n_exact_planar = 0
     n_faceted_curved = 0
     n_unseeded_faceted = 0
+
+    # Faces grouped by body component label, ready for shell assembly. A single
+    # face_id is NOT confined to one body once meshes are fused, so each built
+    # face is filed by the body component of the triangles that produced it —
+    # done inside the recovery helpers, not by an id-level representative.
+    faces_by_component: dict[int, list[Face]] = defaultdict(list)
 
     for face_id in result.distinct_ids:
         if face_id not in side_map:
@@ -491,9 +713,9 @@ def recover_brep(result: ResultMesh, side_map: SideMap) -> RecoveryResult:
             # triangle) — same shape as a curved-residue group, just without
             # a ``surface_kind``. Preserves the full geometry of the result
             # instead of silently dropping it.
-            patch = _faceted_patch(result, face_id)
-            for face in patch:
-                sewing.Add(face.wrapped)
+            patch = _faceted_patch(
+                result, face_id, topology, component_of_triangle, faces_by_component
+            )
             n_unseeded_faceted += 1
             recovered_faces.append(
                 RecoveredFace(
@@ -508,15 +730,20 @@ def recover_brep(result: ResultMesh, side_map: SideMap) -> RecoveryResult:
             continue
         record = side_map[face_id]
         if record.is_planar:
-            recovered = _recover_planar_face(result, face_id, record)
-            for face in recovered.faces:
-                sewing.Add(face.wrapped)
+            recovered = _recover_planar_face(
+                result,
+                face_id,
+                record,
+                topology,
+                component_of_triangle,
+                faces_by_component,
+            )
             n_exact_planar += len(recovered.faces)
             recovered_faces.append(recovered)
         else:
-            patch = _faceted_patch(result, face_id)
-            for face in patch:
-                sewing.Add(face.wrapped)
+            patch = _faceted_patch(
+                result, face_id, topology, component_of_triangle, faces_by_component
+            )
             n_faceted_curved += 1
             recovered_faces.append(
                 RecoveredFace(
@@ -529,26 +756,25 @@ def recover_brep(result: ResultMesh, side_map: SideMap) -> RecoveryResult:
                 )
             )
 
-    sewing.Perform()
-    sewed = sewing.SewedShape()
-
-    # Sewing yields one shell per connected component. A CSG result splits into
-    # several shells for two distinct reasons that must NOT be conflated:
-    #   * disjoint bodies         -> each shell is its own positive Solid;
-    #   * a body with a cavity    -> the cavity's inward-facing shell is an
-    #                                internal VOID of the enclosing body.
-    # Summing a positive Solid per shell would ADD a cavity instead of carving
-    # it out. group_shells_into_solids classifies by bounding-box nesting: a
-    # shell nested inside another is that body's void (one level of nesting,
-    # matching Solid.from_mesh); non-nested shells are separate bodies.
+    # Assemble one TopoDS_Shell per body component directly (no sewing): the
+    # faces already share vertices and edges through ``topology``, so adding
+    # them to a shell yields a connected, manifold shell with no seam repair.
+    # group_shells_into_solids then classifies by bounding-box nesting:
+    #   * disjoint bodies      -> each shell is its own positive Solid;
+    #   * a body with a cavity -> the cavity's inward-facing shell is an
+    #                             internal VOID of the enclosing body.
+    builder = BRep_Builder()
     shells: list[Shell] = []
-    explorer = TopExp_Explorer(sewed, TopAbs_ShapeEnum.TopAbs_SHELL)
-    while explorer.More():
-        shell_fix = ShapeFix_Shell()
-        shell_fix.Init(TopoDS.Shell_s(explorer.Current()))
-        shell_fix.Perform()
-        shells.append(Shell(shell_fix.Shell()))
-        explorer.Next()
+    for component in sorted(faces_by_component):
+        faces = faces_by_component[component]
+        if not faces:
+            continue
+        shell = TopoDS_Shell()
+        builder.MakeShell(shell)
+        for face in faces:
+            builder.Add(shell, face.wrapped)
+        shell.Closed(True)
+        shells.append(Shell(shell))
 
     solids: list[Solid] = []
     for outer_shell, void_shells in group_shells_into_solids(shells):
