@@ -2207,8 +2207,14 @@ def _mesh_fillet_impl(
         radii = _chain_radius_samples(chain, per_vertex_fn)
         try:
             _check_fillet_feasibility(
-                chain, vertices, triangles, face_id, tri_normals, radii,
-                host_tree, normal_index,
+                chain,
+                vertices,
+                triangles,
+                face_id,
+                tri_normals,
+                radii,
+                host_tree,
+                normal_index,
             )
         except MeshFilletInfeasible as exc:
             if on_infeasible == "raise":
