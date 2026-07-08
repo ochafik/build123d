@@ -30,13 +30,14 @@ from __future__ import annotations
 
 import copy as copy_module
 import warnings
-import numpy as np
-import sympy  # type: ignore
 from collections.abc import Callable, Iterable, Sequence
 from itertools import product
 from math import atan2, copysign, cos, degrees, radians, sin, sqrt
+from typing import Literal, overload
+
+import numpy as np
+import sympy  # type: ignore
 from scipy.optimize import minimize
-from typing import overload, Literal
 from typing_extensions import deprecated
 
 from build123d.build_common import WorkplaneList, flatten_sequence, validate_inputs
@@ -44,15 +45,15 @@ from build123d.build_enums import (
     AngularDirection,
     ContinuityLevel,
     GeomType,
-    LengthMode,
     Keep,
+    LengthMode,
     Mode,
     Sagitta,
-    Tangency,
     Side,
+    Tangency,
 )
 from build123d.build_line import BuildLine
-from build123d.geometry import Axis, Location, Plane, Vector, VectorLike, TOLERANCE
+from build123d.geometry import TOLERANCE, Axis, Location, Plane, Vector, VectorLike
 from build123d.topology import Curve, Edge, Face, Vertex, Wire
 from build123d.topology.shape_core import Shape, ShapeList
 
@@ -1771,7 +1772,7 @@ class FilletPolyline(BaseLineObject):
                 other_vertices = {
                     ve for e in edges for ve in e.vertices() if ve != vertex
                 }
-                third_edge = Edge.make_line(*[v for v in other_vertices])
+                third_edge = Edge.make_line(*other_vertices)
                 fillet_face = Face(Wire(edges + [third_edge])).fillet_2d(
                     current_radius, [vertex]
                 )
@@ -1781,7 +1782,7 @@ class FilletPolyline(BaseLineObject):
         if close:
             interior_edges = []
 
-            for i in range(len(fillets)):
+            for i in range(len(fillets)):  # pylint: disable=consider-using-enumerate
                 prev_fillet = fillets[i - 1]
                 curr_fillet = fillets[i]
                 prev_idx = i - 1

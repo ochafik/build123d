@@ -42,17 +42,18 @@ license:
 from __future__ import annotations
 
 import contextvars
+import functools
 import inspect
 import logging
 import sys
 import warnings
-import functools
 from abc import ABC, abstractmethod
-from itertools import product
-from math import sqrt, cos, pi
-from typing import Any, cast, overload, Protocol, Type, TypeVar, Generic
-
 from collections.abc import Callable, Iterable
+from itertools import product
+from math import cos, pi, sqrt
+from typing import Any, Generic, Type, TypeVar, cast, overload
+
+from OCP.Standard import Standard_ConstructionError
 from typing_extensions import Self
 
 from build123d.build_enums import Align, Mode, Select, Unit
@@ -77,8 +78,8 @@ from build123d.topology import (
     Solid,
     Vertex,
     Wire,
-    tuplify,
     new_edges,
+    tuplify,
 )
 
 # pylint: disable=too-many-lines
@@ -418,7 +419,7 @@ class Builder(ABC, Generic[ShapeT]):
                                 x_dir=(1, 0, 0),
                                 z_dir=new_face.normal_at(),
                             )
-                        except Exception:
+                        except (TypeError, ValueError, Standard_ConstructionError):
                             plane = Plane(origin=(0, 0, 0), z_dir=new_face.normal_at())
 
                         new_face = plane.to_local_coords(new_face)
@@ -1310,16 +1311,10 @@ class WorkplaneList:
 
 # Type variable representing the return type of the wrapped function
 T2 = TypeVar("T2")
-T2_covar = TypeVar("T2_covar", covariant=True)
-
-
-class ContextComponentGetter(Protocol[T2_covar]):
-    def __call__(self, select: Select = Select.ALL) -> T2_covar: ...
 
 
 def __gen_context_component_getter(
     func: Callable[[Builder, Select], T2],
-    # ) -> ContextComponentGetter[T2]:
 ) -> Callable[[Select], T2]:
     """
     Wraps a Builder method to automatically provide the Builder context.
@@ -1335,7 +1330,7 @@ def __gen_context_component_getter(
               a `Select` instance as its second argument.
 
     Returns:
-        ContextComponentGetter[T2]: A callable that takes only a `Select` argument and
+        Callable[T2]: A callable that takes only a `Select` argument and
         internally retrieves the Builder context to call the original method.
 
     Raises:

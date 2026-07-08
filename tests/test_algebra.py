@@ -725,6 +725,20 @@ class AlgebraTests(unittest.TestCase):
         self.assertAlmostEqual(b.area, r.area, 5)
         self.assertEqual(r._dim, 2)
 
+    def test_sketch_algebra_returns_sketch(self):
+        difference = Circle(10) - Rectangle(5, 5)
+        self.assertTrue(isinstance(difference, Sketch))
+        self.assertEqual(difference._dim, 2)
+        self.assertEqual(len(difference.faces()), 1)
+
+        union = Circle(10) + Rectangle(5, 5)
+        self.assertTrue(isinstance(union, Sketch))
+        self.assertEqual(union._dim, 2)
+
+        intersection = Circle(10) & Rectangle(5, 5)
+        self.assertTrue(isinstance(intersection, Sketch))
+        self.assertEqual(intersection._dim, 2)
+
     def test_empty_and_sketch(self):
         b = Rectangle(1, 3)
         with self.assertRaises(ValueError):

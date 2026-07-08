@@ -60,11 +60,7 @@ from collections.abc import Iterable, Sequence
 import numpy as np
 
 from OCP.BRep import BRep_Tool
-from OCP.BRepAlgoAPI import (
-    BRepAlgoAPI_BooleanOperation,
-    BRepAlgoAPI_Cut,
-    BRepAlgoAPI_Splitter,
-)
+from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut
 from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeFace
 from OCP.BRepLib import BRepLib_FindSurface
 from OCP.BRepOffsetAPI import BRepOffsetAPI_ThruSections
@@ -75,7 +71,6 @@ from OCP.TopExp import TopExp_Explorer
 from OCP.TopTools import TopTools_ListOfShape
 from OCP.TopoDS import (
     TopoDS,
-    TopoDS_Builder,
     TopoDS_Compound,
     TopoDS_Face,
     TopoDS_Shape,
@@ -91,7 +86,6 @@ from .shape_core import (
     ShapeList,
     downcast,
     shapetype,
-    unwrap_topods_compound,
     _make_topods_compound_from_shapes,
 )
 

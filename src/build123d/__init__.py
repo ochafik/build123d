@@ -246,4 +246,5 @@ __all__ = [
     "export_gltf",
     "export_stl",
     "export_brep",
+    "export_to_pcbway",
 ]

@@ -29,10 +29,12 @@ license:
 
 import copy as copy_module
 import logging
-from math import radians, tan
-from typing import cast, TypeAlias
-
 from collections.abc import Iterable
+from math import radians, tan
+from typing import TypeAlias, cast
+
+from OCP.Standard import Standard_ConstructionError, Standard_Failure
+from OCP.StdFail import StdFail_NotDone
 
 from build123d.build_common import (
     Builder,
@@ -41,21 +43,14 @@ from build123d.build_common import (
     flatten_sequence,
     validate_inputs,
 )
-from build123d.build_enums import Keep, Kind, Mode, Side, Transition, GeomType
+from build123d.build_enums import GeomType, Keep, Kind, Mode, Side, Transition
 from build123d.build_line import BuildLine
 from build123d.build_part import BuildPart
 from build123d.build_sketch import BuildSketch
-from build123d.geometry import (
-    Axis,
-    Plane,
-    Rotation,
-    RotationLike,
-    Vector,
-    VectorLike,
-)
+from build123d.geometry import Axis, Plane, Rotation, RotationLike, Vector, VectorLike
+from build123d.objects_curve import BaseLineObject
 from build123d.objects_part import BasePartObject
 from build123d.objects_sketch import BaseSketchObject
-from build123d.objects_curve import BaseLineObject
 from build123d.topology import (
     Compound,
     Curve,
@@ -629,8 +624,14 @@ def offset(
                     )
                 else:
                     inner_wires.append(offset_wire)
-            except Exception:
+            except (
+                RuntimeError,
+                Standard_Failure,
+                Standard_ConstructionError,
+                StdFail_NotDone,
+            ):
                 pass
+
         # inner wires may go beyond the outer wire so subtract faces
         new_face = Face(outer_wire)
         if (new_face.normal_at() - face.normal_at()).length > 0.001:

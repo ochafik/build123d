@@ -42,7 +42,7 @@ import logging
 import warnings
 from collections.abc import Callable, Iterable, Sequence
 from math import degrees, log10, pi, prod, radians
-from typing import TYPE_CHECKING, Any, Type, TypeAlias, cast, overload
+from typing import TYPE_CHECKING, Any, Type, TypeAlias, TypeVar, cast, overload
 
 import numpy as np
 from typing_extensions import deprecated
@@ -78,10 +78,12 @@ from OCP.TopAbs import TopAbs_ShapeEnum
 from OCP.TopLoc import TopLoc_Location
 from OCP.TopoDS import TopoDS, TopoDS_Edge, TopoDS_Face, TopoDS_Shape, TopoDS_Vertex
 
-from build123d.build_enums import Align, Align2DType, Align3DType, Extrinsic, Intrinsic
+from build123d.build_enums import Align, Align2D, Align3D, Extrinsic, Intrinsic
 
 if TYPE_CHECKING:  # pragma: no cover
     from .topology import Edge, Face, Shape, Vertex
+
+    _ShapeT = TypeVar("_ShapeT", bound=Shape)
 
 # Create a build123d logger to distinguish these logs from application logs.
 # If the user doesn't configure logging, all build123d logs will be discarded.
@@ -626,11 +628,12 @@ class AxisMeta(type):
 class Axis(metaclass=AxisMeta):
     """Axis
 
-    Axis defined by point and direction
+    Axis defined by point and direction or by two points
 
     Args:
         origin (VectorLike): start point
         direction (VectorLike): direction
+        end_point (VectorLike): point used with origin to define direction
         edge (Edge): origin & direction defined by start of edge
         location (Location): location to convert to axis
 
@@ -655,6 +658,10 @@ class Axis(metaclass=AxisMeta):
         """Axis: point and direction"""
 
     @overload
+    def __init__(self, origin: VectorLike, *, end_point: VectorLike) -> None:
+        """Axis: point and end point"""
+
+    @overload
     def __init__(self, edge: Edge) -> None:
         """Axis: start of Edge"""
 
@@ -664,6 +671,7 @@ class Axis(metaclass=AxisMeta):
         gp_ax1 = kwargs.pop("gp_ax1", None)
         origin = kwargs.pop("origin", None)
         direction = kwargs.pop("direction", None)
+        end_point = kwargs.pop("end_point", None)
         edge = kwargs.pop("edge", None)
         location = kwargs.pop("location", None)
 
@@ -686,6 +694,12 @@ class Axis(metaclass=AxisMeta):
                 raise ValueError(f"Unrecognized single argument: {arg}")
         elif len(args) == 2:
             origin, direction = args
+
+        # Convert end point to direction
+        if end_point is not None:
+            if direction is not None:
+                raise ValueError("Axis end_point cannot be used with direction")
+            direction = Vector(end_point) - Vector(origin)
 
         # Handle edge-based construction
         if edge is not None:
@@ -723,6 +737,7 @@ class Axis(metaclass=AxisMeta):
 
     @property
     def wrapped(self):
+        """OCP object"""
         return self._wrapped
 
     @property
@@ -942,6 +957,42 @@ class Axis(metaclass=AxisMeta):
         """intersect vector with other &"""
         return self.intersect(other)
 
+    def _intersect_axis(self, axis: Axis) -> Vector | Axis | None:
+        """Find intersection of this axis and another axis."""
+        if self.is_coaxial(axis):
+            return self
+        if self.is_skew(axis):
+            return None
+
+        p1 = np.array([*self.position])
+        d1 = np.array([*self.direction])
+        p2 = np.array([*axis.position])
+        d2 = np.array([*axis.direction])
+
+        system_of_equations = np.array([d1, -d2, np.cross(d1, d2)]).T
+        origin_diff = p2 - p1
+        t1, _, _ = np.linalg.lstsq(system_of_equations, origin_diff, rcond=None)[0]
+
+        intersection_point = p1 + t1 * d1
+        return Vector(*intersection_point)
+
+    def _intersect_vector(self, vector: VectorLike) -> Vector | None:
+        """Find intersection of this axis and a point."""
+        vector = Vector(vector)
+        vec_to_point = vector - self.position
+        projected_length = vec_to_point.dot(self.direction)
+        projected_vec = self.direction * projected_length + self.position
+        return vector if vector == projected_vec else None
+
+    def _intersect_location(self, location: Location) -> Vector | Location | None:
+        """Find intersection of this axis and a location."""
+        location_dir = Plane(location).z_dir
+        if self.intersect(location.position) is None:
+            return None
+        if location_dir == self.direction:
+            return location
+        return location.position
+
     @overload
     def intersect(self, vector: VectorLike) -> Vector | None:
         """Find intersection of axis and vector"""
@@ -967,52 +1018,16 @@ class Axis(metaclass=AxisMeta):
         axis, plane, vector, location, shape = _parse_intersect_args(*args, **kwargs)
 
         if axis is not None:
-            if self.is_coaxial(axis):
-                return self
-
-            if self.is_skew(axis):
-                return None
-
-            # Extract points and directions to numpy arrays
-            p1 = np.array([*self.position])
-            d1 = np.array([*self.direction])
-            p2 = np.array([*axis.position])
-            d2 = np.array([*axis.direction])
-
-            # Solve the system of equations to find the intersection
-            system_of_equations = np.array([d1, -d2, np.cross(d1, d2)]).T
-            origin_diff = p2 - p1
-            t1, _, _ = np.linalg.lstsq(system_of_equations, origin_diff, rcond=None)[0]
-
-            # Calculate the intersection point
-            intersection_point = p1 + t1 * d1
-            return Vector(*intersection_point)
+            return self._intersect_axis(axis)
 
         if plane is not None:
             return plane.intersect(self)
 
         if vector is not None:
-            # Create a vector from the origin to the point
-            vec_to_point = vector - self.position
-
-            # Project the vector onto the direction of the axis
-            projected_length = vec_to_point.dot(self.direction)
-            projected_vec = self.direction * projected_length + self.position
-
-            # Calculate the difference between the original vector and the projected vector
-            if vector == projected_vec:
-                return vector
+            return self._intersect_vector(vector)
 
         if location is not None:
-            # Find the "direction" of the location
-            location_dir = Plane(location).z_dir
-
-            if self.intersect(location.position) is not None:
-                # Is the location on the axis with the same direction?
-                if location_dir == self.direction:
-                    return location
-                else:
-                    return location.position
+            return self._intersect_location(location)
 
         if shape is not None:
             return shape.intersect(self)
@@ -1240,7 +1255,7 @@ class BoundBox:
             return False
         return self.wrapped.Distance(other.wrapped) <= tolerance
 
-    def to_align_offset(self, align: Align2DType | Align3DType) -> Vector:
+    def to_align_offset(self, align: Align2D | Align3D) -> Vector:
         """Amount to move object to achieve the desired alignment"""
         return to_align_offset(self.min, self.max, align)
 
@@ -1471,7 +1486,7 @@ class Color:
 
         # --- Determine starting hue ---
         if isinstance(starting_hue, float):
-            if not (0.0 <= starting_hue <= 1.0):
+            if not 0.0 <= starting_hue <= 1.0:
                 raise ValueError("Starting hue must be within range 0.0–1.0")
         elif isinstance(starting_hue, int):
             if starting_hue < 0:
@@ -1789,6 +1804,7 @@ class Location:
 
     @property
     def wrapped(self) -> TopLoc_Location:
+        """OCP object"""
         return self._wrapped
 
     @property
@@ -1875,6 +1891,9 @@ class Location:
     def __deepcopy__(self, _memo) -> Location:
         """Lib/copy.py deep copy"""
         return Location(self.wrapped.Transformation())
+
+    @overload
+    def __mul__(self, other: _ShapeT) -> _ShapeT: ...
 
     @overload
     def __mul__(self, other: Location) -> Location: ...
@@ -2055,19 +2074,17 @@ class Location:
         if plane is not None:
             return plane.intersect(self)
 
-        if vector is not None and self.position == vector:
-            return vector
+        if vector is not None:
+            return vector if self.position == vector else None
 
         if location is not None:
-            if self == location:
-                return self
-            elif self.position == location.position:
-                return self.position
+            return (
+                self
+                if self == location
+                else self.position if self.position == location.position else None
+            )
 
-        if shape is not None:
-            return shape.intersect(self)
-
-        return None
+        return shape.intersect(self) if shape is not None else None
 
 
 class LocationEncoder(json.JSONEncoder):
@@ -2148,6 +2165,7 @@ class OrientedBoundBox:
 
     @property
     def wrapped(self):
+        """OCP object"""
         return self._wrapped
 
     @property
@@ -2737,9 +2755,33 @@ class Plane(metaclass=PlaneMeta):
         BRepGProp_Face(face).Normal(u_val, v_val, gp_pnt, normal)
         return Vector(normal)
 
+    @staticmethod
+    def _single_arg_as_origin_and_dirs(
+        arg0: Any,
+    ) -> tuple[Vector, tuple[Vector, Vector] | None]:
+        """Parse a single positional argument as an origin or three points."""
+        arg0_sequence = list(arg0)
+        if all(isinstance(coordinate, (int, float)) for coordinate in arg0_sequence):
+            return Vector(arg0_sequence), None
+
+        if len(arg0_sequence) != 3:
+            raise TypeError("Expected three VectorLike points")
+        try:
+            points = [Vector(point) for point in arg0_sequence]
+        except Exception as exc:
+            raise TypeError("Expected three VectorLike points") from exc
+
+        x_dir = points[1] - points[0]
+        z_dir = x_dir.cross(points[2] - points[0])
+        return points[0], (x_dir, z_dir)
+
     @overload
     def __init__(self, gp_pln: gp_Pln) -> None:
         """Return a plane from a OCCT gp_pln"""
+
+    @overload
+    def __init__(self, points: Iterable[VectorLike]) -> None:
+        """Return a plane defined by three points"""
 
     @overload
     def __init__(
@@ -2777,7 +2819,9 @@ class Plane(metaclass=PlaneMeta):
         # pylint: disable=too-many-locals,too-many-branches,too-many-statements
         """Create a plane from either an OCCT gp_pln, Face, Location, or coordinates"""
 
-        type_error_message = "Expected gp_Pln, Face, Location, or VectorLike"
+        type_error_message = (
+            "Expected gp_Pln, Face, Location, Axis, VectorLike, or three points"
+        )
 
         passed_z_dir = "z_dir" in kwargs
         passed_y_dir = "y_dir" in kwargs
@@ -2817,11 +2861,23 @@ class Plane(metaclass=PlaneMeta):
                         raise TypeError(type_error_message) from exc
             elif arg_origin is None:
                 try:
-                    arg_origin = Vector(arg0)
+                    if len(args) == 1 and not any(
+                        (arg_x_dir, arg_y_dir, passed_y_dir, passed_z_dir)
+                    ):
+                        arg_origin, single_arg_dirs = (
+                            self._single_arg_as_origin_and_dirs(arg0)
+                        )
+                        if single_arg_dirs is not None:
+                            arg_x_dir, arg_z_dir = single_arg_dirs
+                    else:
+                        arg_origin = Vector(arg0)
+
                     if arg_x_dir is None and len(args) > 1:
                         arg_x_dir = Vector(args[1]).normalized()
                     if len(args) > 2:
                         arg_z_dir = Vector(args[2]).normalized()
+                except TypeError:
+                    raise
                 except Exception as exc:
                     raise TypeError(type_error_message) from exc
 
@@ -2916,10 +2972,12 @@ class Plane(metaclass=PlaneMeta):
 
     @property
     def wrapped(self) -> gp_Pln:
+        """The OCP object"""
         return self._wrapped
 
     @staticmethod
     def _ensure_right_handed(pln: gp_Pln):
+        """Check for right handedness and fix if required"""
         if pln.Position().Direct():
             return pln
 
@@ -2960,6 +3018,8 @@ class Plane(metaclass=PlaneMeta):
         return Plane(self.origin, self.x_dir, -self.z_dir)
 
     @overload
+    def __mul__(self, other: _ShapeT) -> _ShapeT: ...
+    @overload
     def __mul__(self, other: Location | Plane) -> Location: ...
     @overload
     def __mul__(self, other: Iterable[Location | Plane]) -> list[Location]: ...
@@ -2994,7 +3054,7 @@ class Plane(metaclass=PlaneMeta):
         try:
             return [self.moved(loc) for loc in all_location_like(other)]
         except NotAllLocationLikeError as e:
-            raise TypeError(f"{type(self).__name__} cannot be multiplied by {e}")
+            raise TypeError(f"{type(self).__name__} cannot be multiplied by {e}") from e
         except TypeError:  # not iterable
             pass
         raise TypeError(
@@ -3042,21 +3102,32 @@ class Plane(metaclass=PlaneMeta):
 
     @property
     def z_dir(self) -> Vector:
+        """Local Z direction normal to the plane."""
         return Vector(self.wrapped.Axis().Direction())
 
     @property
     def x_dir(self) -> Vector:
+        """Local X direction of the plane."""
         return Vector(self.wrapped.XAxis().Direction())
 
     @x_dir.setter
-    def x_dir(self, dir: VectorLike):
+    def x_dir(self, direction: VectorLike):
+        """Set the local X direction of the plane."""
         ax2 = self.to_gp_ax2()
-        ax2.SetXDirection(Vector(dir).to_dir())
+        ax2.SetXDirection(Vector(direction).to_dir())
         self.wrapped.SetPosition(gp_Ax3(ax2))
 
     @property
     def y_dir(self) -> Vector:
+        """Local Y direction of the plane."""
         return Vector(self.wrapped.YAxis().Direction())
+
+    @y_dir.setter
+    def y_dir(self, direction: VectorLike):
+        """Set the local Y direction of the plane."""
+        ax2 = self.to_gp_ax2()
+        ax2.SetYDirection(Vector(direction).to_dir())
+        self.wrapped.SetPosition(gp_Ax3(ax2))
 
     def shift_origin(self, locator: Axis | VectorLike | Vertex) -> Plane:
         """shift plane origin
@@ -3313,6 +3384,42 @@ class Plane(metaclass=PlaneMeta):
             return_value = self.wrapped.Contains(Vector(obj).to_pnt(), tolerance)
         return return_value
 
+    def _intersect_axis(self, axis: Axis) -> Axis | Vector | None:
+        """Find intersection of this plane and an axis."""
+        if self.contains(axis):
+            return axis
+
+        geom_line = Geom_Line(axis.wrapped)
+        geom_plane = Geom_Plane(self.to_gp_ax3())
+        intersection_calculator = GeomAPI_IntCS(geom_line, geom_plane)
+
+        if intersection_calculator.IsDone() and intersection_calculator.NbPoints() == 1:
+            return Vector(intersection_calculator.Point(1))
+        return None
+
+    def _intersect_plane(self, plane: Plane) -> Axis | Plane | None:
+        """Find intersection of this plane and another plane."""
+        if self.contains(plane.origin) and self.z_dir == plane.z_dir:
+            return self
+
+        surface1 = Geom_Plane(self.wrapped)
+        surface2 = Geom_Plane(plane.wrapped)
+        intersector = GeomAPI_IntSS(surface1, surface2, TOLERANCE)
+        if intersector.IsDone() and intersector.NbLines() > 0:
+            intersection_line = intersector.Line(1)
+            assert isinstance(intersection_line, Geom_Line)
+            return Axis(intersection_line.Position())
+        return None
+
+    def _intersect_location(self, location: Location) -> Vector | Location | None:
+        """Find intersection of this plane and a location."""
+        location_plane = Plane(location)
+        if not self.contains(location_plane.origin):
+            return None
+        if self.z_dir == location_plane.z_dir:
+            return location
+        return location_plane.origin
+
     @overload
     def intersect(self, vector: VectorLike) -> Vector | None:
         """Find intersection of plane and vector"""
@@ -3339,49 +3446,16 @@ class Plane(metaclass=PlaneMeta):
         axis, plane, vector, location, shape = _parse_intersect_args(*args, **kwargs)
 
         if axis is not None:
-            if self.contains(axis):
-                return axis
-
-            geom_line = Geom_Line(axis.wrapped)
-            geom_plane = Geom_Plane(self.to_gp_ax3())
-
-            intersection_calculator = GeomAPI_IntCS(geom_line, geom_plane)
-
-            if (
-                intersection_calculator.IsDone()
-                and intersection_calculator.NbPoints() == 1
-            ):
-                # Get the intersection point
-                intersection_point = Vector(intersection_calculator.Point(1))
-            else:
-                intersection_point = None
-
-            return intersection_point
+            return self._intersect_axis(axis)
 
         if plane is not None:
-            if self.contains(plane.origin) and self.z_dir == plane.z_dir:
-                return self
-
-            surface1 = Geom_Plane(self.wrapped)
-            surface2 = Geom_Plane(plane.wrapped)
-            intersector = GeomAPI_IntSS(surface1, surface2, TOLERANCE)
-            if intersector.IsDone() and intersector.NbLines() > 0:
-                # Get the intersection line (axis)
-                intersection_line = intersector.Line(1)
-                # Extract the axis from the intersection line
-                axis = intersection_line.Position()
-                return Axis(axis)
+            return self._intersect_plane(plane)
 
         if vector is not None and self.contains(vector):
             return vector
 
         if location is not None:
-            pln = Plane(location)
-            if self.contains(pln.origin):
-                if self.z_dir == pln.z_dir:
-                    return location
-                else:
-                    return pln.origin
+            return self._intersect_location(location)
 
         if shape is not None:
             return shape.intersect(self)
@@ -3401,7 +3475,7 @@ CLASS_REGISTRY = {
 def to_align_offset(
     min_point: VectorLike,
     max_point: VectorLike,
-    align: Align2DType | Align3DType,
+    align: Align2D | Align3D,
     center: VectorLike | None = None,
 ) -> Vector:
     """Amount to move object to achieve the desired alignment"""
@@ -3437,6 +3511,11 @@ def to_align_offset(
 
 
 class NotAllLocationLikeError(TypeError):
+    """Raised when an iterable contains objects that cannot be converted to Locations.
+
+    The exception message lists the unique type names of the invalid objects.
+    """
+
     def __init__(self, wrong_types: Iterable[Type[Any]]) -> None:
         super().__init__(", ".join(sorted(t.__name__ for t in set(wrong_types))))
 
@@ -3452,5 +3531,4 @@ def all_location_like(items: Iterable[Any]) -> list[Location | Plane]:
         if not isinstance(item, Location | Plane)
     ):
         raise NotAllLocationLikeError(wrong_types)
-    else:
-        return items
+    return items

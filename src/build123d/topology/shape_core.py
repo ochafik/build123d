@@ -960,7 +960,11 @@ class Shape(NodeMixin, Generic[TOPODS]):
             raise RuntimeError("Composite factory is not registered")
         return factory(shape_list)
 
-    def __add__(self, other: None | Shape | Iterable[Shape]) -> Self | Compound:
+    @overload
+    def __add__(self, other: None) -> Self: ...
+    @overload
+    def __add__(self, other: Shape | Iterable[Shape]) -> Self | Compound: ...
+    def __add__(self, other):
         """fuse shape to self operator +"""
         # Convert `other` to list of base objects and filter out None values
         if other is None:
@@ -1103,7 +1107,11 @@ class Shape(NodeMixin, Generic[TOPODS]):
             f"{type(self).__name__} cannot be multiplied by {type(other).__name__}"
         )
 
-    def __sub__(self, other: None | Shape | Iterable[Shape]) -> Self | Compound:
+    @overload
+    def __sub__(self, other: None) -> Self: ...
+    @overload
+    def __sub__(self, other: Shape | Iterable[Shape]) -> Self | Compound: ...
+    def __sub__(self, other):
         """cut shape from self operator -"""
 
         if self._wrapped is None:
@@ -2170,10 +2178,14 @@ class Shape(NodeMixin, Generic[TOPODS]):
 
     @overload
     def split_by_perimeter(
-        self, perimeter: Edge | Wire
+        self, perimeter: Edge | Wire, keep: Literal[Keep.INSIDE] = Keep.INSIDE
     ) -> Face | Shell | ShapeList[Face] | None:
         """split_by_perimeter and keep inside (default)"""
 
+    @deprecated(
+        "Shape.split_by_perimeter is deprecated; use Face.split_by_perimeter "
+        "or Shell.split_by_perimeter instead."
+    )
     def split_by_perimeter(self, perimeter: Edge | Wire, keep: Keep = Keep.INSIDE):
         """split_by_perimeter
 
@@ -2216,8 +2228,8 @@ class Shape(NodeMixin, Generic[TOPODS]):
         def process_sides(sides):
             """Process sides to determine if it should be None, a single element,
             a Shell, or a ShapeList."""
-            # if not sides:
-            #     return None
+            if not sides:
+                return None
             if len(sides) == 1:
                 return sides[0]
             # Attempt to create a shell
@@ -2243,13 +2255,16 @@ class Shape(NodeMixin, Generic[TOPODS]):
                 continue
             perimeter_edges.Append(perimeter_edge.wrapped)
 
-        # Split the shells by the perimeter edges
-        lefts: list[Shell] = []
-        rights: list[Shell] = []
-        for target_shell in self.shells():
-            if not target_shell:
+        # Split the shells/faces by the perimeter edges
+        lefts: list[Shell | Face] = []
+        rights: list[Shell | Face] = []
+        target_shapes = self.shells()
+        if not target_shapes:
+            target_shapes = self.faces()
+        for target_shape in target_shapes:
+            if not target_shape:
                 continue
-            constructor = BRepFeat_SplitShape(target_shell.wrapped)
+            constructor = BRepFeat_SplitShape(target_shape.wrapped)
             constructor.Add(perimeter_edges)
             constructor.Build()
             lefts.extend(get(constructor.Left()))
@@ -2701,9 +2716,9 @@ class Shape(NodeMixin, Generic[TOPODS]):
     def _repr_html_(self):
         """Jupyter 3D representation support"""
 
-        from build123d.jupyter_tools import shape_to_html, HAS_VTK
+        from build123d.jupyter_tools import shape_to_html, has_vtk
 
-        if HAS_VTK:
+        if has_vtk:
             return shape_to_html(self)._repr_html_()
         return repr(self)
 
@@ -2854,7 +2869,9 @@ def topo_distance_to(
     if not all(isinstance(shape, Shape) for shape in sources):
         raise ValueError("Topological distance requires Shape objects")
 
+    # pylint: disable=no-member
     peer_type = sources[0].shape_type
+
     if any(shape.shape_type != peer_type for shape in sources):
         raise ValueError("Topological distance requires shapes of the same type")
 
