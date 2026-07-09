@@ -128,42 +128,74 @@ from .bridge import DEFAULT_LINEAR_TOLERANCE, FaceRecord, ResultMesh, SideMap
 # this threshold.
 _SLIVER_EDGE_TOLERANCE = TOLERANCE
 
+# A triangle with area below this is treated as a degenerate sliver rather
+# than a genuine (if small) facet: near machine-epsilon, not merely "small".
+# A genuine collinear/T-vertex artefact is an exact (to float precision)
+# degeneracy, so its area sits many orders of magnitude below this. This must
+# stay well *below* the smallest legitimate-but-thin facet a coarse
+# tessellation can produce — a genuine (non-degenerate) sliver from a
+# low-resolution faceted sphere was observed at area 9.4e-10 on a Minkowski
+# rounded box; dropping it split a merged planar face's connected component
+# in two, since it was the only link between two otherwise-disconnected
+# fragments.
+_SLIVER_AREA_TOLERANCE = 1e-15
+
 
 def _weld_degenerate_triangles(result: ResultMesh) -> ResultMesh:
     """Weld collapsed-edge vertex pairs and drop the slivers they leave behind.
 
     A ``manifold3d`` boolean (a fillet/chamfer's swept-tool subtract or union,
-    in particular) can leave two mesh-vertex indices at ~1e-7 separation along
-    an intersection curve — distinct indices, not the same one, so nothing
-    upstream ever merges them. A triangle spanning such a pair is a near-zero-
-    area sliver; when it sits *inside* a planar seeded id's own triangle group,
-    its near-zero-length edge pinches :func:`_boundary_loops` into a
+    in particular) can leave a handful of triangles with near-zero area at its
+    own seam curves — an intrinsic artefact of the boolean result, not the
+    input tessellation. When such a sliver sits *inside* a planar seeded id's
+    own triangle group, it pinches :func:`_boundary_loops` into a
     self-retracing loop, and the exact planar face built on that loop comes
     back ``BRepCheck_UnorientableShape`` (its boundary wire is
     ``BRepCheck_SelfIntersectingWire``) even though the *mesh* is perfectly
     manifold — ``MeshPart.is_valid`` never sees the problem.
 
+    Two distinct sliver shapes are observed, and need different handling:
+
+    * **Duplicate-vertex**: two of the triangle's three corners are
+      (near-)coincident — a genuine near-zero-length mesh **edge**. Welding
+      that edge's two endpoints together is what actually collapses the
+      pinch: dropping the triangle without merging would leave its other two
+      corners at two distinct-but-coincident indices, each with its own edge
+      to the third corner — exactly the original pinch, just relabelled.
+    * **Collinear / T-vertex**: all three corners are distinct and none of
+      the three edges is short, but the corners are (near-)colinear — one
+      genuinely lies on the segment between the other two. No pair here is
+      "the same point", so there is nothing to weld; dropping the triangle
+      outright is correct, because a T-vertex triangle's two short legs are
+      always shared with the two real (non-degenerate) triangles that meet
+      at the T, while its long closing edge is a boolean-seam artefact used
+      by no other triangle — so dropping it only ever removes an edge with
+      zero remaining users, never orphaning one with one.
+
     Unlike :func:`build123d.mesh.bridge._weld` (a spatial grid-snap of *every*
     vertex, safe on a fresh per-face tessellation where a shared seam vertex is
-    always bit-identical between its two faces), this welds only the endpoints
-    of an actual mesh **edge** shorter than :data:`_SLIVER_EDGE_TOLERANCE` —
-    i.e. two vertices already joined by a triangle in this result. Grid-
-    snapping the whole boolean-result mesh instead merges any vertices that
-    happen to land in the same quantization cell regardless of whether they
-    are topologically related, which was observed to weld unrelated nearby
-    ribbon-loft vertices into one index and turn previously-fine edges
-    non-manifold (used by 4 triangles instead of 2). Restricting the weld to
-    genuine short edges only ever merges vertices the mesh itself already
-    connects, so it cannot manufacture a new non-manifold edge.
+    always bit-identical between its two faces), the weld here only welds the
+    endpoints of an actual mesh **edge** shorter than
+    :data:`_SLIVER_EDGE_TOLERANCE` — i.e. two vertices already joined by a
+    triangle in this result. Grid-snapping the whole boolean-result mesh
+    instead merges any vertices that happen to land in the same quantization
+    cell regardless of whether they are topologically related, which was
+    observed to weld unrelated nearby ribbon-loft vertices into one index and
+    turn previously-fine edges non-manifold (used by 4 triangles instead of
+    2). Restricting the weld to genuine short edges only ever merges vertices
+    the mesh itself already connects, so it cannot manufacture a new
+    non-manifold edge.
 
     Merged vertices are grouped by union-find over every sub-tolerance edge,
     then averaged (like :func:`build123d.mesh.bridge._weld`) so the result
-    isn't grid-biased. Any triangle degenerate after the remap — a repeated
-    vertex index, zero area — is dropped. Because the weld runs on the *whole*
-    result mesh before triangles are split by ``face_id``, every surviving
-    triangle in every group (planar or faceted) still shares its vertex
-    indices with its neighbours, so :class:`_SharedTopology` keeps building one
-    edge per seam regardless of which side of the seam collapsed.
+    isn't grid-biased. Any triangle still below :data:`_SLIVER_AREA_TOLERANCE`
+    after the weld — the duplicate-vertex kind now has a repeated vertex
+    index; the collinear kind never had one to begin with — is dropped.
+    Because this all runs on the *whole* result mesh before triangles are
+    split by ``face_id``, every surviving triangle in every group (planar or
+    faceted) still shares its vertex indices with its neighbours, so
+    :class:`_SharedTopology` keeps building one edge per seam regardless of
+    which side of the seam collapsed.
 
     Args:
         result (ResultMesh): the raw boolean result mesh.
@@ -210,33 +242,48 @@ def _weld_degenerate_triangles(result: ResultMesh) -> ResultMesh:
             if root_start != root_end:
                 parent[max(root_start, root_end)] = min(root_start, root_end)
 
-    if not any_short:
-        return result
+    if any_short:
+        roots = np.fromiter(
+            (find(i) for i in range(len(vertices))), dtype=np.int64, count=len(vertices)
+        )
+        unique_roots, inverse = np.unique(roots, return_inverse=True)
+        inverse = inverse.reshape(-1)
+        welded_vertices = np.zeros((len(unique_roots), 3), dtype=np.float64)
+        counts = np.zeros(len(unique_roots), dtype=np.int64)
+        np.add.at(welded_vertices, inverse, vertices)
+        np.add.at(counts, inverse, 1)
+        welded_vertices /= counts[:, None]
+        welded_triangles = inverse[triangles]
+        welded_face_id = result.face_id
+    else:
+        welded_vertices = vertices
+        welded_triangles = triangles
+        welded_face_id = result.face_id
 
-    roots = np.fromiter((find(i) for i in range(len(vertices))), dtype=np.int64, count=len(vertices))
-    unique_roots, inverse = np.unique(roots, return_inverse=True)
-    inverse = inverse.reshape(-1)
-    welded_vertices = np.zeros((len(unique_roots), 3), dtype=np.float64)
-    counts = np.zeros(len(unique_roots), dtype=np.int64)
-    np.add.at(welded_vertices, inverse, vertices)
-    np.add.at(counts, inverse, 1)
-    welded_vertices /= counts[:, None]
-
-    welded_triangles = inverse[triangles]
+    # Drop every triangle still degenerate after the weld: a repeated vertex
+    # index (the duplicate-vertex kind, now collapsed to a point) or a
+    # near-zero area with three still-distinct indices (the collinear /
+    # T-vertex kind, which the edge-weld above never touches since none of
+    # its three edges is short).
     corner_a = welded_triangles[:, 0]
     corner_b = welded_triangles[:, 1]
     corner_c = welded_triangles[:, 2]
-    keep = (corner_a != corner_b) & (corner_b != corner_c) & (corner_a != corner_c)
+    distinct = (corner_a != corner_b) & (corner_b != corner_c) & (corner_a != corner_c)
+    points_a = welded_vertices[corner_a]
+    points_b = welded_vertices[corner_b]
+    points_c = welded_vertices[corner_c]
+    areas = 0.5 * np.linalg.norm(np.cross(points_b - points_a, points_c - points_a), axis=1)
+    keep = distinct & (areas >= _SLIVER_AREA_TOLERANCE)
     if keep.all():
         return ResultMesh(
             vertices=welded_vertices,
             triangles=welded_triangles,
-            face_id=result.face_id,
+            face_id=welded_face_id,
         )
     return ResultMesh(
         vertices=welded_vertices,
         triangles=welded_triangles[keep],
-        face_id=result.face_id[keep],
+        face_id=welded_face_id[keep],
     )
 
 

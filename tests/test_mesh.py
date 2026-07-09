@@ -83,7 +83,8 @@ from build123d.mesh import (  # noqa: E402
     recover_brep,
     to_cross_section,
 )
-from build123d.mesh.bridge import read_result, shape_to_manifold  # noqa: E402
+from build123d.mesh.bridge import ResultMesh, read_result, shape_to_manifold  # noqa: E402
+from build123d.mesh.recovery import _weld_degenerate_triangles  # noqa: E402
 
 # --------------------------------------------------------------------------
 # Packaging / import-isolation
@@ -2638,6 +2639,123 @@ def test_mesh_chamfer_bored_panel_skip_to_solid_is_recoverable():
     solid = chamfered.to_solid()
     assert isinstance(solid, (Solid, Compound))
     assert solid.volume == pytest.approx(chamfered.volume, rel=1e-4)
+
+
+# --------------------------------------------------------------------------
+# _weld_degenerate_triangles — the two sliver shapes it must collapse/drop
+# --------------------------------------------------------------------------
+
+
+def test_weld_degenerate_triangles_collapses_duplicate_vertex_sliver():
+    """A triangle with two near-coincident corners is welded, then dropped.
+
+    The duplicate-vertex sliver kind: two of the three corners are ~1e-7
+    apart (a genuine near-zero-length mesh edge). The weld must merge that
+    pair (not just drop the triangle), or the other two corners are left as
+    two distinct-but-coincident indices, each with its own edge to the third
+    corner -- the original self-intersecting-wire pinch, just relabelled.
+    """
+    vertices = np.array(
+        [
+            [0.0, 0.0, 0.0],  # 0
+            [1.0, 0.0, 0.0],  # 1
+            [1.0, 1.0, 0.0],  # 2 -- real quad corner
+            [1.0 + 5e-8, 0.0, 0.0],  # 3 -- near-duplicate of vertex 1
+        ],
+        dtype=np.float64,
+    )
+    triangles = np.array(
+        [
+            [0, 1, 2],  # real triangle, uses the "1" copy
+            [0, 2, 3],  # real triangle, uses the "3" (near-duplicate) copy
+            [1, 3, 2],  # the sliver: 1 and 3 are ~5e-8 apart
+        ],
+        dtype=np.int64,
+    )
+    face_id = np.array([1, 1, 1], dtype=np.int64)
+    result = ResultMesh(vertices=vertices, triangles=triangles, face_id=face_id)
+
+    welded = _weld_degenerate_triangles(result)
+
+    # The sliver triangle collapses (its two near-duplicate corners weld to
+    # one vertex, leaving a repeated index) and is dropped; the two real
+    # triangles survive, now sharing the single welded vertex.
+    assert len(welded.triangles) == 2
+    welded_vertex_1 = welded.triangles[0][1]
+    welded_vertex_3 = welded.triangles[1][2]
+    assert welded_vertex_1 == welded_vertex_3
+
+
+def test_weld_degenerate_triangles_drops_collinear_t_vertex_sliver():
+    """A triangle with three distinct, non-close, but collinear corners is dropped.
+
+    The collinear / T-vertex sliver kind (found on a different bored-panel
+    geometry by an independent tester, see design ddocs/design/algorithms.md
+    §K): no pair of corners is close enough to weld (every edge is a normal
+    length), but the three points are exactly collinear -- one lies on the
+    segment between the other two. There is nothing to weld here; dropping
+    the triangle outright is correct because its two short legs are shared
+    with the two real triangles that meet at the T, and its long closing
+    edge has no other user.
+    """
+    vertices = np.array(
+        [
+            [0.0, 0.0, 0.0],  # 0
+            [1.0, 0.0, 0.0],  # 1
+            [1.0, 1.0, 0.0],  # 2
+            [0.0, 1.0, 0.0],  # 3
+            [0.5, 0.0, 0.0],  # 4 -- T-vertex, exactly on segment 0-1
+        ],
+        dtype=np.float64,
+    )
+    triangles = np.array(
+        [
+            [0, 4, 3],  # real triangle, short leg 0-4
+            [4, 1, 2],  # real triangle, short leg 4-1
+            [4, 2, 3],  # real triangle closing the quad
+            [0, 1, 4],  # DEGENERATE: 0, 1, 4 collinear -- zero area, no short edge
+        ],
+        dtype=np.int64,
+    )
+    face_id = np.array([1, 1, 1, 1], dtype=np.int64)
+    result = ResultMesh(vertices=vertices, triangles=triangles, face_id=face_id)
+
+    welded = _weld_degenerate_triangles(result)
+
+    assert len(welded.triangles) == 3
+    surviving = {tuple(sorted(tri.tolist())) for tri in welded.triangles}
+    assert (0, 3, 4) in surviving
+    assert (1, 2, 4) in surviving
+    assert (2, 3, 4) in surviving
+    assert (0, 1, 4) not in surviving
+
+
+def test_weld_degenerate_triangles_keeps_legitimate_thin_facet():
+    """A real (non-degenerate) thin facet must survive the area drop.
+
+    Regression: dropping every near-zero-area triangle by an *absolute*
+    tolerance that isn't tight enough will also drop a genuine thin facet
+    from a coarse tessellation (observed on a Minkowski-rounded box, area
+    ~9.4e-10 -- a sliver-by-tessellation, not a degeneracy) if it happens to
+    be the sole connection between two otherwise-disconnected fragments of a
+    merged planar face's connected component. This triangle is thin but its
+    area is nowhere near machine-epsilon, so it must not be dropped.
+    """
+    vertices = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.5, 1e-4, 0.0],  # real point, off the 0-1 line by 1e-4 -- not collinear
+        ],
+        dtype=np.float64,
+    )
+    triangles = np.array([[0, 1, 2]], dtype=np.int64)
+    face_id = np.array([1], dtype=np.int64)
+    result = ResultMesh(vertices=vertices, triangles=triangles, face_id=face_id)
+
+    welded = _weld_degenerate_triangles(result)
+
+    assert len(welded.triangles) == 1
 
 
 # --------------------------------------------------------------------------
