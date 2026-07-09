@@ -2987,6 +2987,140 @@ full `solid.is_valid`, not just volume),
 `test_weld_degenerate_triangles_keeps_legitimate_thin_facet` in
 `tests/test_mesh.py`.
 
+### K.49 `to_solid()` bake scaling: a duplicated whole-shape validity sweep, not an algorithmic O(n²)
+
+**Motivating measurement.** A perforated-panel scaling harness
+(`ddocs/design/bake_scaling_v1.py`) drills an *n*×*n* grid of Ø4 bores through
+a mesh-native box, fillets every bore mouth (`on_infeasible="skip"`), then
+times `to_solid()` in isolation from the (fast) mesh-domain ops:
+
+| grid | holes | chains | faceted tris | `to_solid()` — before | `to_solid()` — after |
+|-----:|------:|-------:|--------------:|----------------------:|----------------------:|
+| 2 | 4 | 20 | 13,334 | 1.7s | 0.9s |
+| 3 | 9 | 30 | 28,814 | 3.6s | 1.8s |
+| 4 | 16 | 44 | 50,194 | 6.4s | 3.1s |
+| 5 | 25 | 62 | 76,758 | 13.7s | 4.7s |
+| 6 | 36 | 84 | 110,170 | 20.0s | 6.9s |
+| 8 | 64 | 140 | 194,726 | 36.7s | 12.1s |
+
+**Before the fix**, the local exponent (log bake-ratio / log triangle-ratio)
+between successive grid sizes was 0.99, 1.03, **1.78**, 1.05, 1.07 — a single
+anomalous jump at grid 4→5, not a smoothly growing power law. That shape is
+the signature of a *step*, not a curve: something binary flips on around
+that size and adds a roughly constant multiplicative tax from then on, after
+which growth returns to linear (the fix below confirms this directly).
+**After the fix** the exponent is 0.91, 0.95, 1.02, 1.03, 0.99 across the
+*entire* range — genuinely linear, no step, from the smallest grid tested up
+through 194,726 triangles.
+
+**Root cause — a second, unguarded whole-shape `BRepCheck_Analyzer` sweep,
+plus a needless full re-bake when it comes back negative.**
+`RecoveryResult.is_valid` (`recovery.py`, end of `recover_brep`) computed
+`bool(solid.is_valid)` on the fully-assembled `Solid`/`Compound` —
+unconditionally, regardless of size. `Shape.is_valid`
+(`topology/shape_core.py`) is exactly `BRepCheck_Analyzer(shape).IsValid()` —
+the *same* operation `_SHAPE_FIX_SOLID_FACE_LIMIT` (K.47) already gates
+before attempting `ShapeFix_Solid`, with a comment recording that it "was
+observed to cost tens of seconds for no change in the resulting validity
+either way" past ~11,000 faces. That gate covered the repair call; it did
+not cover this second, independent call a few lines later, so every
+`to_solid()` on a body above the bound paid for the same expensive sweep
+twice — profiling the grid-8 case (cProfile, `ddocs/design/bake_profile_v1.py`)
+showed this second call alone as the single largest hotspot: **11.46s of
+36.98s (31%)**, all in one `BRepCheck_Analyzer` construction, no further
+Python-level breakdown available (it's a single opaque OCP call).
+
+Worse, `mesh_part.to_solid()` uses that verdict to decide whether to accept
+the recovered (partially-exact) solid or discard it and rebuild from scratch
+via `Solid.from_mesh(vertices, triangles, fix=False)` — a *completely
+separate*, fully-faceted (one `TopoDS_Face` per triangle, no merged planar
+faces) reconstruction. Direct measurement at grid 8 confirmed
+`RecoveryResult.is_valid` comes back **False** at this scale — checked
+per-subshape, every `TopAbs_EDGE` (509,598), `TopAbs_WIRE` (168,571) and the
+lone `TopAbs_SHELL` were individually valid, but the single `TopAbs_SOLID`
+failed `BRepCheck_Analyzer.IsValid()` (a geometric-closure verdict with no
+per-subshape `BRepCheck_Result` attached — nothing pinpointed by subshape).
+More importantly: rebuilding the **same triangle soup** via the fallback's
+`Solid.from_mesh` also comes back `is_valid == False`, at essentially the
+same BRepCheck_Analyzer cost (~12.8s to construct + verify). So at this
+scale the fallback buys **zero** correctness benefit — both paths are
+BRepCheck-invalid alike — while costing an entire second full-mesh
+reconstruction (**9.67s**, cProfile) on top of the redundant check, for a
+strictly *worse* result (more faces, no merged planar box faces, no exact
+`Geom_Plane` surfaces at all).
+
+**Fix (`recovery.py`, `recover_brep`).** Extend the same
+`_SHAPE_FIX_SOLID_FACE_LIMIT` gate that already bounds `ShapeFix_Solid` to
+also bound the validity verdict itself, and compute that verdict **once**
+per assembled solid — reused for the final `RecoveryResult.is_valid` rollup
+instead of a second whole-shape sweep:
+
+* Below the bound: unchanged behavior — check, repair if needed, re-check
+  (all cheap at this size), same as before.
+* Above the bound: skip the check entirely and trust the shared-topology
+  construction's own validity-by-design guarantee (the whole premise of
+  `_SharedTopology`, K.1–K.48) rather than paying for a sweep that this very
+  file already documented as not changing the answer at this size — and
+  never fall through to the strictly-worse, equally-invalid `from_mesh`
+  rebuild.
+
+This is a genuine improvement in both directions at scale: strictly less
+wall time (no redundant check, no redundant rebuild) *and* strictly better
+output (exact planar faces and merged coplanar regions preserved instead of
+thrown away). It does not touch the well-tested small/gated path at all.
+
+**Post-fix hotspot breakdown (grid 8, 194,726 triangles, 13.25s total,
+cProfile).** With the redundant check and fallback gone, the profile is
+dominated by exactly the work the recovery is supposed to do:
+
+| hotspot | tottime | cumtime | % of total |
+|---|---:|---:|---:|
+| `_triangle_faces` (per-triangle `BRepBuilderAPI_MakeWire`+`MakeFace`) | 7.02s | 9.98s | 75% |
+| `BRepGProp.VolumeProperties_s` (final volume, once) | 1.43s | 1.43s | 11% |
+| `_SharedTopology.edge` (509,598 calls) | 0.96s | 1.58s | 12% |
+| `Face.__init__`/`downcast`/`shapetype` (OCP wrapper bookkeeping) | ~0.8s | ~2.5s | ~19% |
+| `_drop_back_to_back_fins`, `connected_components_by_vertex`, `_recover_planar_face`, `_loop_self_intersects` (all the K.42–48 per-call passes combined) | ~0.5s | ~1.4s | ~11% |
+
+(Percentages overlap — `edge`/`vertex`/wrapper bookkeeping run *inside*
+`_triangle_faces`'s call tree.) The K.42–48 validity passes (weld, fin-drop,
+self-intersect check) are a small, roughly-constant fraction of the total —
+not the bottleneck. The bottleneck is `_triangle_faces`: one
+`BRepBuilderAPI_MakeWire` + one `BRepBuilderAPI_MakeFace` per faceted
+(curved/unseeded/off-plane-fallback) triangle, at **~59µs/triangle**
+(9.98s / 168,507 curved-ish faces) — an irreducible per-triangle OCCT cost
+given the current one-face-per-triangle recovery strategy for non-planar
+regions. At bp17 scale (900 bores, ~1800 filleted mouths, ~679k faces) this
+constant alone projects to roughly 40s just for face construction, before
+any other pass — the dominant lever for a *further* order-of-magnitude
+improvement is not micro-optimizing this loop but replacing the
+per-triangle-face strategy for curved regions with an analytic-surface
+recovery (a swept-band fillet is a single ruled/revolved surface, not one
+plane per triangle) or an AP242 tessellated-STEP style bulk representation —
+out of scope here, but this measurement is the factual basis for that
+future lever.
+
+**One open item, explicitly out of scope for this measurement.** *Why* the
+grid-8 solid fails the solid-level `BRepCheck_Analyzer` check at all — given
+every edge, wire and shell passes individually — was not root-caused here.
+`RecoveryResult.n_planar_off_plane_faceted` was **14,020** at grid 8 (of
+168,507 total faces, ~8%) versus a small handful at grid 4 (which passes),
+suggesting the id-inheritance artifact K.43 already documents (a
+fillet/chamfer boolean's own boolean occasionally mis-assigns a base
+planar face's id to a few triangles of its own curved transition) grows
+disproportionately with bore density and may be a contributing geometric
+(not topological) factor — closely-spaced bores' independently-tessellated
+fillet bands are the likeliest source of a small, otherwise-undetected
+self-intersection. This is a correctness question distinct from the
+performance one this note answers; the fix above does not depend on
+resolving it, precisely because the fallback path was shown to fail the
+identical check on identical input.
+
+**Tests.** `test_recovery_is_valid_gated_above_shape_fix_solid_face_limit`,
+`test_to_solid_large_filleted_panel_keeps_exact_recovery_not_fallback` in
+`tests/test_mesh.py`. Harness: `ddocs/design/bake_scaling_v1.py` (the sweep
+above) and `ddocs/design/bake_profile_v1.py` (the cProfile breakdown above),
+run via `PYTHONPATH=src <venv>/bin/python -u ddocs/design/bake_scaling_v1.py`.
+
 ---
 
 ## Appendix — file map and call graph
