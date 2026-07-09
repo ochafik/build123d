@@ -85,6 +85,9 @@ from build123d.mesh import (  # noqa: E402
 )
 from build123d.mesh.bridge import ResultMesh, read_result, shape_to_manifold  # noqa: E402
 from build123d.mesh.recovery import _weld_degenerate_triangles  # noqa: E402
+from OCP.TopAbs import TopAbs_EDGE, TopAbs_FACE  # noqa: E402
+from OCP.TopExp import TopExp  # noqa: E402
+from OCP.TopTools import TopTools_IndexedDataMapOfShapeListOfShape  # noqa: E402
 
 # --------------------------------------------------------------------------
 # Packaging / import-isolation
@@ -2555,6 +2558,80 @@ def test_mesh_fillet_report_exports_and_is_iterable():
     assert report.total_skipped == 1
 
 
+def _max_edge_face_valence(solid) -> int:
+    """The highest number of faces sharing a single edge in ``solid``.
+
+    A valid ``BRepCheck``-clean solid never exceeds 2 (every edge borders
+    exactly two faces); a closed-loop fillet's back-to-back fin defect
+    (design ddocs/design/algorithms.md §K.48) shows up here as 4 even when
+    ``MeshPart.is_valid`` (mesh-level manifoldness only) reports no problem.
+    """
+    edge_face_map = TopTools_IndexedDataMapOfShapeListOfShape()
+    TopExp.MapShapesAndAncestors_s(solid.wrapped, TopAbs_EDGE, TopAbs_FACE, edge_face_map)
+    return max(
+        (edge_face_map.FindFromIndex(i).Size() for i in range(1, edge_face_map.Extent() + 1)),
+        default=0,
+    )
+
+
+def test_mesh_fillet_bore_rim_skip_to_solid_is_valid():
+    """Regression: a single closed-loop (bore-rim) fillet must to_solid() valid.
+
+    The minimal closed-loop case (design ddocs/design/algorithms.md §K.48): a
+    single round-bore rim fillet, no other chains involved. Before §K.48's
+    fix this recovered a solid with the correct volume but a handful of
+    non-manifold (edge-shared-by-4-faces) edges around the rim seam — a
+    back-to-back fin left behind by the vertex weld (§K.42) that collapses
+    the fillet boolean's own near-duplicate seam vertices.
+    """
+    box = MeshPart.box(20, 20, 4)
+    bore = MeshPart.cylinder(radius=2, height=12)
+    drilled = mesh_cut(box, bore)
+    top_chain = next(
+        chain
+        for chain in drilled.feature_edges()
+        if chain.is_loop
+        and all(
+            abs(drilled.manifold.to_mesh().vert_properties[v, 2] - 2.0) < 0.05
+            for v in chain.verts
+        )
+    )
+
+    filleted = drilled.fillet([top_chain], radius=0.5, on_infeasible="raise")
+    assert filleted.is_valid
+
+    solid = filleted.to_solid()
+    assert isinstance(solid, (Solid, Compound))
+    assert solid.is_valid
+    assert _max_edge_face_valence(solid) <= 2
+    assert solid.volume == pytest.approx(filleted.volume, rel=1e-6)
+
+
+def test_mesh_chamfer_bore_rim_skip_to_solid_is_valid():
+    """Chamfer twin of the bore-rim fillet-to_solid validity regression above."""
+    box = MeshPart.box(20, 20, 4)
+    bore = MeshPart.cylinder(radius=2, height=12)
+    drilled = mesh_cut(box, bore)
+    top_chain = next(
+        chain
+        for chain in drilled.feature_edges()
+        if chain.is_loop
+        and all(
+            abs(drilled.manifold.to_mesh().vert_properties[v, 2] - 2.0) < 0.05
+            for v in chain.verts
+        )
+    )
+
+    chamfered = drilled.chamfer([top_chain], size=0.5, on_infeasible="raise")
+    assert chamfered.is_valid
+
+    solid = chamfered.to_solid()
+    assert isinstance(solid, (Solid, Compound))
+    assert solid.is_valid
+    assert _max_edge_face_valence(solid) <= 2
+    assert solid.volume == pytest.approx(chamfered.volume, rel=1e-6)
+
+
 def test_mesh_fillet_box_all_edges_skip_to_solid_is_valid():
     """Regression: to_solid() on a filleted box must pass BRepCheck.
 
@@ -2593,21 +2670,18 @@ def test_mesh_chamfer_box_all_edges_skip_to_solid_is_valid():
 
 
 def test_mesh_fillet_bored_panel_skip_to_solid_is_recoverable():
-    """A filleted bored panel's to_solid() recovers the correct volume.
+    """A filleted bored panel's to_solid() is BRepCheck-valid, correct volume.
 
     A 40x25x4 panel with two Ø4 bores, every feature edge (12 box edges + 4
-    bore-rim loops) filleted at r=0.5 with ``on_infeasible="skip"``: the same
-    degenerate-sliver defect as
-    ``test_mesh_fillet_box_all_edges_skip_to_solid_is_valid`` above, PLUS a
-    known, separate residual affecting *curved* (closed-loop) chains
-    specifically — even a single bore-rim fillet with no other chains
-    involved still recovers a Solid whose BRepCheck is not clean (a handful
-    of non-manifold edges survive around the rim seam), which looks like a
-    ribbon-loft seam-closure defect in the closed-loop sweep itself
-    (fillet.py), not a recovery-side sliver. Recovery is now robust enough
-    that the volume is bit-accurate regardless (previously this could bake to
-    a wildly wrong body); full BRepCheck validity for curved-chain fillets is
-    tracked as a follow-up, not asserted here.
+    bore-rim loops) filleted at r=0.5 with ``on_infeasible="skip"``. Until
+    design ddocs/design/algorithms.md §K.48's fix this recovered only the
+    correct volume, not a clean BRepCheck: closed-loop (bore-rim) chains left
+    a handful of non-manifold seam edges (§K.42's back-to-back fin, exposed
+    only once vertex-welded), and this panel's ~6800-face solid also exceeds
+    ``_SHAPE_FIX_SOLID_FACE_LIMIT`` so ``ShapeFix_Solid`` never got a chance
+    to silently repair it the way it does for the smaller single-edge tests
+    below — the fin fix and the §K.48 hole-wire-orientation fix both had to
+    hold without that safety net for this test to pass.
     """
     panel = MeshPart.box(40, 25, 4)
     holes = [
@@ -2621,11 +2695,12 @@ def test_mesh_fillet_bored_panel_skip_to_solid_is_recoverable():
 
     solid = filleted.to_solid()
     assert isinstance(solid, (Solid, Compound))
+    assert solid.is_valid
     assert solid.volume == pytest.approx(filleted.volume, rel=1e-4)
 
 
 def test_mesh_chamfer_bored_panel_skip_to_solid_is_recoverable():
-    """Chamfer twin of the bored-panel volume-recovery regression above."""
+    """Chamfer twin of the bored-panel to_solid() validity regression above."""
     panel = MeshPart.box(40, 25, 4)
     holes = [
         MeshPart.cylinder(radius=2.0, height=12).move(Location((x, 0, 0)))
@@ -2638,6 +2713,7 @@ def test_mesh_chamfer_bored_panel_skip_to_solid_is_recoverable():
 
     solid = chamfered.to_solid()
     assert isinstance(solid, (Solid, Compound))
+    assert solid.is_valid
     assert solid.volume == pytest.approx(chamfered.volume, rel=1e-4)
 
 

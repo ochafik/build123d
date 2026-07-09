@@ -197,6 +197,14 @@ def _weld_degenerate_triangles(result: ResultMesh) -> ResultMesh:
     :class:`_SharedTopology` keeps building one edge per seam regardless of
     which side of the seam collapsed.
 
+    One more artefact only becomes visible *after* this weld: a closed-loop
+    seam (a bore-rim fillet, running the weld over ~2 · chain-length
+    coincidence points instead of an open chain's 2 endpoints) can uncover a
+    **back-to-back fin** — two triangles that land on the exact same three
+    canonical vertices, wound oppositely, because each was tessellated
+    independently on its own side of the seam before welding. See
+    :func:`_drop_back_to_back_fins`, called last, below.
+
     Args:
         result (ResultMesh): the raw boolean result mesh.
 
@@ -274,17 +282,131 @@ def _weld_degenerate_triangles(result: ResultMesh) -> ResultMesh:
     points_c = welded_vertices[corner_c]
     areas = 0.5 * np.linalg.norm(np.cross(points_b - points_a, points_c - points_a), axis=1)
     keep = distinct & (areas >= _SLIVER_AREA_TOLERANCE)
-    if keep.all():
+    kept_triangles = welded_triangles[keep]
+    kept_face_id = welded_face_id[keep]
+
+    # A run of consecutive slivers around a *closed* seam (a bore-rim fillet)
+    # welds cleanly per-edge, but the vertex weld can silently uncover a
+    # back-to-back fin: two of the surviving triangles referencing the same
+    # three canonical vertices with opposite winding (see _drop_back_to_back_fins).
+    fin_keep = _drop_back_to_back_fins(kept_triangles)
+    if fin_keep.all():
         return ResultMesh(
             vertices=welded_vertices,
-            triangles=welded_triangles,
-            face_id=welded_face_id,
+            triangles=kept_triangles,
+            face_id=kept_face_id,
         )
     return ResultMesh(
         vertices=welded_vertices,
-        triangles=welded_triangles[keep],
-        face_id=welded_face_id[keep],
+        triangles=kept_triangles[fin_keep],
+        face_id=kept_face_id[fin_keep],
     )
+
+
+def _drop_back_to_back_fins(triangles: np.ndarray) -> np.ndarray:
+    """Cancel triangle pairs that share all three vertices with opposite winding.
+
+    **Symptom this fixes.** A closed-loop (bore-rim) fillet/chamfer's own
+    ``manifold3d`` boolean can leave, at a handful of spots around the seam, a
+    *pair* of triangles that are geometrically the same patch seen from both
+    sides — one wound forward, one backward — because the boolean's own seam
+    curve touches an existing surface (design K.42's "near-duplicate vertex"
+    artefact) from two independently-tessellated sides at once. Before
+    :func:`_weld_degenerate_triangles` collapses each side's near-duplicate
+    vertices onto one canonical index, the pair look like two distinct
+    (nearly-coincident) triangles; *after* the weld they land on the exact
+    same three vertex indices, exposing the fin. Left in place, a fin's shared
+    edges are used by **four** triangles instead of two (the fin's own two,
+    plus the two genuine faces it happens to sit between) —
+    ``BRepCheck_Analyzer`` reports these as non-manifold, even though
+    ``MeshPart.is_valid`` never sees a problem (a mod-2 mesh library is blind
+    to a locally-cancelling double cover).
+
+    **Why cancelling is safe.** A back-to-back pair contributes zero enclosed
+    volume and no new boundary — removing both together restores exactly the
+    edge-valence the surrounding mesh already relies on (the two genuine
+    faces on either side of the fin keep their own two-triangle-per-edge
+    count). This is *only* found after the weld — a fin hiding behind two
+    different near-duplicate index groups on each side would not be visible
+    to a search over the raw (pre-weld) triangle array.
+
+    **Why cancelling only when an edge is over-valenced.** A forward/backward
+    pair sharing all three vertices is not automatically a defect: a tiny,
+    already-degenerate input can legitimately weld down to two triangles that
+    happen to share a triple with opposite winding while every one of their
+    edges is still used by exactly the two of them (no non-manifold edge, no
+    third or fourth face involved) — cancelling *those* would silently delete
+    real, if unfortunately-shaped, geometry that the weld never actually broke
+    anything for. A genuine fin, by contrast, always leaves at least one of
+    its three edges shared by more than the fin's own two triangles (the
+    faces on either side of the fin still reference it too), which is what
+    actually manifests as ``BRepCheck``'s four-triangle non-manifold edge.
+    Gating cancellation on that condition acts *only* where it demonstrably
+    fixes an existing valence problem and never touches an isolated
+    (if degenerate) pair that was not causing one.
+
+    **How.** Group triangles by their *unordered* vertex-index triple. Within
+    a group of size ≥ 2, rotate each triangle to start at its lowest vertex
+    index — this collapses the two cyclic rotations sharing one winding onto
+    one key, leaving *at most* two distinct rotated keys per group (a
+    triangle on three fixed vertices has exactly two possible windings).
+    Exactly two keys present means the group is a genuine forward/backward
+    pair (or several); if at least one of the triple's three edges has a
+    mesh-wide valence above 2, cancel ``min(count_forward, count_backward)``
+    of each, dropping both members of every cancelled pair. A group with only
+    one winding present (an ordinary, non-duplicated triangle), with more
+    than two triangles sharing a triple but only one winding (impossible for
+    a 3-cycle, so unreachable in practice), or whose edges are all already at
+    valence 2 is left untouched.
+
+    Args:
+        triangles (np.ndarray): ``(M, 3)`` int64 triangle vertex indices,
+            already vertex-welded and sliver-dropped (canonical indices).
+
+    Returns:
+        np.ndarray: ``(M,)`` boolean keep-mask, ``True`` for every triangle
+        that survives fin cancellation.
+    """
+    if len(triangles) == 0:
+        return np.ones(0, dtype=bool)
+
+    edge_valence: dict[tuple[int, int], int] = defaultdict(int)
+    for corner_a, corner_b, corner_c in triangles.tolist():
+        for u, v in ((corner_a, corner_b), (corner_b, corner_c), (corner_c, corner_a)):
+            edge_valence[(u, v) if u < v else (v, u)] += 1
+
+    groups: dict[tuple[int, int, int], list[int]] = defaultdict(list)
+    for index, (corner_a, corner_b, corner_c) in enumerate(triangles.tolist()):
+        groups[tuple(sorted((corner_a, corner_b, corner_c)))].append(index)
+
+    keep = np.ones(len(triangles), dtype=bool)
+    for triple, indices in groups.items():
+        if len(indices) < 2:
+            continue
+        over_valenced = any(
+            edge_valence[(u, v) if u < v else (v, u)] > 2
+            for u, v in ((triple[0], triple[1]), (triple[1], triple[2]), (triple[0], triple[2]))
+        )
+        if not over_valenced:
+            continue
+        by_winding: dict[tuple[int, int, int], list[int]] = defaultdict(list)
+        for index in indices:
+            corner_a, corner_b, corner_c = (int(x) for x in triangles[index])
+            verts = (corner_a, corner_b, corner_c)
+            start = min(range(3), key=lambda i: verts[i])
+            by_winding[verts[start:] + verts[:start]].append(index)
+        if len(by_winding) != 2:
+            # Either every triangle in the group shares one winding (not a
+            # fin — e.g. a coincidentally-repeated but consistently-oriented
+            # facet from an upstream duplicate), or more than two windings
+            # are present (impossible for a 3-cycle, so unreachable in
+            # practice) — leave the group alone either way.
+            continue
+        forward, backward = by_winding.values()
+        cancelled = min(len(forward), len(backward))
+        for index in forward[:cancelled] + backward[:cancelled]:
+            keep[index] = False
+    return keep
 
 
 # ---------------------------------------------------------------------------
@@ -830,12 +952,15 @@ def _recover_planar_face(
         points = topology.positions[loop]
         return np.column_stack([points @ in_plane_u, points @ in_plane_v])
 
-    def loop_area(coords: np.ndarray) -> float:
+    def signed_loop_area(coords: np.ndarray) -> float:
         x_coords, y_coords = coords[:, 0], coords[:, 1]
-        return 0.5 * abs(
+        return 0.5 * (
             np.dot(x_coords, np.roll(y_coords, -1))
             - np.dot(y_coords, np.roll(x_coords, -1))
         )
+
+    def loop_area(coords: np.ndarray) -> float:
+        return abs(signed_loop_area(coords))
 
     faces: list[Face] = []
     n_faceted_fallback = 0
@@ -894,11 +1019,29 @@ def _recover_planar_face(
         outer_wire = topology.wire(scored[0][0])
         if outer_wire is None:
             continue
+        # _boundary_loops's natural directed-edge winding already traces a
+        # hole in the *opposite* rotational sense from the outer boundary in
+        # this same 2-D projection (a hole is bounded by the group's edges
+        # the same way the outer loop is, just with the material on the
+        # other side) — that's a property of any consistently-wound mesh, not
+        # something that depends on which way the plane's own normal happens
+        # to point. Unconditionally reversing every hole wire assumed the
+        # opposite (that the natural winding always needs flipping), which is
+        # only true when the outer loop's own signed area is positive; a
+        # negative-signed outer (observed on e.g. a box's bottom face, whose
+        # seeded plane_normal points -Z) needs its holes left un-reversed —
+        # reversing them anyway silently flips a face-with-hole to
+        # BRepCheck_BadOrientationOfSubshape even though every wire and edge
+        # checks out individually. Comparing each hole's sign against the
+        # outer's is robust to either case.
+        outer_sign = signed_loop_area(scored[0][1])
         face_builder = BRepBuilderAPI_MakeFace(geom_plane, outer_wire, True)
-        for hole_loop, _ in scored[1:]:
+        for hole_loop, hole_coords in scored[1:]:
             hole_wire = topology.wire(hole_loop)
             if hole_wire is not None:
-                face_builder.Add(TopoDS.Wire_s(hole_wire.Reversed()))
+                if (signed_loop_area(hole_coords) > 0) == (outer_sign > 0):
+                    hole_wire = TopoDS.Wire_s(hole_wire.Reversed())
+                face_builder.Add(hole_wire)
         face: Face | None = None
         if face_builder.IsDone():
             face = Face(face_builder.Face())
