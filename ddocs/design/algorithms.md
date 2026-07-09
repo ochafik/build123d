@@ -2884,32 +2884,104 @@ was calibrated between two real cases: a mixed faceted-curved/planar body
 multi-bore panel (~11000+ faces past a handful of holes) needs tens of
 seconds for it to fail regardless.
 
-**Residual known limitation.** None of K.42–K.47 fully closes `to_solid()`
-validity for **curved (closed-loop) chains** specifically: even a single
-bore-rim fillet, with no other chains involved, still recovers a solid with
-a handful of non-manifold edges surviving the rim seam (confirmed via
-`TopTools_IndexedDataMapOfShapeListOfShape` edge→face valence audit — some
-edges are shared by 4 faces, not 2). This was checked against tolerances
-spanning four orders of magnitude for a vertex-weld fix and found
-unresponsive at every one, which rules out a mesh-proximity cause; it looks
-like a ribbon-loft seam-closure defect in the closed-loop sweep itself
-(`fillet.py`), not a recovery-side sliver — tracked as a follow-up, not
-fixed here. `to_solid()` still recovers the *correct volume* regardless
-(bit-accurate to the mesh, previously not guaranteed at all for these
-inputs). Straight-edge (open-chain) fillets/chamfers are unaffected and pass
-`to_solid().is_valid` cleanly — see
-`test_mesh_fillet_box_all_edges_skip_to_solid_is_valid` /
-`test_mesh_chamfer_box_all_edges_skip_to_solid_is_valid`. Similarly, a
-10×10 grid of bores (100 holes) was found to already exceed a
-minute in `to_solid()` on the **unmodified baseline** (confirmed by
-reverting every fix in this section and re-timing) — an existing scaling
-characteristic of building one `TopoDS_Face` per unseeded facet triangle
-that grows with circular-chain count, not a regression introduced here.
+A 10×10 grid of bores (100 holes) was found to already exceed a minute in
+`to_solid()` on the **unmodified baseline** (confirmed by reverting every fix
+in this section and re-timing) — an existing scaling characteristic of
+building one `TopoDS_Face` per unseeded facet triangle that grows with
+circular-chain count, not a regression introduced here.
 
-**Tests.** `test_mesh_fillet_box_all_edges_skip_to_solid_is_valid`,
+### K.48 Closed-loop back-to-back fins, and a general hole-wire sign bug
+
+**Symptom.** Even a single bore-rim fillet, with no other chains involved,
+recovered a solid with the correct volume but a handful of non-manifold
+edges surviving the rim seam — confirmed via a
+`TopTools_IndexedDataMapOfShapeListOfShape` edge→face valence audit: some
+edges were shared by four faces, not two. K.42's vertex-weld fix (tolerances
+spanning four orders of magnitude) was unresponsive at every one tried,
+ruling out a mesh-proximity cause.
+
+**Root cause #1 — a back-to-back fin, only visible after the K.42 weld.**
+Tracing one bad edge's four incident triangles back to their *pre-weld*
+vertex indices found two genuine faces (the untouched bore-wall triangle
+below the seam, and the fillet band's own next-ring triangle above it) plus
+**two triangles referencing the exact same three canonical vertices with
+opposite winding** — a zero-thickness fin. Before the K.42 weld these two
+looked like distinct (near-duplicate-index) triangles, because the fillet
+boolean's own seam curve is tessellated independently from *both* sides
+(design H.38's wedge-minus-ball tool touches the pre-existing surface along
+a curve at every one of the chain's ~60+ frames — far more simultaneous
+coincidence points than an open chain's 2 endpoints ever produces); only
+once K.42 collapses each side's near-duplicates onto one canonical index do
+the pair land on identical vertices and expose the fin. A direct experiment
+ruled out `fillet.py`'s own tool construction as the source: rebuilding the
+loop's fillet tool as a single non-convex ribbon loft (skipping H.38's
+wedge−ball boolean entirely) produced the *same* count of degenerate
+triangles and the same post-weld valence-4 edges — the artefact comes from
+`manifold3d`'s general boolean engine whenever a new solid's boundary is
+geometrically coincident with an existing mesh region along a curve, not
+from any one tool-construction strategy.
+
+**Fix — `_drop_back_to_back_fins` (`recovery.py`), called at the end of
+`_weld_degenerate_triangles`.** Group the weld-and-sliver-survived triangles
+by their unordered vertex-index triple; within a group, rotate each triangle
+to start at its lowest vertex index (collapsing the two windings sharing one
+onto one key — a triangle on three fixed vertices has exactly two possible
+windings). A group with both keys present is a genuine forward/backward
+pair; cancel `min(count_forward, count_backward)` of each, but **only when
+at least one of the triple's three edges has a mesh-wide valence above
+2** — i.e. only when cancelling demonstrably fixes an existing
+over-shared edge. That gate matters: an already-tiny/degenerate input can
+legitimately weld down to two triangles sharing a triple with opposite
+winding while every edge is still at valence 2 (no third or fourth face
+involved) — cancelling unconditionally regressed
+`test_weld_degenerate_triangles_collapses_duplicate_vertex_sliver`'s
+synthetic quad-collapse fixture, which relies on exactly that pair
+surviving. Gating on over-valence fires only where a fin is truly present.
+
+**Root cause #2 — a general hole-wire orientation-sign bug, exposed at
+scale.** Fixing the fin alone was not sufficient: the bored-panel repro
+(`test_mesh_fillet_bored_panel_skip_to_solid_is_recoverable`) still failed,
+and even the single-rim case's solid was invalid *before*
+`ShapeFix_Solid` ran (K.47) — `ShapeFix_Solid` was silently repairing a
+**second, unrelated** defect on every small test, one that has nothing to do
+with fillets or closed loops: `_recover_planar_face` unconditionally called
+`hole_wire.Reversed()` on every hole loop, assuming the natural
+`_boundary_loops` winding always needs flipping relative to the outer loop.
+That is only true when the outer loop's own signed area (in the face's
+local 2-D frame) is positive; a seeded plane whose `plane_normal` happens to
+point the other way (observed on a box's *bottom* face, normal `-Z`) gives a
+*negative*-signed outer loop, and reversing its hole anyway makes the hole
+wind the *same* rotational sense as the outer — `BRepCheck_BadOrientationOfSubshape`
+on an otherwise entirely valid face (every wire and edge checks out
+individually; K.46's lesson about standalone checks does not apply here,
+this reproduces standalone). Confirmed present in the **unfilleted control**
+too (a plain `mesh_cut(Box, Cylinder)`, no fillet at all) — `ShapeFix_Solid`
+was masking it there as well, for every test in this suite small enough to
+stay under `_SHAPE_FIX_SOLID_FACE_LIMIT`. The bored-panel repro (~6800
+faces) is the first case in this codebase's tests to exceed that bound and
+therefore the first to surface it.
+
+**Fix.** Compare each hole loop's own signed area against the outer loop's
+sign (both computed in the same local 2-D frame already used for the
+area-based outer/hole sort); reverse the hole wire only when its sign
+matches the outer's (meaning the natural winding needs flipping), leave it
+alone when already opposite. Self-correcting regardless of which way
+`plane_normal` happens to point.
+
+**Result.** Both fixes together make `to_solid()` fully `BRepCheck`-valid
+for closed-loop (bore-rim) fillets and chamfers, including the bored-panel
+scale that exceeds `_SHAPE_FIX_SOLID_FACE_LIMIT` and therefore gets no
+`ShapeFix_Solid` safety net at all. `to_solid()` was already recovering the
+*correct volume* regardless (bit-accurate to the mesh); now the shell is
+clean too.
+
+**Tests.** `test_mesh_fillet_bore_rim_skip_to_solid_is_valid`,
+`test_mesh_chamfer_bore_rim_skip_to_solid_is_valid` (the minimal single-loop
+case, with an edge-valence audit), `test_mesh_fillet_box_all_edges_skip_to_solid_is_valid`,
 `test_mesh_chamfer_box_all_edges_skip_to_solid_is_valid`,
 `test_mesh_fillet_bored_panel_skip_to_solid_is_recoverable`,
-`test_mesh_chamfer_bored_panel_skip_to_solid_is_recoverable`,
+`test_mesh_chamfer_bored_panel_skip_to_solid_is_recoverable` (now asserting
+full `solid.is_valid`, not just volume),
 `test_weld_degenerate_triangles_collapses_duplicate_vertex_sliver`,
 `test_weld_degenerate_triangles_drops_collinear_t_vertex_sliver`,
 `test_weld_degenerate_triangles_keeps_legitimate_thin_facet` in
