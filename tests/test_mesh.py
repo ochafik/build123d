@@ -84,7 +84,10 @@ from build123d.mesh import (  # noqa: E402
     to_cross_section,
 )
 from build123d.mesh.bridge import ResultMesh, read_result, shape_to_manifold  # noqa: E402
-from build123d.mesh.recovery import _weld_degenerate_triangles  # noqa: E402
+from build123d.mesh.recovery import (  # noqa: E402
+    _SHAPE_FIX_SOLID_FACE_LIMIT,
+    _weld_degenerate_triangles,
+)
 from OCP.TopAbs import TopAbs_EDGE, TopAbs_FACE  # noqa: E402
 from OCP.TopExp import TopExp  # noqa: E402
 from OCP.TopTools import TopTools_IndexedDataMapOfShapeListOfShape  # noqa: E402
@@ -2715,6 +2718,93 @@ def test_mesh_chamfer_bored_panel_skip_to_solid_is_recoverable():
     assert isinstance(solid, (Solid, Compound))
     assert solid.is_valid
     assert solid.volume == pytest.approx(chamfered.volume, rel=1e-4)
+
+
+def _drilled_filleted_grid(grid_n, pitch=9.0, thickness=4.0, radius=0.5):
+    """A grid_n x grid_n perforated, fully rim-filleted panel MeshPart.
+
+    Shared builder for the two large-scale §K.49 regression tests below —
+    same shape as ddocs/design/bake_scaling_v1.py's harness, at grid 5 (the
+    smallest grid size observed to cross both ``_SHAPE_FIX_SOLID_FACE_LIMIT``
+    and the scale where the recovered solid's own BRepCheck_Analyzer verdict
+    flips to invalid).
+    """
+    span = (grid_n - 1) * pitch
+    side = span + 30.0
+    panel = MeshPart.box(side, side, thickness)
+    start = -span / 2.0
+    holes = [
+        MeshPart.cylinder(radius=2.0, height=thickness * 3).move(
+            Location((start + i * pitch, start + j * pitch, 0))
+        )
+        for i in range(grid_n)
+        for j in range(grid_n)
+    ]
+    drilled = mesh_cut(panel, *holes)
+    chains = drilled.feature_edges()
+    return drilled.fillet(chains, radius=radius, on_infeasible="skip")
+
+
+def test_recovery_is_valid_gated_above_shape_fix_solid_face_limit():
+    """Above ``_SHAPE_FIX_SOLID_FACE_LIMIT``, recover_brep trusts validity.
+
+    Design ddocs/design/algorithms.md §K.49: ``RecoveryResult.is_valid`` used
+    to recompute a whole-shape ``BRepCheck_Analyzer`` sweep unconditionally —
+    the same expensive operation ``_SHAPE_FIX_SOLID_FACE_LIMIT`` (§K.47)
+    already gates before ``ShapeFix_Solid``, just called a second time,
+    ungated, a few lines later. At grid-5 scale (76,758 triangles) this
+    recovered solid's own analytic-recovery face count already exceeds the
+    bound, so the fix's fast path (trust rather than re-verify) applies here
+    — this is a fast-running proxy for the slower grid-8 case profiled in
+    the design note.
+    """
+    filleted = _drilled_filleted_grid(grid_n=5)
+    result_mesh = read_result(filleted.manifold)
+    recovered = recover_brep(result_mesh, filleted.side_map)
+    assert isinstance(recovered.solid, (Solid, Compound))
+    face_count = sum(1 for _ in recovered.solid.faces())
+    assert face_count > _SHAPE_FIX_SOLID_FACE_LIMIT
+    # Above the bound, is_valid is trusted (True) rather than re-verified —
+    # the whole point of the fix is to *not* pay for a second whole-shape
+    # BRepCheck_Analyzer sweep here.
+    assert recovered.is_valid
+
+
+def test_to_solid_large_filleted_panel_keeps_exact_recovery_not_fallback():
+    """A large filleted panel's to_solid() keeps the exact recovery.
+
+    Design ddocs/design/algorithms.md §K.49. Before the fix,
+    ``mesh_part.to_solid()`` discarded the (partially-exact) recovery and
+    rebuilt entirely faceted via ``Solid.from_mesh`` whenever
+    ``RecoveryResult.is_valid`` came back False — which, at this grid-5
+    scale, it reliably did (confirmed even the fallback's own from_mesh
+    rebuild of the identical triangle soup was equally BRepCheck-invalid, so
+    the fallback bought no correctness benefit while costing an entire
+    second full-mesh rebuild on top of the redundant validity sweep). Above
+    ``_SHAPE_FIX_SOLID_FACE_LIMIT``, to_solid() must therefore keep the
+    exact recovery's merged analytic planar faces and lower face count — a
+    from_mesh fallback would instead rebuild the panel's flat top/bottom/side
+    faces as many tiny per-triangle facets, with roughly one face per raw
+    triangle.
+    """
+    filleted = _drilled_filleted_grid(grid_n=5)
+    _, triangles = filleted.to_arrays()
+
+    solid = filleted.to_solid()
+    assert isinstance(solid, (Solid, Compound))
+    faces = solid.faces()
+    assert len(faces) > _SHAPE_FIX_SOLID_FACE_LIMIT
+    # A from_mesh fallback rebuild has ~one face per raw triangle; the exact
+    # recovery merges the panel's flat faces into a handful of large
+    # analytic planes instead, so its face count sits measurably below the
+    # raw triangle count.
+    assert len(faces) < 0.9 * len(triangles)
+    # The panel's large flat top/bottom/side faces survive as big analytic
+    # GeomType.PLANE faces — the exact recovery's signature. A fallback
+    # rebuild has no such face: every one of its faces is a tiny flat
+    # per-triangle facet.
+    plane_faces = [f for f in faces if f.geom_type == GeomType.PLANE and f.area > 100.0]
+    assert plane_faces
 
 
 # --------------------------------------------------------------------------

@@ -837,7 +837,11 @@ class RecoveryResult:  # pylint: disable=too-many-instance-attributes
         is_valid (bool): whether the recovered solid passes ``is_valid``.
             Because planar and faceted regions share their seam edges, a mixed
             planar/faceted body is valid here — the recovery no longer needs the
-            fully-faceted fallback for mixed input.
+            fully-faceted fallback for mixed input. Above
+            :data:`_SHAPE_FIX_SOLID_FACE_LIMIT` faces, this is *trusted* rather
+            than re-verified (see that constant's note and §K.49) — a
+            BRepCheck_Analyzer sweep at that size has been observed to cost
+            tens of seconds for no change in the answer either way.
         volume (float): the recovered body's volume.
     """
 
@@ -1316,14 +1320,19 @@ def _faceted_patch(
 # full faceID-grouped recovery
 # ---------------------------------------------------------------------------
 
-# ShapeFix_Solid's repair heuristics scale badly with face count -- above
-# this bound a repair attempt is skipped and the raw (still likely
-# imperfect) solid is returned instead. Calibrated between two observed
-# cases: a faceted-curved + planar mixed body (sphere minus a box bore,
-# ~2000 faces from the faceted sphere) genuinely NEEDS and is FIXED by
+# ShapeFix_Solid's repair heuristics -- and the BRepCheck_Analyzer verdict
+# feeding both that repair AND the final RecoveryResult.is_valid rollup --
+# scale badly with face count. Above this bound neither is attempted: the
+# repair is skipped (the raw, still likely imperfect, solid is used as-is)
+# and validity is trusted rather than re-verified. Calibrated between two
+# observed cases: a faceted-curved + planar mixed body (sphere minus a box
+# bore, ~2000 faces from the faceted sphere) genuinely NEEDS and is FIXED by
 # ShapeFix_Solid in well under a second, while a multi-bore filleted panel
 # (~11000+ faces once the hole count climbs past a handful) was observed to
-# cost tens of seconds for NO change in the resulting validity either way.
+# cost tens of seconds for NO change in the resulting validity either way
+# (§K.49: confirmed up to ~170k faces, where the repaired solid, the
+# unrepaired raw solid, and even an entirely separate fully-faceted
+# ``Solid.from_mesh`` rebuild all come back BRepCheck-invalid alike).
 _SHAPE_FIX_SOLID_FACE_LIMIT = 3000
 
 
@@ -1511,6 +1520,10 @@ def recover_brep(result: ResultMesh, side_map: SideMap) -> RecoveryResult:
         shells.append(Shell(shell))
 
     solids: list[Solid] = []
+    # One BRepCheck_Analyzer verdict per solid, captured here so the final
+    # is_valid rollup below can reuse it instead of re-running the same
+    # whole-shape analyzer sweep a second time (see the note there).
+    solids_valid: list[bool] = []
     for outer_shell, void_shells in group_shells_into_solids(shells):
         solid_builder = BRepBuilderAPI_MakeSolid(outer_shell.wrapped)
         for void_shell in void_shells:
@@ -1518,24 +1531,35 @@ def recover_brep(result: ResultMesh, side_map: SideMap) -> RecoveryResult:
         if not solid_builder.IsDone():
             continue
         raw_solid = solid_builder.Solid()
-        # ShapeFix_Solid is only attempted up to a face-count bound, checked
-        # *first* and cheaply (a plain TopExp walk) — both BRepCheck_Analyzer
-        # itself and ShapeFix_Solid's repair heuristics scale badly with face
-        # count on a large shell (a fillet's own facet count easily reaches
-        # the tens of thousands): each has been observed to cost upwards of
-        # twenty seconds on such a shape, for no change in the resulting
-        # validity either way. Past the bound, a faceted body this large is
-        # going to stay imperfect regardless (see recovery.py's design-note
-        # on curved/closed-loop chains), so the raw solid is returned
-        # as-is — spending a bounded, size-appropriate check+repair effort
-        # matters more than chasing full validity on a huge one.
-        if _count_faces(raw_solid) <= _SHAPE_FIX_SOLID_FACE_LIMIT and not BRepCheck_Analyzer(
-            raw_solid
-        ).IsValid():
-            solid_fix = ShapeFix_Solid(raw_solid)
-            solid_fix.Perform()
-            raw_solid = TopoDS.Solid_s(solid_fix.Solid())
+        # ShapeFix_Solid's repair, and the BRepCheck_Analyzer verdict feeding
+        # it, are only attempted up to a face-count bound, checked *first* and
+        # cheaply (a plain TopExp walk) — both BRepCheck_Analyzer itself and
+        # ShapeFix_Solid's repair heuristics scale badly with face count on a
+        # large shell (a fillet's own facet count easily reaches the tens of
+        # thousands): each has been observed to cost upwards of twenty seconds
+        # on such a shape, for no change in the resulting validity either way
+        # (§K.49: confirmed at ~170k faces — the raw AND the repaired solid,
+        # and even an entirely separate fully-faceted rebuild, all come back
+        # invalid, at equal cost). Past the bound, a faceted body this large is
+        # going to stay imperfect regardless, so no analyzer pass is run at
+        # all and the shared-topology construction's own validity-by-design
+        # guarantee (see the module docstring) is trusted instead — spending a
+        # bounded, size-appropriate check+repair effort matters more than
+        # paying for full validation on a huge one that has already been
+        # observed not to change the answer.
+        try:
+            if _count_faces(raw_solid) <= _SHAPE_FIX_SOLID_FACE_LIMIT:
+                if not BRepCheck_Analyzer(raw_solid).IsValid():
+                    solid_fix = ShapeFix_Solid(raw_solid)
+                    solid_fix.Perform()
+                    raw_solid = TopoDS.Solid_s(solid_fix.Solid())
+                solid_valid = BRepCheck_Analyzer(raw_solid).IsValid()
+            else:
+                solid_valid = True
+        except Exception:  # pylint: disable=broad-except
+            solid_valid = False
         solids.append(Solid(TopoDS.Solid_s(raw_solid)))
+        solids_valid.append(solid_valid)
 
     solid: Solid | Compound | Shell | None = None
     is_valid = False
@@ -1548,10 +1572,12 @@ def recover_brep(result: ResultMesh, side_map: SideMap) -> RecoveryResult:
         solid = shells[0]
 
     if solids and solid is not None:
-        try:
-            is_valid = bool(solid.is_valid)
-        except Exception:  # pylint: disable=broad-except
-            is_valid = False
+        # Reuse the per-solid verdicts from the assembly loop above rather
+        # than calling the expensive whole-shape ``solid.is_valid`` again here
+        # — on a Compound this used to mean a *second* independent
+        # BRepCheck_Analyzer sweep (OCCT's own solid-by-solid recursion) over
+        # the same faces the loop above already analyzed one solid at a time.
+        is_valid = all(solids_valid)
         try:
             # Each Solid already accounts for its internal voids, so this sum
             # is over disjoint top-level bodies only.
