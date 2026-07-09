@@ -2732,6 +2732,37 @@ shortest edge never manufactures a relationship the mesh didn't already
 have, and was verified triangle-by-triangle against the union-find's
 resulting clusters to confirm no unrelated vertex ever joins one.
 
+**Second sliver shape — collinear / T-vertex, no short edge.** An
+independent tester diagnosing a *different* bored-panel geometry (a wider
+panel, different hole pitch/radius) found the edge-weld above doesn't cover
+every sliver: some are three *distinct*, non-close corners that are
+(near-)collinear — one vertex lies exactly on the segment between the other
+two, so no pair is "the same point" and there is nothing to weld.
+`Manifold.simplify()` collapses the duplicate-vertex kind but not this one at
+any epsilon (confirmed on their geometry up to 1e-3). Verified absent from
+this module's own bored-panel test geometry (0 of 424 degenerate triangles
+lacked a short edge there) but present given different panel/hole
+dimensions — the two kinds are independent failure modes of the same
+boolean, not alternates. `_weld_degenerate_triangles` now also computes each
+triangle's **area** after the edge-weld and drops (not welds — there is no
+vertex pair to merge) any triangle still below `_SLIVER_AREA_TOLERANCE`.
+This is deliberately much tighter than `_SLIVER_EDGE_TOLERANCE`'s own scale
+(`1e-15`, near machine-epsilon) rather than a small absolute area: a first
+attempt at `1e-9` also caught a genuine *non-degenerate* thin facet from a
+coarse faceted sphere on a Minkowski-rounded box (`test_mesh_minkowski_*`,
+area `9.4e-10`) that turned out to be the sole connection between two
+otherwise-disconnected fragments of a merged planar face's connected
+component — dropping it split one recovered face into two, regressing
+`len(big_planar) == 6` to `5`. A collinear/T-vertex artefact is an *exact*
+(to float precision) degeneracy regardless of the mesh's absolute scale, so
+tightening the threshold by six orders of magnitude comfortably clears every
+legitimate thin facet observed while still catching the artefact. Dropping
+(rather than welding) is safe specifically because a T-vertex triangle's two
+short legs are always shared with the two real triangles that meet at the
+T — only its long closing edge is the boolean-seam artefact, used by no
+other triangle, so dropping the triangle only ever removes an edge with zero
+remaining users.
+
 ### K.43 Planar-id inheritance across the fillet's own curved transition
 
 **Symptom.** A *seeded planar* id's connected component containing
@@ -2878,7 +2909,10 @@ that grows with circular-chain count, not a regression introduced here.
 **Tests.** `test_mesh_fillet_box_all_edges_skip_to_solid_is_valid`,
 `test_mesh_chamfer_box_all_edges_skip_to_solid_is_valid`,
 `test_mesh_fillet_bored_panel_skip_to_solid_is_recoverable`,
-`test_mesh_chamfer_bored_panel_skip_to_solid_is_recoverable` in
+`test_mesh_chamfer_bored_panel_skip_to_solid_is_recoverable`,
+`test_weld_degenerate_triangles_collapses_duplicate_vertex_sliver`,
+`test_weld_degenerate_triangles_drops_collinear_t_vertex_sliver`,
+`test_weld_degenerate_triangles_keeps_legitimate_thin_facet` in
 `tests/test_mesh.py`.
 
 ---
