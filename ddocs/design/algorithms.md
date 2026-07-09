@@ -2687,6 +2687,202 @@ with the report attached to the result, so call sites are interchangeable.
 
 ---
 
+## K. `recovery.py` / `bridge.py` — `to_solid()` validity after fillet/chamfer
+
+**The bug.** `MeshPart.is_valid` (manifoldness) was never enough to
+guarantee `to_solid()` produced a `BRepCheck`-valid `Solid`: a fillet or
+chamfer with `on_infeasible="skip"` on a real bored panel converted to an
+*invalid* solid despite `filleted.is_valid` reporting `True` and the STEP
+export succeeding. No existing test exercised `fillet → to_solid() →
+Solid.is_valid` — every fillet/chamfer test in §H/§J stopped at the
+mesh-level check. Diagnosis found **four independent, previously-unknown
+defects** stacked on top of each other, uncovered only by tracing
+`BRepCheck_Analyzer`'s per-subshape statuses down to their root geometry one
+layer at a time.
+
+### K.42 Sliver-pinched planar boundary loops
+
+**Symptom.** `BRepCheck_UnorientableShape` on faces built by
+`_recover_planar_face`, with `BRepCheck_SelfIntersectingWire` on their
+boundary wire.
+
+**Root cause.** A fillet/chamfer's own `manifold3d` boolean can leave two
+mesh-vertex indices at ~1e-7 separation along its own seam curve — distinct
+indices, since nothing upstream merges them (the input tessellation was
+already welded per-face; this artefact is intrinsic to the *boolean result*,
+not the input). A triangle spanning such a pair is a near-zero-area sliver;
+when it sits inside a *planar* seeded id's own connected component,
+`_boundary_loops`'s directed-edge chase threads straight through the
+near-zero-length edge and back, pinching the loop into a self-retracing
+(hence self-intersecting) 2-D trace once flattened onto the exact plane.
+
+**Fix — `_weld_degenerate_triangles` (`recovery.py`).** A targeted,
+*scope-bounded* weld, run once at the top of `recover_brep` before triangles
+are split by `face_id`: for every triangle with a near-zero-area, union-find
+only its own **shortest edge**'s two endpoints (not the third/apex vertex,
+and not a global spatial search). This was calibrated by elimination —
+grid-snapping every vertex to a tolerance (matching the *input*-side
+`bridge.py::_weld`) or welding *all three* corner pairs of a degenerate
+triangle both looked plausible but were falsified: each was observed to
+transitively chain unrelated, genuinely-distinct vertices together through a
+run of nearby slivers, turning previously-fine edges non-manifold (used by 4
+triangles instead of 2) or, worse, merging a mesh-vertex 3+ units away into
+the same point. Restricting the union to *only* a degenerate triangle's own
+shortest edge never manufactures a relationship the mesh didn't already
+have, and was verified triangle-by-triangle against the union-find's
+resulting clusters to confirm no unrelated vertex ever joins one.
+
+### K.43 Planar-id inheritance across the fillet's own curved transition
+
+**Symptom.** A *seeded planar* id's connected component containing
+triangles that are geometrically nowhere near its seeded plane (observed
+deviations up to several units, versus a legitimate seam vertex's ≤0.03-ish
+tessellation sagitta) — `_recover_planar_face` then force-builds an exact
+`Geom_Plane` face on wildly non-planar boundary data, corrupting the wire.
+
+**Root cause.** `manifold3d`'s own `face_id` inheritance across the fillet's
+swept-tool boolean occasionally assigns a *base* planar face's id to a
+handful of triangles that are actually part of the tool's own curved
+transition surface — an id-misassignment intrinsic to the boolean, not a
+recovery defect.
+
+**Fix — coplanarity guard in `_recover_planar_face`.** Per connected
+component (not per id — a single id can still have some components on-plane
+and others not), check the *raw* mesh vertices' max deviation from the
+seeded plane against `_PLANAR_COMPONENT_COPLANARITY_TOLERANCE`
+(`= DEFAULT_LINEAR_TOLERANCE`, chosen with a healthy margin either side of
+the two observed cases above). A component that fails is recovered via
+`_triangle_faces` (extracted from `_faceted_patch` so both share the same
+per-triangle face-building code) instead of forced onto the exact plane —
+exactly the existing curved/unseeded fallback, just triggered per-component
+instead of per-id. Tracked via the new `RecoveryResult.n_planar_off_plane_faceted`.
+
+### K.44 Self-intersection-when-flattened, undetectable in 3-D
+
+**Symptom.** A component that passes the coplanarity guard (bounded seam
+noise) yet still produces a `BRepCheck`-invalid face: a long boundary chord
+elsewhere in the same loop crosses a mildly off-plane seam detail once
+everything is projected onto the plane's 2-D parameter space, even though
+the wire is not self-intersecting in 3-D (`BRepCheck_Analyzer` on the wire
+alone reports valid).
+
+**Fix.** Project each candidate loop into the plane's local `(u, v)` frame
+— already computed for the existing outer/hole area-sort — and run an O(n²)
+segment-pair self-intersection check (`_loop_self_intersects`,
+`_segments_cross`) *before* calling `topology.wire()` for that component.
+This ordering matters: `topology.wire()` shares its edges through
+`_SharedTopology`'s cache keyed by unordered vertex-index pair, so building
+a wire only to discard it after a *post-hoc* `BRepCheck_Analyzer(face)`
+failure was tried first and rejected — a discarded wire still leaves its
+edge directions cached, and a later neighbour reusing those same edges gets
+a silently wrong orientation from it (this is exactly how K.46's regression
+was found: a standalone-`BRepCheck`-invalid face-with-a-hole *was* actually
+fine once assembled into a shell, and the reverse also happened — a
+standalone-valid face was orientation-flipped relative to its shell
+neighbours). Checking the projected coordinates is read-only, so a rejected
+component never touches the shared cache at all.
+
+### K.45 `plane_normal` blind to `TopoDS_Face` orientation (bridge.py)
+
+**Symptom.** A recovered solid with the correct volume magnitude reported
+`chk.IsValid() == False` at the top level with **zero** invalid
+faces/wires/edges/vertices/shells at every individually-checkable level — a
+per-face signed-volume-contribution audit (`Σ (centroid · normal) · area /
+3` over every face) found one face contributing the *wrong sign*: two
+symmetric faces of a plain box (`y=-12.5` and `y=+12.5`) both had a stored
+`FaceRecord.plane_normal` of `(0, 1, 0)` — physically impossible for a pair
+of opposite outward faces.
+
+**Root cause.** `bridge.py::_analyse_face` derived `plane_normal` from
+`BRepAdaptor_Surface(face.wrapped).Plane().Axis().Direction()` — the raw
+`Geom_Plane`'s own axis, which is **blind to `face.wrapped.Orientation()`**.
+For a `TopAbs_REVERSED` face (observed on 3 of a `Box`'s 6 faces — OCCT
+routinely reuses/shares plane geometry with mixed face orientations) this is
+the *inward* normal. `_recover_planar_face` seeds its `Geom_Plane` straight
+from this axis, so the recovered face's effective outward orientation came
+out flipped for exactly the reversed-in-the-original faces.
+
+**Fix.** Negate `plane_normal` when `face.wrapped.Orientation() ==
+TopAbs_REVERSED`, mirroring the existing precedent in
+`topology/two_d.py::Face.location_at` for the identical
+orientation-blindness of a raw `Geom_Surface` evaluation. This was the
+*single* fix that actually resolved the wrong-volume symptom — a
+standalone-face orientation cross-check added directly in `recovery.py` was
+tried first, found to itself be a source of false positives (see K.46), and
+removed once this root cause was identified.
+
+### K.46 Two false starts, ruled out and reverted
+
+While chasing K.44/K.45, two additional interventions were added and then
+removed after they caused regressions of their own — kept here so they are
+not retried:
+
+* **Standalone `BRepCheck_Analyzer(face)` as an accept/reject oracle** inside
+  the exact-plane / fitted-plane face builder. This both let through a
+  genuinely bad face in one geometry (K.44's motivating case) *and*
+  wrongly rejected a perfectly valid face-with-a-hole in another
+  (`test_faces_of_a_drilled_block_matches_native_count`, `mesh_cut(Box,
+  Box)` — no fillet at all — regressed from 11 faces to 18 once a
+  standalone `BadOrientationOfSubshape` false-positive forced its main body
+  through the per-triangle fallback). A face's own orientation is only
+  meaningful relative to its neighbours in the shell; nothing about a
+  standalone check can see that.
+* **Cross-checking a built face's normal against the seeded `plane_normal`**
+  in `_recover_planar_face`, added to try to catch K.45's symptom before the
+  real root cause was found. Reverted once K.45 was fixed at the source —
+  this check would have *reintroduced* the same wrong-orientation bug for
+  any face whose seeded normal is unreliable for a reason other than K.45's.
+
+### K.47 `ShapeFix_Solid` cost, gated by face count
+
+**Symptom.** A previously-innocuous `ShapeFix_Solid(solid).Perform()` call
+at the end of `recover_brep` — present before any of this section's fixes —
+turned a ~2s bake into ~17s on a mere 4-bore panel once the K.42–K.45 fixes
+were in place, for the *same* resulting validity either way (confirmed via
+a no-op monkeypatch: skipping `Perform()` entirely gave identical
+`is_valid`/`volume`). `BRepCheck_Analyzer.IsValid()` itself was *also*
+found to cost over 20 seconds on a ~260k-face solid (a 5×5 grid of bores).
+
+**Fix.** Check face count first (`_count_faces`, a plain `TopExp` walk —
+cheap even on a huge shape) against `_SHAPE_FIX_SOLID_FACE_LIMIT = 3000`
+*before* paying for either `BRepCheck_Analyzer` or `ShapeFix_Solid` on a
+large solid; only run the check-then-fix pair below that bound. The bound
+was calibrated between two real cases: a mixed faceted-curved/planar body
+(`MeshPart.sphere(10) - MeshPart.from_part(Box(4, 4, 40))`, ~2000 faces)
+*needs* and *is fixed by* `ShapeFix_Solid` in well under a second, while the
+multi-bore panel (~11000+ faces past a handful of holes) needs tens of
+seconds for it to fail regardless.
+
+**Residual known limitation.** None of K.42–K.47 fully closes `to_solid()`
+validity for **curved (closed-loop) chains** specifically: even a single
+bore-rim fillet, with no other chains involved, still recovers a solid with
+a handful of non-manifold edges surviving the rim seam (confirmed via
+`TopTools_IndexedDataMapOfShapeListOfShape` edge→face valence audit — some
+edges are shared by 4 faces, not 2). This was checked against tolerances
+spanning four orders of magnitude for a vertex-weld fix and found
+unresponsive at every one, which rules out a mesh-proximity cause; it looks
+like a ribbon-loft seam-closure defect in the closed-loop sweep itself
+(`fillet.py`), not a recovery-side sliver — tracked as a follow-up, not
+fixed here. `to_solid()` still recovers the *correct volume* regardless
+(bit-accurate to the mesh, previously not guaranteed at all for these
+inputs). Straight-edge (open-chain) fillets/chamfers are unaffected and pass
+`to_solid().is_valid` cleanly — see
+`test_mesh_fillet_box_all_edges_skip_to_solid_is_valid` /
+`test_mesh_chamfer_box_all_edges_skip_to_solid_is_valid`. Similarly, a
+10×10 grid of bores (100 holes) was found to already exceed a
+minute in `to_solid()` on the **unmodified baseline** (confirmed by
+reverting every fix in this section and re-timing) — an existing scaling
+characteristic of building one `TopoDS_Face` per unseeded facet triangle
+that grows with circular-chain count, not a regression introduced here.
+
+**Tests.** `test_mesh_fillet_box_all_edges_skip_to_solid_is_valid`,
+`test_mesh_chamfer_box_all_edges_skip_to_solid_is_valid`,
+`test_mesh_fillet_bored_panel_skip_to_solid_is_recoverable`,
+`test_mesh_chamfer_bored_panel_skip_to_solid_is_recoverable` in
+`tests/test_mesh.py`.
+
+---
+
 ## Appendix — file map and call graph
 
 ```
