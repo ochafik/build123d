@@ -97,6 +97,9 @@ from OCP.BRepBuilderAPI import (
     BRepBuilderAPI_MakeVertex,
     BRepBuilderAPI_MakeWire,
 )
+from OCP.BRepCheck import BRepCheck_Analyzer
+from OCP.TopAbs import TopAbs_FACE
+from OCP.TopExp import TopExp_Explorer
 from OCP.Geom import Geom_Plane
 from OCP.gp import gp_Ax3, gp_Dir, gp_Pln, gp_Pnt
 from OCP.ShapeFix import ShapeFix_Solid
@@ -108,7 +111,134 @@ from build123d.topology.utils import (
     group_shells_into_solids,
 )
 
-from .bridge import FaceRecord, ResultMesh, SideMap
+from build123d.geometry import TOLERANCE
+
+from .bridge import DEFAULT_LINEAR_TOLERANCE, FaceRecord, ResultMesh, SideMap
+
+# ---------------------------------------------------------------------------
+# seam weld -- collapse boolean-result slivers before any per-id grouping
+# ---------------------------------------------------------------------------
+
+# A mesh EDGE shorter than this is treated as a collapsed duplicate, not a
+# genuine (if small) feature. Matches build123d's own geometric TOLERANCE; the
+# repro's own artefact edges top out two orders of magnitude below this (their
+# max is ~3.6e-7) and the next-smallest *legitimate* edges in the same mesh
+# start three orders of magnitude above it (~1e-3), so there is no observed
+# case in this codebase's test geometry where a real feature is anywhere near
+# this threshold.
+_SLIVER_EDGE_TOLERANCE = TOLERANCE
+
+
+def _weld_degenerate_triangles(result: ResultMesh) -> ResultMesh:
+    """Weld collapsed-edge vertex pairs and drop the slivers they leave behind.
+
+    A ``manifold3d`` boolean (a fillet/chamfer's swept-tool subtract or union,
+    in particular) can leave two mesh-vertex indices at ~1e-7 separation along
+    an intersection curve — distinct indices, not the same one, so nothing
+    upstream ever merges them. A triangle spanning such a pair is a near-zero-
+    area sliver; when it sits *inside* a planar seeded id's own triangle group,
+    its near-zero-length edge pinches :func:`_boundary_loops` into a
+    self-retracing loop, and the exact planar face built on that loop comes
+    back ``BRepCheck_UnorientableShape`` (its boundary wire is
+    ``BRepCheck_SelfIntersectingWire``) even though the *mesh* is perfectly
+    manifold — ``MeshPart.is_valid`` never sees the problem.
+
+    Unlike :func:`build123d.mesh.bridge._weld` (a spatial grid-snap of *every*
+    vertex, safe on a fresh per-face tessellation where a shared seam vertex is
+    always bit-identical between its two faces), this welds only the endpoints
+    of an actual mesh **edge** shorter than :data:`_SLIVER_EDGE_TOLERANCE` —
+    i.e. two vertices already joined by a triangle in this result. Grid-
+    snapping the whole boolean-result mesh instead merges any vertices that
+    happen to land in the same quantization cell regardless of whether they
+    are topologically related, which was observed to weld unrelated nearby
+    ribbon-loft vertices into one index and turn previously-fine edges
+    non-manifold (used by 4 triangles instead of 2). Restricting the weld to
+    genuine short edges only ever merges vertices the mesh itself already
+    connects, so it cannot manufacture a new non-manifold edge.
+
+    Merged vertices are grouped by union-find over every sub-tolerance edge,
+    then averaged (like :func:`build123d.mesh.bridge._weld`) so the result
+    isn't grid-biased. Any triangle degenerate after the remap — a repeated
+    vertex index, zero area — is dropped. Because the weld runs on the *whole*
+    result mesh before triangles are split by ``face_id``, every surviving
+    triangle in every group (planar or faceted) still shares its vertex
+    indices with its neighbours, so :class:`_SharedTopology` keeps building one
+    edge per seam regardless of which side of the seam collapsed.
+
+    Args:
+        result (ResultMesh): the raw boolean result mesh.
+
+    Returns:
+        ResultMesh: a mesh with the same seam-sharing invariant, sliver
+        triangles removed, and ``face_id`` aligned with the surviving
+        triangles.
+    """
+    vertices = result.vertices
+    triangles = result.triangles
+    corner_a = vertices[triangles[:, 0]]
+    corner_b = vertices[triangles[:, 1]]
+    corner_c = vertices[triangles[:, 2]]
+    edge_lengths = (
+        np.linalg.norm(corner_a - corner_b, axis=1),
+        np.linalg.norm(corner_b - corner_c, axis=1),
+        np.linalg.norm(corner_c - corner_a, axis=1),
+    )
+    edge_pairs = (
+        (triangles[:, 0], triangles[:, 1]),
+        (triangles[:, 1], triangles[:, 2]),
+        (triangles[:, 2], triangles[:, 0]),
+    )
+
+    parent = np.arange(len(vertices))
+
+    def find(index: int) -> int:
+        root = index
+        while parent[root] != root:
+            root = parent[root]
+        while parent[index] != root:
+            parent[index], index = root, parent[index]
+        return root
+
+    any_short = False
+    for (starts, ends), lengths in zip(edge_pairs, edge_lengths):
+        short = lengths < _SLIVER_EDGE_TOLERANCE
+        if not np.any(short):
+            continue
+        any_short = True
+        for start, end in zip(starts[short].tolist(), ends[short].tolist()):
+            root_start, root_end = find(start), find(end)
+            if root_start != root_end:
+                parent[max(root_start, root_end)] = min(root_start, root_end)
+
+    if not any_short:
+        return result
+
+    roots = np.fromiter((find(i) for i in range(len(vertices))), dtype=np.int64, count=len(vertices))
+    unique_roots, inverse = np.unique(roots, return_inverse=True)
+    inverse = inverse.reshape(-1)
+    welded_vertices = np.zeros((len(unique_roots), 3), dtype=np.float64)
+    counts = np.zeros(len(unique_roots), dtype=np.int64)
+    np.add.at(welded_vertices, inverse, vertices)
+    np.add.at(counts, inverse, 1)
+    welded_vertices /= counts[:, None]
+
+    welded_triangles = inverse[triangles]
+    corner_a = welded_triangles[:, 0]
+    corner_b = welded_triangles[:, 1]
+    corner_c = welded_triangles[:, 2]
+    keep = (corner_a != corner_b) & (corner_b != corner_c) & (corner_a != corner_c)
+    if keep.all():
+        return ResultMesh(
+            vertices=welded_vertices,
+            triangles=welded_triangles,
+            face_id=result.face_id,
+        )
+    return ResultMesh(
+        vertices=welded_vertices,
+        triangles=welded_triangles[keep],
+        face_id=result.face_id[keep],
+    )
+
 
 # ---------------------------------------------------------------------------
 # connectivity -- split a seeded id into edge-connected components
@@ -236,6 +366,67 @@ def _boundary_loops(triangles: np.ndarray) -> list[list[int]]:
             guard += 1
         loops.append(loop)
     return loops
+
+
+def _segments_cross(
+    start_a: np.ndarray, end_a: np.ndarray, start_b: np.ndarray, end_b: np.ndarray
+) -> bool:
+    """True if open 2-D segments ``(start_a, end_a)`` and ``(start_b, end_b)`` cross.
+
+    Endpoint touches (shared vertices between consecutive loop segments) are
+    deliberately excluded via the open interval, so adjacent loop edges never
+    register as crossing at their shared vertex.
+
+    Args:
+        start_a (np.ndarray): first segment's start point, ``(2,)``.
+        end_a (np.ndarray): first segment's end point, ``(2,)``.
+        start_b (np.ndarray): second segment's start point, ``(2,)``.
+        end_b (np.ndarray): second segment's end point, ``(2,)``.
+
+    Returns:
+        bool: True if the segments cross at an interior point of both.
+    """
+    direction_a = end_a - start_a
+    direction_b = end_b - start_b
+    denominator = direction_a[0] * direction_b[1] - direction_a[1] * direction_b[0]
+    if abs(denominator) < 1e-12:
+        return False  # parallel (or one is degenerate) -- not a transversal crossing
+    offset = start_b - start_a
+    t = (offset[0] * direction_b[1] - offset[1] * direction_b[0]) / denominator
+    u = (offset[0] * direction_a[1] - offset[1] * direction_a[0]) / denominator
+    return 1e-9 < t < 1.0 - 1e-9 and 1e-9 < u < 1.0 - 1e-9
+
+
+def _loop_self_intersects(coords: np.ndarray) -> bool:
+    """True if a closed 2-D polygon (ordered vertices) crosses itself.
+
+    Guards :func:`_recover_planar_face` against forcing a wire onto its
+    seeded plane when the projection isn't a simple polygon: a component can
+    pass the coarse coplanarity check (bounded seam noise) yet still fold
+    onto itself once flattened, e.g. a long boundary chord elsewhere in the
+    same loop crossing a mildly off-plane seam detail — a configuration
+    ``BRepBuilderAPI_MakeFace`` accepts (``IsDone()`` is true) but which comes
+    back ``BRepCheck_UnorientableShape``. An O(n²) segment-pair scan is cheap
+    here: recovered boundary loops are tens of vertices, not thousands.
+
+    Args:
+        coords (np.ndarray): ``(N, 2)`` ordered polygon vertices in the
+            plane's local frame.
+
+    Returns:
+        bool: True if any two non-adjacent edges of the polygon cross.
+    """
+    count = len(coords)
+    if count < 4:
+        return False
+    for i in range(count):
+        start_a, end_a = coords[i], coords[(i + 1) % count]
+        for j in range(i + 1, count):
+            if j == i or (j + 1) % count == i or (i + 1) % count == j:
+                continue  # shares an endpoint with segment i -- not a crossing
+            if _segments_cross(start_a, end_a, coords[j], coords[(j + 1) % count]):
+                return True
+    return False
 
 
 def _project_to_plane(
@@ -465,6 +656,15 @@ class RecoveryResult:  # pylint: disable=too-many-instance-attributes
             facets without analytic provenance. Such a mixed result is now
             valid by construction (shared seam topology), so a non-zero count
             no longer implies an invalid body.
+        n_planar_off_plane_faceted (int): number of faces recovered faceted
+            because they belong to a seeded *planar* id's connected component
+            that failed the coplanarity check (see
+            :data:`_PLANAR_COMPONENT_COPLANARITY_TOLERANCE`). Non-zero when a
+            fillet/chamfer boolean's own id-inheritance assigned a base
+            planar face's id to a handful of triangles that are actually part
+            of the swept tool's curved transition — forcing those onto the
+            exact plane would corrupt the face, so they are kept faceted
+            instead, same as a genuinely curved id.
         is_valid (bool): whether the recovered solid passes ``is_valid``.
             Because planar and faceted regions share their seam edges, a mixed
             planar/faceted body is valid here — the recovery no longer needs the
@@ -479,6 +679,7 @@ class RecoveryResult:  # pylint: disable=too-many-instance-attributes
     n_synthetic_planar: int = 0
     n_synthetic_faceted: int = 0
     n_unseeded_faceted: int = 0
+    n_planar_off_plane_faceted: int = 0
     is_valid: bool = False
     volume: float = 0.0
 
@@ -504,6 +705,24 @@ def _exact_plane(record: FaceRecord) -> Geom_Plane:
     return Geom_Plane(gp_Pln(axis))
 
 
+# A connected component of a *seeded planar* id is trusted to lie on that
+# id's exact plane only if every one of its (pre-weld-projection) vertices is
+# within this distance of it. manifold3d's fillet/chamfer boolean occasionally
+# inherits a base face's id onto a handful of triangles that are actually part
+# of the swept tool's own curved transition -- an id-inheritance artifact, not
+# a tessellation error. Forcing such an off-plane component onto the analytic
+# plane anyway builds a wire whose vertices don't actually lie in the plane's
+# 2-D parameter space, which BRepBuilderAPI_MakeFace turns into a
+# BRepCheck_UnorientableShape face. A genuine seam component (shared with an
+# adjacent faceted patch) deviates from the plane by at most the fillet
+# profile's own tessellation sagitta -- observed up to ~0.03 for a half-mm
+# fillet at the default 8 segments -- while a misassigned component deviates
+# by the fillet radius or more (observed >= 0.5). Matching
+# DEFAULT_LINEAR_TOLERANCE (the tessellation deflection already in play
+# everywhere else in this bridge) sits comfortably between the two.
+_PLANAR_COMPONENT_COPLANARITY_TOLERANCE = DEFAULT_LINEAR_TOLERANCE
+
+
 def _recover_planar_face(
     result: ResultMesh,
     face_id: int,
@@ -511,15 +730,19 @@ def _recover_planar_face(
     topology: _SharedTopology,
     component_of_triangle: np.ndarray,
     faces_by_component: dict[int, list[Face]],
-) -> RecoveredFace:
+) -> tuple[RecoveredFace, int]:
     """Rebuild exact planar ``TopoDS_Face``(s) for one seeded planar id.
 
     Each edge-connected component of the id's triangle group becomes one exact
-    planar :class:`~build123d.Face` on the *known input* ``Geom_Plane``. Within a
-    component the largest boundary loop is the outer wire and any nested loop is
-    a hole. Each wire is built from the **shared** per-segment ``TopoDS_Edge``
-    objects (see :class:`_SharedTopology`), subdividing the boundary at every
-    mesh vertex so its edges line up one-to-one with any adjacent faceted patch.
+    planar :class:`~build123d.Face` on the *known input* ``Geom_Plane`` --
+    unless the component fails the coplanarity check (see
+    :data:`_PLANAR_COMPONENT_COPLANARITY_TOLERANCE`), in which case it is
+    recovered as a faceted patch instead (:func:`_triangle_faces`), same as a
+    genuinely curved id. Within an exact component the largest boundary loop is
+    the outer wire and any nested loop is a hole. Each wire is built from the
+    **shared** per-segment ``TopoDS_Edge`` objects (see :class:`_SharedTopology`),
+    subdividing the boundary at every mesh vertex so its edges line up
+    one-to-one with any adjacent faceted patch.
 
     A single seeded id can span more than one disjoint body (face ids are not
     confined to one connected component once meshes are fused), so each built
@@ -536,8 +759,9 @@ def _recover_planar_face(
             component (mutated in place).
 
     Returns:
-        RecoveredFace: the recovered face(s); ``faces`` is empty if no face
-        could be built.
+        tuple[RecoveredFace, int]: the recovered face(s) (``faces`` is empty if
+        none could be built), and how many of those faces are faceted-fallback
+        (off-plane component) rather than exact.
     """
     group_indices = result.triangles_of(face_id)
     group = result.triangles[group_indices]
@@ -555,9 +779,11 @@ def _recover_planar_face(
     in_plane_u /= np.linalg.norm(in_plane_u)
     in_plane_v = np.cross(unit_normal, in_plane_u)
 
-    def loop_area(loop: list[int]) -> float:
+    def loop_coords(loop: list[int]) -> np.ndarray:
         points = topology.positions[loop]
-        coords = np.column_stack([points @ in_plane_u, points @ in_plane_v])
+        return np.column_stack([points @ in_plane_u, points @ in_plane_v])
+
+    def loop_area(coords: np.ndarray) -> float:
         x_coords, y_coords = coords[:, 0], coords[:, 1]
         return 0.5 * abs(
             np.dot(x_coords, np.roll(y_coords, -1))
@@ -565,19 +791,64 @@ def _recover_planar_face(
         )
 
     faces: list[Face] = []
+    n_faceted_fallback = 0
     for component in _connected_components(group):
+        component_indices = group_indices[component]
         component_triangles = group[component]
+
+        def fall_back_to_faceted() -> None:
+            nonlocal n_faceted_fallback
+            patch = _triangle_faces(
+                result,
+                component_indices,
+                topology,
+                component_of_triangle,
+                faces_by_component,
+            )
+            faces.extend(patch)
+            n_faceted_fallback += len(patch)
+
+        # Coplanarity guard (see _PLANAR_COMPONENT_COPLANARITY_TOLERANCE): a
+        # component whose *raw* mesh vertices stray far from the seeded plane
+        # is an id-inheritance artifact, not real seam noise -- recover it
+        # faceted instead of building a corrupt exact face on top of it.
+        raw_points = result.vertices[np.unique(component_triangles)]
+        deviation = np.abs((raw_points - origin) @ unit_normal)
+        if deviation.max() > _PLANAR_COMPONENT_COPLANARITY_TOLERANCE:
+            fall_back_to_faceted()
+            continue
+
         loops = [
             loop for loop in _boundary_loops(component_triangles) if len(loop) >= 3
         ]
         if not loops:
             continue
-        scored = sorted(loops, key=loop_area, reverse=True)
-        outer_wire = topology.wire(scored[0])
+        loop_coordinates = [loop_coords(loop) for loop in loops]
+        scored = sorted(
+            zip(loops, loop_coordinates), key=lambda pair: loop_area(pair[1]), reverse=True
+        )
+
+        # Self-intersection guard, checked on the loops' *2-D* projection
+        # (their eventual pcurve trace) *before* any topology.wire() call: a
+        # component can pass the coarse coplanarity check above (bounded seam
+        # noise) yet still fold onto itself once flattened -- e.g. a long
+        # boundary chord elsewhere in the same loop crossing a mildly
+        # off-plane seam detail. Checking (and discarding) only *after*
+        # building the wire is unsafe: topology.wire() already shares its
+        # edges through _SharedTopology, so a discarded wire still leaves its
+        # edge directions cached, silently flipping the orientation a
+        # neighbouring face sees on those same edges. Detecting this from the
+        # read-only projected coordinates avoids ever touching the shared
+        # cache for a component we are about to reject.
+        if any(_loop_self_intersects(coords) for _, coords in scored):
+            fall_back_to_faceted()
+            continue
+
+        outer_wire = topology.wire(scored[0][0])
         if outer_wire is None:
             continue
         face_builder = BRepBuilderAPI_MakeFace(geom_plane, outer_wire, True)
-        for hole_loop in scored[1:]:
+        for hole_loop, _ in scored[1:]:
             hole_wire = topology.wire(hole_loop)
             if hole_wire is not None:
                 face_builder.Add(TopoDS.Wire_s(hole_wire.Reversed()))
@@ -595,11 +866,20 @@ def _recover_planar_face(
             faces_by_component[body].append(face)
 
     if not faces:
-        return RecoveredFace(face_id, "PLANE", [], False, "no face built")
+        return RecoveredFace(face_id, "PLANE", [], False, "no face built"), 0
     note = "exact Geom_Plane"
-    if len(faces) > 1:
+    if n_faceted_fallback:
+        note = (
+            f"exact Geom_Plane ({len(faces) - n_faceted_fallback} piece(s)); "
+            f"{n_faceted_fallback} triangle(s) in off-plane component(s) "
+            "recovered faceted instead (id-inheritance artifact)"
+        )
+    elif len(faces) > 1:
         note = f"exact Geom_Plane, split into {len(faces)} pieces"
-    return RecoveredFace(face_id, "PLANE", faces, True, note)
+    return (
+        RecoveredFace(face_id, "PLANE", faces, n_faceted_fallback == 0, note),
+        n_faceted_fallback,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -723,7 +1003,7 @@ def _recover_synthetic_face(
             plane_origin=origin,
             plane_normal=normal,
         )
-        recovered = _recover_planar_face(
+        recovered, _n_fallback = _recover_planar_face(
             result,
             face_id,
             fitted_record,
@@ -753,6 +1033,53 @@ def _recover_synthetic_face(
         ),
         False,
     )
+
+
+def _triangle_faces(
+    result: ResultMesh,
+    triangle_indices: np.ndarray,
+    topology: _SharedTopology,
+    component_of_triangle: np.ndarray,
+    faces_by_component: dict[int, list[Face]],
+) -> list[Face]:
+    """Build one flat ``TopoDS_Face`` per triangle of ``triangle_indices``.
+
+    The shared per-segment worker behind :func:`_faceted_patch` (a full seeded
+    id's triangles) and :func:`_recover_planar_face`'s per-component
+    coplanarity fallback (one connected component's triangles that turned out
+    not to lie on the seeded plane) — both need the identical "one flat face
+    per triangle, edges from :class:`_SharedTopology`" construction, just over
+    a different triangle-index subset of the same result mesh.
+
+    Args:
+        result (ResultMesh): the boolean result mesh.
+        triangle_indices (np.ndarray): result-mesh triangle indices to build.
+        topology (_SharedTopology): the shared vertex/edge cache.
+        component_of_triangle (np.ndarray): per-triangle body component label.
+        faces_by_component (dict[int, list[Face]]): built faces filed by body
+            component (mutated in place).
+
+    Returns:
+        list[Face]: one flat triangle face per input triangle index.
+    """
+    patch: list[Face] = []
+    for triangle_index in triangle_indices:
+        triangle = result.triangles[triangle_index]
+        corner_a, corner_b, corner_c = (int(x) for x in triangle)
+        edge_ab = topology.edge(corner_a, corner_b)
+        edge_bc = topology.edge(corner_b, corner_c)
+        edge_ca = topology.edge(corner_c, corner_a)
+        if edge_ab is None or edge_bc is None or edge_ca is None:
+            continue
+        wire_builder = BRepBuilderAPI_MakeWire(edge_ab, edge_bc, edge_ca)
+        if not wire_builder.IsDone():
+            continue
+        face_builder = BRepBuilderAPI_MakeFace(wire_builder.Wire(), True)
+        if face_builder.IsDone():
+            face = Face(face_builder.Face())
+            patch.append(face)
+            faces_by_component[int(component_of_triangle[triangle_index])].append(face)
+    return patch
 
 
 def _faceted_patch(
@@ -786,29 +1113,38 @@ def _faceted_patch(
     Returns:
         list[Face]: one flat triangle face per triangle of the group.
     """
-    patch: list[Face] = []
-    for triangle_index in result.triangles_of(face_id):
-        triangle = result.triangles[triangle_index]
-        corner_a, corner_b, corner_c = (int(x) for x in triangle)
-        edge_ab = topology.edge(corner_a, corner_b)
-        edge_bc = topology.edge(corner_b, corner_c)
-        edge_ca = topology.edge(corner_c, corner_a)
-        if edge_ab is None or edge_bc is None or edge_ca is None:
-            continue
-        wire_builder = BRepBuilderAPI_MakeWire(edge_ab, edge_bc, edge_ca)
-        if not wire_builder.IsDone():
-            continue
-        face_builder = BRepBuilderAPI_MakeFace(wire_builder.Wire(), True)
-        if face_builder.IsDone():
-            face = Face(face_builder.Face())
-            patch.append(face)
-            faces_by_component[int(component_of_triangle[triangle_index])].append(face)
-    return patch
+    return _triangle_faces(
+        result,
+        result.triangles_of(face_id),
+        topology,
+        component_of_triangle,
+        faces_by_component,
+    )
 
 
 # ---------------------------------------------------------------------------
 # full faceID-grouped recovery
 # ---------------------------------------------------------------------------
+
+# ShapeFix_Solid's repair heuristics scale badly with face count -- above
+# this bound a repair attempt is skipped and the raw (still likely
+# imperfect) solid is returned instead. Calibrated between two observed
+# cases: a faceted-curved + planar mixed body (sphere minus a box bore,
+# ~2000 faces from the faceted sphere) genuinely NEEDS and is FIXED by
+# ShapeFix_Solid in well under a second, while a multi-bore filleted panel
+# (~11000+ faces once the hole count climbs past a handful) was observed to
+# cost tens of seconds for NO change in the resulting validity either way.
+_SHAPE_FIX_SOLID_FACE_LIMIT = 3000
+
+
+def _count_faces(shape) -> int:
+    """Count ``TopAbs_FACE`` subshapes of ``shape`` (a cheap O(n) walk)."""
+    count = 0
+    explorer = TopExp_Explorer(shape, TopAbs_FACE)
+    while explorer.More():
+        count += 1
+        explorer.Next()
+    return count
 
 
 def recover_brep(result: ResultMesh, side_map: SideMap) -> RecoveryResult:
@@ -861,6 +1197,12 @@ def recover_brep(result: ResultMesh, side_map: SideMap) -> RecoveryResult:
             "arrays carries no provenance — use to_solid(reconstruct=False)."
         )
 
+    # Collapse any near-duplicate-vertex sliver left by the boolean itself
+    # (see _weld_degenerate_triangles) before triangles are split by face_id —
+    # a sliver inside a planar group's own component would otherwise pinch its
+    # boundary loop into a self-intersecting wire (BRepCheck_UnorientableShape).
+    result = _weld_degenerate_triangles(result)
+
     # One TopoDS_Vertex / TopoDS_Edge per result-mesh vertex index, placed by
     # the seam-projection rule, shared across all faces built below.
     topology = _SharedTopology(_vertex_positions(result, side_map))
@@ -878,6 +1220,7 @@ def recover_brep(result: ResultMesh, side_map: SideMap) -> RecoveryResult:
     n_synthetic_planar = 0
     n_synthetic_faceted = 0
     n_unseeded_faceted = 0
+    n_planar_off_plane_faceted = 0
 
     # Faces grouped by body component label, ready for shell assembly. A single
     # face_id is NOT confined to one body once meshes are fused, so each built
@@ -930,7 +1273,7 @@ def recover_brep(result: ResultMesh, side_map: SideMap) -> RecoveryResult:
                 n_synthetic_faceted += 1
             recovered_faces.append(synthetic)
         elif record.is_planar:
-            recovered = _recover_planar_face(
+            recovered, n_fallback = _recover_planar_face(
                 result,
                 face_id,
                 record,
@@ -938,7 +1281,8 @@ def recover_brep(result: ResultMesh, side_map: SideMap) -> RecoveryResult:
                 component_of_triangle,
                 faces_by_component,
             )
-            n_exact_planar += len(recovered.faces)
+            n_exact_planar += len(recovered.faces) - n_fallback
+            n_planar_off_plane_faceted += n_fallback
             recovered_faces.append(recovered)
         else:
             patch = _faceted_patch(
@@ -983,9 +1327,25 @@ def recover_brep(result: ResultMesh, side_map: SideMap) -> RecoveryResult:
             solid_builder.Add(void_shell.wrapped)
         if not solid_builder.IsDone():
             continue
-        solid_fix = ShapeFix_Solid(solid_builder.Solid())
-        solid_fix.Perform()
-        solids.append(Solid(TopoDS.Solid_s(solid_fix.Solid())))
+        raw_solid = solid_builder.Solid()
+        # ShapeFix_Solid is only attempted up to a face-count bound, checked
+        # *first* and cheaply (a plain TopExp walk) — both BRepCheck_Analyzer
+        # itself and ShapeFix_Solid's repair heuristics scale badly with face
+        # count on a large shell (a fillet's own facet count easily reaches
+        # the tens of thousands): each has been observed to cost upwards of
+        # twenty seconds on such a shape, for no change in the resulting
+        # validity either way. Past the bound, a faceted body this large is
+        # going to stay imperfect regardless (see recovery.py's design-note
+        # on curved/closed-loop chains), so the raw solid is returned
+        # as-is — spending a bounded, size-appropriate check+repair effort
+        # matters more than chasing full validity on a huge one.
+        if _count_faces(raw_solid) <= _SHAPE_FIX_SOLID_FACE_LIMIT and not BRepCheck_Analyzer(
+            raw_solid
+        ).IsValid():
+            solid_fix = ShapeFix_Solid(raw_solid)
+            solid_fix.Perform()
+            raw_solid = TopoDS.Solid_s(solid_fix.Solid())
+        solids.append(Solid(TopoDS.Solid_s(raw_solid)))
 
     solid: Solid | Compound | Shell | None = None
     is_valid = False
@@ -1017,6 +1377,7 @@ def recover_brep(result: ResultMesh, side_map: SideMap) -> RecoveryResult:
         n_synthetic_planar=n_synthetic_planar,
         n_synthetic_faceted=n_synthetic_faceted,
         n_unseeded_faceted=n_unseeded_faceted,
+        n_planar_off_plane_faceted=n_planar_off_plane_faceted,
         is_valid=is_valid,
         volume=volume,
     )

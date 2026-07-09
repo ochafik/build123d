@@ -78,6 +78,7 @@ import manifold3d as m3d  # type: ignore[import-not-found]
 from OCP.BRep import BRep_Tool
 from OCP.BRepAdaptor import BRepAdaptor_Surface
 from OCP.GeomAbs import GeomAbs_SurfaceType
+from OCP.TopAbs import TopAbs_Orientation
 
 from build123d.topology import Face, Shape
 
@@ -325,9 +326,20 @@ def _analyse_face(face_id: int, face: Face, source: str) -> FaceRecord:
         record.plane_origin = np.array(
             [location.X(), location.Y(), location.Z()], dtype=np.float64
         )
-        record.plane_normal = np.array(
+        plane_normal = np.array(
             [direction.X(), direction.Y(), direction.Z()], dtype=np.float64
         )
+        # BRepAdaptor_Surface.Plane() reads the underlying Geom_Plane, which
+        # is blind to this TopoDS_Face's own Orientation flag: it is the
+        # *raw* surface normal, inward for whichever faces of the input shape
+        # happen to be TopAbs_REVERSED (observed on 3 of a Box's 6 faces).
+        # Recovery seeds every planar face's exact Geom_Plane straight from
+        # this axis (see recovery.py's _exact_plane), so an inward-flipped
+        # normal here silently flips that recovered face's effective outward
+        # orientation in the assembled shell — same fix as Face.location_at.
+        if face.wrapped.Orientation() == TopAbs_Orientation.TopAbs_REVERSED:
+            plane_normal = -plane_normal
+        record.plane_normal = plane_normal
     return record
 
 

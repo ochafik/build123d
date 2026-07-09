@@ -2554,6 +2554,92 @@ def test_mesh_fillet_report_exports_and_is_iterable():
     assert report.total_skipped == 1
 
 
+def test_mesh_fillet_box_all_edges_skip_to_solid_is_valid():
+    """Regression: to_solid() on a filleted box must pass BRepCheck.
+
+    All 12 box edges filleted at r=1.0 with ``on_infeasible="skip"`` used to
+    bake to a BRepCheck-INVALID Solid even though the MeshPart itself reported
+    ``is_valid`` (manifoldness only — see
+    ``test_mesh_fillet_box_all_edges_no_slivers_and_one_body``, which only
+    ever checked that). The fillet's own manifold3d boolean leaves
+    near-duplicate vertices (~1e-7 apart, distinct mesh-vertex indices,
+    tighter than build123d's TOLERANCE=1e-6) along its seam curves; a triangle
+    spanning such a pair is a near-zero-area sliver whose near-zero-length
+    edge pinches a planar face's boundary loop into a self-retracing wire
+    (BRepCheck_SelfIntersectingWire) — see design ddocs/design/algorithms.md,
+    the fillet/to_solid validity section.
+    """
+    box = MeshPart.from_part(Box(20, 20, 20))
+    filleted = box.fillet(box.feature_edges(), radius=1.0, on_infeasible="skip")
+    assert filleted.is_valid
+
+    solid = filleted.to_solid()
+    assert isinstance(solid, (Solid, Compound))
+    assert solid.is_valid
+    assert solid.volume == pytest.approx(filleted.volume, rel=1e-6)
+
+
+def test_mesh_chamfer_box_all_edges_skip_to_solid_is_valid():
+    """Chamfer twin of the fillet-to_solid validity regression above."""
+    box = MeshPart.from_part(Box(20, 20, 20))
+    chamfered = box.chamfer(box.feature_edges(), size=1.0, on_infeasible="skip")
+    assert chamfered.is_valid
+
+    solid = chamfered.to_solid()
+    assert isinstance(solid, (Solid, Compound))
+    assert solid.is_valid
+    assert solid.volume == pytest.approx(chamfered.volume, rel=1e-6)
+
+
+def test_mesh_fillet_bored_panel_skip_to_solid_is_recoverable():
+    """A filleted bored panel's to_solid() recovers the correct volume.
+
+    A 40x25x4 panel with two Ø4 bores, every feature edge (12 box edges + 4
+    bore-rim loops) filleted at r=0.5 with ``on_infeasible="skip"``: the same
+    degenerate-sliver defect as
+    ``test_mesh_fillet_box_all_edges_skip_to_solid_is_valid`` above, PLUS a
+    known, separate residual affecting *curved* (closed-loop) chains
+    specifically — even a single bore-rim fillet with no other chains
+    involved still recovers a Solid whose BRepCheck is not clean (a handful
+    of non-manifold edges survive around the rim seam), which looks like a
+    ribbon-loft seam-closure defect in the closed-loop sweep itself
+    (fillet.py), not a recovery-side sliver. Recovery is now robust enough
+    that the volume is bit-accurate regardless (previously this could bake to
+    a wildly wrong body); full BRepCheck validity for curved-chain fillets is
+    tracked as a follow-up, not asserted here.
+    """
+    panel = MeshPart.box(40, 25, 4)
+    holes = [
+        MeshPart.cylinder(radius=2.0, height=12).move(Location((x, 0, 0)))
+        for x in (-9, 9)
+    ]
+    drilled = mesh_cut(panel, *holes)
+    chains = drilled.feature_edges()
+    filleted = drilled.fillet(chains, radius=0.5, on_infeasible="skip")
+    assert filleted.is_valid
+
+    solid = filleted.to_solid()
+    assert isinstance(solid, (Solid, Compound))
+    assert solid.volume == pytest.approx(filleted.volume, rel=1e-4)
+
+
+def test_mesh_chamfer_bored_panel_skip_to_solid_is_recoverable():
+    """Chamfer twin of the bored-panel volume-recovery regression above."""
+    panel = MeshPart.box(40, 25, 4)
+    holes = [
+        MeshPart.cylinder(radius=2.0, height=12).move(Location((x, 0, 0)))
+        for x in (-9, 9)
+    ]
+    drilled = mesh_cut(panel, *holes)
+    chains = drilled.feature_edges()
+    chamfered = drilled.chamfer(chains, size=0.5, on_infeasible="skip")
+    assert chamfered.is_valid
+
+    solid = chamfered.to_solid()
+    assert isinstance(solid, (Solid, Compound))
+    assert solid.volume == pytest.approx(chamfered.volume, rel=1e-4)
+
+
 # --------------------------------------------------------------------------
 # Mixed-provenance recovery — unseeded face_ids must not be silently dropped
 # (regression: a hull/Minkowski/from_mesh operand combined with a seeded
