@@ -3144,6 +3144,177 @@ bound, never `True`, and `to_solid()` accepts it rather than falling back),
 above) and `ddocs/design/bake_profile_v1.py` (the cProfile breakdown above),
 run via `PYTHONPATH=src <venv>/bin/python -u ddocs/design/bake_scaling_v1.py`.
 
+### K.50 The scale-invalidity root cause, part 1: a seeded/unseeded id
+### namespace collision (fixed) — and part 2, a genuinely unattributed
+### residual (open)
+
+§K.49 left one item explicitly unresolved: *why* the grid-8 solid failed
+`BRepCheck_Analyzer` at the whole-solid level with no individually-invalid
+face/wire/edge/vertex/shell, and whether the growth of
+`n_planar_off_plane_faceted` with bore density (K.43's id-inheritance
+artifact) was merely cosmetic or causally responsible. Diagnosing this
+(`ddocs/design/scale_invalidity_diag_v1.py` through `_v3.py`) found **two
+independent phenomena**, not one.
+
+**Finding 1 — the failing scale is smaller than §K.49 measured, and the
+verdict is non-deterministic.** §K.49's gate
+(`_SHAPE_FIX_SOLID_FACE_LIMIT`) skips the whole-solid `BRepCheck_Analyzer`
+check above ~3000 recovered faces, so every grid size in the §K.49 table
+already had its validity silently unverified (reported `None`), not
+actually confirmed valid. Monkeypatching the gate open (diagnostic-only —
+`ddocs/design/scale_invalidity_diag_v1.py::raw_solid_direct_check`) to force
+a direct check at every size found that **grid 4** (44,430 triangles, far
+below the grid-8/grid-5 scale previously assumed to be the smallest
+failure) already produces a `BRepCheck`-invalid solid — but *only
+sometimes*: run in a fresh process building nothing else first, grid 4 is
+valid; run after a grid-3 panel was already built in the same process, the
+identical grid-4 construction is invalid, reproducibly, every time. Direct
+comparison confirmed the two runs' `ResultMesh.vertices` and `.triangles`
+arrays are **bit-identical** (`np.array_equal`, not just `allclose`) — only
+`.face_id` differs between them. A geometry-blind, history-dependent
+verdict flip is decisive: it rules out a fixed geometric property of the
+mesh (e.g. a genuine 3-D self-intersection, lead (b) from the original
+question) as the primary mechanism, and points squarely at the id-driven
+grouping recovery does (lead (a)).
+
+**Root cause — an unnamespaced id collision, not mere interpolation
+smearing.** K.43 attributed the id-inheritance artifact to "manifold3d's
+own face_id inheritance across the fillet's swept-tool boolean," as if it
+were an unavoidable adjacency-computation quirk. It is not: every
+fillet/chamfer tool (`fillet.py`'s `_build_chain_chamfer_tool`,
+`build_corner_fillet_patch`/`build_corner_chamfer_patch`, the `_make()`
+raw-mesh helper, `m3d.Manifold.hull_points`, …) is built as a **raw,
+unseeded** `manifold3d.Manifold` — no `face_id` is ever passed to its
+`Mesh64` constructor. `manifold3d` then fills `face_id` from its own
+internal small-integer coplanar-region numbering for *that mesh alone*
+(confirmed empirically: a 20,000-point convex hull built standalone tops
+out at id 115). Meanwhile `bridge.py`'s `_FACE_ID_COUNTER` — the "globally
+unique" counter every *seeded* shape (`shape_to_manifold`,
+`synthetic_side_map`) draws its ids from — is a bare, never-reset
+`itertools.count()` starting at 0, the exact same range manifold3d's own
+auto-ids occupy. `fillet.py`'s cut/add tool is then combined directly with
+the already-seeded host mesh (`result - combined_cut`, `result +
+combined_add`) with **no remap step in between** — exactly the hazard
+`synthetic_side_map`'s own docstring already warns about ("would collide
+with the process-wide seeded-id counter the moment the result is mixed
+into a boolean with a seeded operand"), just for a code path that was never
+routed through that remap.
+
+Reproduced in complete isolation, with zero fillet/mesh_cut machinery
+involved: a seeded unit cube (ids 0–5, one per face) unioned with a
+*disjoint*, non-touching, unseeded raw tetrahedron floating 0.33–1.67 units
+above it. The tetrahedron's own auto-ids (`[3, 1, 0, 2]`, from
+`manifold.to_mesh().face_id` before any boolean) collide with the cube's
+seeded ids on contact: the combined result's id-0 group spans triangles
+with centroid z from 0.00 (the cube's real bottom face) to 1.50 (the
+tetrahedron, nowhere near it) — K.43's exact symptom, reproduced with two
+bodies that never touch or overlap in space. This is a discrete numeric
+coincidence between two unrelated id-generation schemes, not a smearing
+effect at a shared boundary.
+
+Because `_FACE_ID_COUNTER` is shared and process-lifetime (never reset
+between MeshPart constructions), *which* seeded id a given tool's auto-id
+happens to numerically equal depends on how many ids earlier, unrelated
+constructions in the same process already consumed — hence the observed
+non-determinism (grid 4 alone vs. grid 4 after grid 3).
+
+**Fix — namespace the two id spaces apart; do not touch geometry.**
+`bridge.py::_FACE_ID_COUNTER` now starts at `_SEEDED_ID_OFFSET = 2**24`
+instead of 0, permanently separating build123d's seeded-id range from
+manifold3d's own small native auto-id range (bounded by a single mesh's own
+coplanar-facet count — orders of magnitude below 2**24 for any realistic
+tool). This requires no change to `fillet.py` at all: the tool's own
+triangles are still built exactly as before and still recovered as
+anonymous faceted patches (`face_id not in side_map`); only the *range*
+seeded ids live in moved. Two false starts, ruled out:
+
+* **Reseed the tool's own ids** (remap its auto-ids to fresh global ones,
+  mirroring `synthetic_side_map`, right before combining with `result`).
+  Correct in principle, but every reseed requires reconstructing a fresh
+  `manifold3d.Manifold` from `to_mesh()` output — and `Manifold(mesh)`'s
+  constructor unconditionally "collapses degenerate triangles and
+  unnecessary vertices" (its own docstring) on construction, even when
+  called twice on already-clean input with unchanged ids. Measured effect:
+  a small single-edge fillet tool's own volume shifted by ~2.66e-6 on a
+  same-id round-trip alone, which propagated into the final result and
+  broke two bit-exact-volume regression tests
+  (`test_mesh_fillet_box_single_edge_is_bit_exact`,
+  `test_mesh_fillet_l_shape_convex_and_concave_chains_succeeds`,
+  `abs=1e-9`). Rejected once identified.
+* **A too-large offset.** `2**31` and above (but still `< 2**32`, so not a
+  plain `uint32` overflow) was tried first and silently **wraps** —
+  `Manifold.to_mesh().face_id` comes back with the *wrong* (small,
+  collided) values, verified by direct round-trip probing at several
+  offsets (`2**24`/`2**28` preserve exactly; `2**31`/`2**32-1`/`2**32` do
+  not). A plain box recovered 12 faces instead of 6 with this offset — its
+  own seeded ids no longer matched their own side-map keys after the
+  round-trip through `Mesh64`/`Manifold`. `2**24` was chosen with generous
+  headroom below the empirically-probed safe ceiling.
+
+Verified: the grid-3-then-grid-4 sequence that reliably flipped grid 4 to
+invalid before the fix now reliably reports it valid (3/3 repeats, and
+fresh-process grid 4 unaffected either way);
+`RecoveryResult.n_planar_off_plane_faceted` is exactly 0 for grid 3 and
+grid 4 in every run order tried (previously 1239–2291, varying by process
+history); triangle counts are bit-identical to the pre-fix baseline (no
+geometry perturbation, unlike the rejected reseed approach). Full suite:
+182/182 (`tests/test_mesh.py`, 181 pre-existing + the new regression test
+below).
+
+**Finding 2 — a second, genuinely-unattributed defect remains at grid 5+,
+unrelated to the above.** With Finding 1's fix applied
+(`n_planar_off_plane_faceted == 0`, confirmed), grid 5 (67,876 triangles,
+~64,681 recovered faces) is **still** `BRepCheck`-invalid at the solid
+level — deterministically, in every process/run-order tried (unlike
+Finding 1's flakiness). Every individual face, wire, edge, vertex and shell
+passes `BRepCheck_Analyzer.IsValid(subshape)` standalone (0 failures out of
+64,681 faces / 64,731 wires / 197,250 edges / 394,500 vertices / 1 shell);
+the solid's own `BRepCheck_Result.Status()` reports `BRepCheck_NoError`
+blind, and its `InitContextIterator`/`MoreShapeInContext` walk yields
+**zero** entries — there is truly nothing pinned to any subshape, matching
+§K.49's original description exactly, now with the id-collision noise
+eliminated as a confound.
+
+*Lead (b) directly refuted for this residual.* A dedicated 3-D
+triangle-triangle intersection scan (`ddocs/design/scale_invalidity_diag_v3.py`)
+grouped every fillet-tool triangle by nearest bore centre (grid 5's 25
+holes, 9 mm pitch) and pruned candidate cross-bore pairs with a `cKDTree`
+(radius 1.0 mm — generous, since each band only reaches ~2.5 mm from its
+own bore centre against a 9 mm pitch). Result: **zero** cross-band triangle
+pairs come within 1.0 mm of each other, let alone intersect. There is no
+candidate for a genuine geometric self-intersection between distinct
+fillet bands at this scale; whatever the residual defect is, it is not
+that.
+
+This narrower residual — deterministic, zero attributable subshape, zero
+off-plane-fallback triangles, zero cross-band proximity — was not
+root-caused. The leading hypothesis (not verified here) is that
+`BRepCheck_Analyzer`'s solid-level check performs an internal
+classification/closure test (not exposed through the standard per-subshape
+`Result`/`StatusOnShape` maps at all) whose own numerical robustness
+degrades on a body with tens of thousands of individually-exact, per-
+triangle flat `TopoDS_Face`s (the current one-face-per-triangle faceted
+recovery strategy for curved/unseeded regions, §K.49's own noted future
+lever) — i.e. a possible limitation of OCCT's own checker at this facet
+density, not necessarily a defect in the recovered geometry itself. Testing
+that hypothesis would mean instrumenting or bisecting OCCT's own solid
+classifier internals — out of scope for this note, kept here as the
+narrowed, evidence-backed successor to §K.49's open item.
+
+**Tests.** `test_seeded_ids_never_collide_with_unseeded_fillet_tool_ids` in
+`tests/test_mesh.py` (Finding 1's regression test — builds several
+throwaway MeshParts first to simulate "not the first shape in this
+process," then asserts `n_planar_off_plane_faceted == 0` and a direct,
+gate-bypassed `BRepCheck_Analyzer` pass on a grid-4 perforated panel; fails
+with `n_planar_off_plane_faceted == 1879` if `_SEEDED_ID_OFFSET` is reverted
+to 0, confirming it actually exercises the fixed code path). Diagnostic
+scripts (not part of the test suite, kept for reference):
+`ddocs/design/scale_invalidity_diag_v1.py` (grid sweep with the
+`_SHAPE_FIX_SOLID_FACE_LIMIT` gate bypassed, per-subshape
+`BRepCheck_Analyzer` breakdown), `_v2.py` (provenance-tagged recovery,
+isolates exactly which recovered face came from which recovery path),
+`_v3.py` (the cross-band triangle-triangle intersection scan).
+
 ---
 
 ## Appendix — file map and call graph

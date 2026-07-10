@@ -1329,6 +1329,13 @@ def _mesh_chamfer_impl(
             add_tools.append(patch)
 
     # Apply cut first, then add (design §3.7 — p10 fix #3 carried forward).
+    #
+    # Every tool/patch above is a raw, unseeded manifold: its own face_id
+    # channel is auto-assigned by manifold3d (small ints local to that one
+    # mesh — see bridge._SEEDED_ID_OFFSET's docstring for why this can never
+    # numerically collide with meshpart's own seeded ids, and
+    # ddocs/design/algorithms.md §K.50 for the id-collision bug this
+    # namespacing fixes).
     result = meshpart.manifold
     if cut_tools:
         combined_cut = (
@@ -2362,6 +2369,13 @@ def _mesh_fillet_impl(
             add_tools.append(patch)
 
     # Apply cut first, then add (design §3.7 — p10 fix #3 carried forward).
+    #
+    # Every tool/patch above is a raw, unseeded manifold: its own face_id
+    # channel is auto-assigned by manifold3d (small ints local to that one
+    # mesh — see bridge._SEEDED_ID_OFFSET's docstring for why this can never
+    # numerically collide with meshpart's own seeded ids, and
+    # ddocs/design/algorithms.md §K.50 for the id-collision bug this
+    # namespacing fixes).
     result = meshpart.manifold
     if cut_tools:
         combined_cut = (

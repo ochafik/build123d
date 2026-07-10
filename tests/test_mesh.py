@@ -88,6 +88,7 @@ from build123d.mesh.recovery import (  # noqa: E402
     _SHAPE_FIX_SOLID_FACE_LIMIT,
     _weld_degenerate_triangles,
 )
+from OCP.BRepCheck import BRepCheck_Analyzer  # noqa: E402
 from OCP.TopAbs import TopAbs_EDGE, TopAbs_FACE  # noqa: E402
 from OCP.TopExp import TopExp  # noqa: E402
 from OCP.TopTools import TopTools_IndexedDataMapOfShapeListOfShape  # noqa: E402
@@ -2743,6 +2744,49 @@ def _drilled_filleted_grid(grid_n, pitch=9.0, thickness=4.0, radius=0.5):
     drilled = mesh_cut(panel, *holes)
     chains = drilled.feature_edges()
     return drilled.fillet(chains, radius=radius, on_infeasible="skip")
+
+
+def test_seeded_ids_never_collide_with_unseeded_fillet_tool_ids():
+    """§K.50: a fillet tool's own auto-assigned ids must never numerically
+    collide with build123d's seeded ids, regardless of prior process history.
+
+    Every fillet/chamfer tool is built as a raw, *unseeded* manifold3d
+    manifold; manifold3d fills its ``face_id`` from its own small
+    (0, 1, 2, …) internal coplanar-region numbering. Before this fix,
+    build123d's own seeded-id counter (``bridge._FACE_ID_COUNTER``) also
+    started at 0 and was never reset between MeshPart constructions in the
+    same process — so whenever a tool facet's small auto-id happened to
+    numerically equal an unrelated *already-seeded* id, ``recover_brep``
+    silently folded that (geometrically unrelated) tool facet into the
+    seeded face's connected component. This was undetectable in an isolated
+    test process (few enough prior ids consumed that a collision was
+    unlikely) but reliably reproduced once a handful of unrelated MeshParts
+    were built earlier in the same process — exactly the multi-shape-per-
+    script pattern of real usage, and precisely what made a grid-4
+    perforated panel's ``to_solid()`` validity depend on unrelated earlier
+    construction, not just its own geometry. This test simulates that
+    "not the first shape in the process" condition explicitly and asserts
+    the outcome no longer depends on it.
+    """
+    # Advance the shared seeded-id counter first, mimicking a script that
+    # already built other MeshParts before reaching the actual repro below.
+    for _ in range(7):
+        MeshPart.box(3, 3, 3)
+
+    filleted = _drilled_filleted_grid(grid_n=4)
+    result_mesh = read_result(filleted.manifold)
+    recovered = recover_brep(result_mesh, filleted.side_map)
+    # The direct, decisive signal: zero fillet-tool facets got mis-grouped
+    # into a seeded planar id's connected component (the id-inheritance
+    # artifact this fix eliminates).
+    assert recovered.n_planar_off_plane_faceted == 0
+    assert recovered.is_valid is not False
+    assert isinstance(recovered.solid, (Solid, Compound))
+    # Diagnostic-only direct check (bypassing _SHAPE_FIX_SOLID_FACE_LIMIT,
+    # which recover_brep itself respects for performance — see §K.49): grid 4
+    # is small enough that a genuine BRepCheck sweep here stays fast, and
+    # confirms the recovered solid is actually valid, not merely unverified.
+    assert BRepCheck_Analyzer(recovered.solid.wrapped).IsValid()
 
 
 def test_recovery_is_valid_gated_above_shape_fix_solid_face_limit():

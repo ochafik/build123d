@@ -95,9 +95,52 @@ DEFAULT_ANGULAR_TOLERANCE = 0.2  # radians (~11 degrees)
 # ``TOLERANCE = 1e-6`` contract (six decimal places).
 _WELD_DECIMALS = 6
 
+# manifold3d fills any *unseeded* mesh's own face_id from its own coplanar-
+# region calculation whenever a raw Mesh64/Manifold is built without an
+# explicit face_id (every fillet/chamfer swept tool: see fillet.py's
+# `_build_chain_chamfer_tool` / `build_corner_fillet_patch` and friends).
+# Those auto-ids are small integers local to *that* mesh alone (0, 1, 2, …,
+# empirically bounded by that one mesh's own coplanar-facet count — a
+# 20,000-point convex hull tops out at ~115; even a very complex swept
+# fillet tool stays several orders of magnitude below the offset chosen
+# below). If the seeded-id counter below also started at 0, a tool's
+# auto-id would eventually numerically coincide with an unrelated *seeded*
+# id the moment manifold3d's boolean mixes the two (a fillet subtracts/adds
+# its tool directly into the already-seeded host mesh, with no remap step
+# in between — unlike the constructive-op path, see `synthetic_side_map`'s
+# docstring on this exact hazard) — silently folding a tool facet into a
+# real seeded planar/curved face's connected component even though it is
+# geometrically nowhere near that face's surface (ddocs/design/algorithms.md
+# §K.50; this was the previously-unattributed root cause of
+# `RecoveryResult.n_planar_off_plane_faceted` growing with bore density, and
+# of `to_solid()` producing a solid-level-invalid `BRepCheck_Analyzer`
+# result at scale with no attributable subshape). Starting the seeded-id
+# counter at a large offset instead of 0 makes such a collision impossible
+# *by construction*, with zero runtime cost and no risk of perturbing
+# geometry (the alternative — reseeding the tool's own ids via a fresh
+# Manifold reconstruction before combining it — was tried and rejected:
+# `Manifold(mesh)`'s constructor always re-collapses "degenerate triangles
+# and unnecessary vertices" on construction, which measurably shifted
+# volume by ~1e-6 on a small fillet tool, breaking the bit-exact volume
+# tests).
+#
+# The offset must stay well clear of manifold3d's own id storage ceiling:
+# empirically, ids at or above 2**31 (but still comfortably below 2**32, so
+# not a plain uint32 wraparound) silently come back wrong from
+# ``Manifold.to_mesh()`` — verified by round-tripping a seeded id through a
+# real ``Mesh64``/``Manifold`` construction at several offsets (2**24 and
+# 2**28 round-trip exactly; 2**31 and above do not). 2**24 (~16.7 million)
+# leaves generous headroom below that ceiling for any single process's
+# lifetime id consumption while staying many orders of magnitude above
+# manifold3d's own small auto-id range.
+_SEEDED_ID_OFFSET = 2**24
+
 # A process-wide counter so face ids are globally unique across every shape ever
 # seeded — booleans can then merge two side-maps with a plain ``dict.update``.
-_FACE_ID_COUNTER = itertools.count()
+# Offset above manifold3d's own small-integer auto-id range (see
+# _SEEDED_ID_OFFSET) so a seeded id can never numerically collide with an
+# unseeded tool/hull manifold's own auto-assigned face_id.
+_FACE_ID_COUNTER = itertools.count(_SEEDED_ID_OFFSET)
 
 # Shared read-only empty index array returned by ResultMesh.triangles_of for an
 # id with no triangles (matches the old np.where([])[0] dtype/shape).
