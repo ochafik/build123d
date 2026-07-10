@@ -2746,7 +2746,7 @@ def _drilled_filleted_grid(grid_n, pitch=9.0, thickness=4.0, radius=0.5):
 
 
 def test_recovery_is_valid_gated_above_shape_fix_solid_face_limit():
-    """Above ``_SHAPE_FIX_SOLID_FACE_LIMIT``, recover_brep trusts validity.
+    """Above ``_SHAPE_FIX_SOLID_FACE_LIMIT``, recover_brep reports UNVERIFIED.
 
     Design ddocs/design/algorithms.md §K.49: ``RecoveryResult.is_valid`` used
     to recompute a whole-shape ``BRepCheck_Analyzer`` sweep unconditionally —
@@ -2754,9 +2754,12 @@ def test_recovery_is_valid_gated_above_shape_fix_solid_face_limit():
     already gates before ``ShapeFix_Solid``, just called a second time,
     ungated, a few lines later. At grid-5 scale (76,758 triangles) this
     recovered solid's own analytic-recovery face count already exceeds the
-    bound, so the fix's fast path (trust rather than re-verify) applies here
-    — this is a fast-running proxy for the slower grid-8 case profiled in
-    the design note.
+    bound, so the fix's fast path (skip the sweep) applies here — a
+    fast-running proxy for the slower grid-8 case profiled in the design
+    note. ``is_valid`` is a **tri-state** verdict specifically so this case
+    is never mis-reported as ``True``: §K.49 measured that a body this large
+    is frequently *actually* BRepCheck-invalid, so skipping the check must
+    report ``None`` (unverified), not a confident (and often wrong) ``True``.
     """
     filleted = _drilled_filleted_grid(grid_n=5)
     result_mesh = read_result(filleted.manifold)
@@ -2764,10 +2767,39 @@ def test_recovery_is_valid_gated_above_shape_fix_solid_face_limit():
     assert isinstance(recovered.solid, (Solid, Compound))
     face_count = sum(1 for _ in recovered.solid.faces())
     assert face_count > _SHAPE_FIX_SOLID_FACE_LIMIT
-    # Above the bound, is_valid is trusted (True) rather than re-verified —
-    # the whole point of the fix is to *not* pay for a second whole-shape
-    # BRepCheck_Analyzer sweep here.
-    assert recovered.is_valid
+    # Above the bound, is_valid is None (unverified) -- never upgraded to
+    # True just because no defect was checked for.
+    assert recovered.is_valid is None
+
+
+def test_recovery_is_valid_is_tri_state_not_bool():
+    """``RecoveryResult.is_valid`` is ``bool | None``, and ``None`` means
+    "unverified", never "assume True".
+
+    Minimal, fast dedicated check of the §K.49 tri-state contract (see the
+    fuller grid-5 test above for a closer proxy of the original bug report):
+    even the smallest grid in ``ddocs/design/bake_scaling_v1.py``'s sweep
+    (grid 2, 4 holes) already recovers well above
+    ``_SHAPE_FIX_SOLID_FACE_LIMIT`` faces, so it exercises the same
+    skip-the-check path as grid 5/8 while running in well under a second.
+    """
+    filleted = _drilled_filleted_grid(grid_n=2)
+    result_mesh = read_result(filleted.manifold)
+    recovered = recover_brep(result_mesh, filleted.side_map)
+    assert isinstance(recovered.solid, (Solid, Compound))
+    face_count = sum(1 for _ in recovered.solid.faces())
+    assert face_count > _SHAPE_FIX_SOLID_FACE_LIMIT
+    assert recovered.is_valid is None
+    # None must never compare equal to True/False -- guards against a
+    # regression back to a plain bool that happens to default False/True.
+    assert recovered.is_valid is not True
+    assert recovered.is_valid is not False
+    # And to_solid() must accept an unverified (None) recovery rather than
+    # fall back to a from_mesh rebuild -- checked via the same face-count
+    # signature used by the fuller test above.
+    solid = filleted.to_solid()
+    _, triangles = filleted.to_arrays()
+    assert len(solid.faces()) < 0.9 * len(triangles)
 
 
 def test_to_solid_large_filleted_panel_keeps_exact_recovery_not_fallback():
@@ -2776,16 +2808,20 @@ def test_to_solid_large_filleted_panel_keeps_exact_recovery_not_fallback():
     Design ddocs/design/algorithms.md §K.49. Before the fix,
     ``mesh_part.to_solid()`` discarded the (partially-exact) recovery and
     rebuilt entirely faceted via ``Solid.from_mesh`` whenever
-    ``RecoveryResult.is_valid`` came back False — which, at this grid-5
-    scale, it reliably did (confirmed even the fallback's own from_mesh
-    rebuild of the identical triangle soup was equally BRepCheck-invalid, so
+    ``RecoveryResult.is_valid`` was not ``True`` — which, at this grid-5
+    scale, it reliably was not (a direct check confirmed the recovered
+    solid actually is BRepCheck-invalid here, and that the fallback's own
+    from_mesh rebuild of the identical triangle soup is equally invalid, so
     the fallback bought no correctness benefit while costing an entire
-    second full-mesh rebuild on top of the redundant validity sweep). Above
-    ``_SHAPE_FIX_SOLID_FACE_LIMIT``, to_solid() must therefore keep the
-    exact recovery's merged analytic planar faces and lower face count — a
-    from_mesh fallback would instead rebuild the panel's flat top/bottom/side
-    faces as many tiny per-triangle facets, with roughly one face per raw
-    triangle.
+    second full-mesh rebuild on top of the redundant validity sweep).
+    ``to_solid()`` now treats the unverified (``None``) verdict above
+    ``_SHAPE_FIX_SOLID_FACE_LIMIT`` as "keep this recovery" rather than
+    "fall back" -- it does not claim the kept solid is valid, only that
+    the fallback has no better claim to validity either. So to_solid() must
+    keep the exact recovery's merged analytic planar faces and lower face
+    count — a from_mesh fallback would instead rebuild the panel's flat
+    top/bottom/side faces as many tiny per-triangle facets, with roughly one
+    face per raw triangle.
     """
     filleted = _drilled_filleted_grid(grid_n=5)
     _, triangles = filleted.to_arrays()

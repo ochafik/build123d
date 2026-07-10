@@ -702,21 +702,32 @@ class MeshPart:
             if (
                 recovered.solid is not None
                 and isinstance(recovered.solid, (Solid, Compound))
-                and recovered.is_valid
+                and recovered.is_valid is not False
             ):
                 return recovered.solid
-            # Recovery did not yield a valid closed solid. With shared-topology
-            # recovery (one TopoDS_Vertex/Edge per mesh vertex index, shared
-            # across planar faces and faceted patches) a mixed-provenance body
-            # — exact-planar seeded faces abutting faceted hull / Minkowski /
-            # unseeded regions — is now valid by construction, so this fallback
-            # is *not* expected to trigger for bp10-style mixed input. It
-            # remains a safety net for genuinely-unrecoverable cases: a bare
-            # Shell (no closed solid built), or a degenerate mesh OCCT cannot
-            # close. Falling through to the faceted bake then still gives the
-            # caller a guaranteed-valid Solid; callers that want the
-            # partially-exact recovered body can invoke ``recover_brep()``
-            # directly and inspect the ``RecoveryResult``.
+            # Recovery did not yield a solid known to be valid. With
+            # shared-topology recovery (one TopoDS_Vertex/Edge per mesh vertex
+            # index, shared across planar faces and faceted patches) a
+            # mixed-provenance body — exact-planar seeded faces abutting
+            # faceted hull / Minkowski / unseeded regions — is now valid by
+            # construction, so this fallback is *not* expected to trigger for
+            # bp10-style mixed input. It remains a safety net for
+            # genuinely-unrecoverable cases: a bare Shell (no closed solid
+            # built), a degenerate mesh OCCT cannot close, or a body small
+            # enough to be re-checked (``recovered.is_valid is False``,
+            # verified invalid — see ``RecoveryResult.is_valid``'s tri-state
+            # contract). ``recovered.is_valid is None`` (unverified, above
+            # ``_SHAPE_FIX_SOLID_FACE_LIMIT``) is deliberately accepted here,
+            # NOT treated as invalid: design ddocs/design/algorithms.md §K.49
+            # measured that at that scale the fallback below is an equally
+            # unverified — and, when actually checked, equally
+            # BRepCheck-invalid — rebuild of the identical triangle soup, so
+            # falling through would pay for a full second reconstruction and
+            # return strictly worse geometry (more faces, no merged planar
+            # faces) for no correctness benefit. Callers that want the
+            # partially-exact recovered body (and its real validity verdict)
+            # can invoke ``recover_brep()`` directly and inspect the
+            # ``RecoveryResult``.
 
         vertices, triangles = self.to_arrays()
         solid = Solid.from_mesh(vertices, triangles, fix=False)

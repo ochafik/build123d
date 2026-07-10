@@ -3057,17 +3057,37 @@ instead of a second whole-shape sweep:
 
 * Below the bound: unchanged behavior — check, repair if needed, re-check
   (all cheap at this size), same as before.
-* Above the bound: skip the check entirely and trust the shared-topology
-  construction's own validity-by-design guarantee (the whole premise of
-  `_SharedTopology`, K.1–K.48) rather than paying for a sweep that this very
-  file already documented as not changing the answer at this size — and
-  never fall through to the strictly-worse, equally-invalid `from_mesh`
-  rebuild.
+* Above the bound: skip the check entirely — but report the verdict as
+  **unverified**, not as valid (see "Revision: a tri-state verdict" below).
+  Never fall through to the strictly-worse `from_mesh` rebuild on the
+  strength of that skip, since that rebuild has no better claim to validity
+  either.
 
 This is a genuine improvement in both directions at scale: strictly less
 wall time (no redundant check, no redundant rebuild) *and* strictly better
 output (exact planar faces and merged coplanar regions preserved instead of
 thrown away). It does not touch the well-tested small/gated path at all.
+
+**Revision: a tri-state verdict, not a trusted `True`.** The first version
+of this fix set the above-bound verdict to `True` ("trust the
+shared-topology construction's validity-by-design guarantee"). That is
+wrong on its own evidence: the very measurement above shows the grid-8
+recovered solid is **actually BRepCheck-invalid**, not merely
+expensive-to-prove-valid — reporting `True` there is a confident, false
+answer, exactly the kind of silent footgun K.1–K.48 spent this whole
+section eliminating. `RecoveryResult.is_valid` is therefore `bool | None`:
+`True` (checked, passed), `False` (checked, failed), `None` (skipped above
+the bound — genuinely unverified). The rollup across several disjoint
+bodies is: any verified-`False` solid makes the whole result `False`
+(a known defect stays known); otherwise any `None` solid makes it `None`
+(never upgraded to `True` just because nothing was checked); only when
+every solid was actually checked and passed is the result `True`.
+`mesh_part.to_solid()` accepts the recovery whenever `is_valid is not
+False` — i.e. `True` *or* `None` both keep the recovery, and only a
+*verified* `False` falls through to the (no-better-off) `from_mesh`
+rebuild. The performance win is unchanged (the expensive sweep is still
+skipped above the bound); what changed is that the API no longer claims to
+know something it didn't check.
 
 **Post-fix hotspot breakdown (grid 8, 194,726 triangles, 13.25s total,
 cProfile).** With the redundant check and fallback gone, the profile is
@@ -3116,6 +3136,9 @@ resolving it, precisely because the fallback path was shown to fail the
 identical check on identical input.
 
 **Tests.** `test_recovery_is_valid_gated_above_shape_fix_solid_face_limit`,
+`test_recovery_is_valid_is_tri_state_not_bool` (a minimal, fast, dedicated
+check of the tri-state contract itself — `is_valid is None` above the
+bound, never `True`, and `to_solid()` accepts it rather than falling back),
 `test_to_solid_large_filleted_panel_keeps_exact_recovery_not_fallback` in
 `tests/test_mesh.py`. Harness: `ddocs/design/bake_scaling_v1.py` (the sweep
 above) and `ddocs/design/bake_profile_v1.py` (the cProfile breakdown above),
